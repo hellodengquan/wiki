@@ -767,7 +767,437 @@ async regenerateCertificates () {
 
 ---
 
-## 九、关键源码位置索引
+## 九、策略链失败时的 fallback 与短路逻辑
+
+Wiki.js 的认证体系设计是 **用户显式选择策略**，而非系统自动遍历策略链，因此不存在传统意义上的"依次尝试多个策略"的 fallback 链。但在特定场景下仍存在短路（short-circuit）和回退（fallback）行为。
+
+### 9.1 无策略链设计：一次请求对应一个策略
+
+核心逻辑在 `User.login()` 中（`server/models/users.js:293-332`）：
+
+```js
+static async login (opts, context) {
+  if (_.has(WIKI.auth.strategies, opts.strategy)) {
+    const selStrategy = _.get(WIKI.auth.strategies, opts.strategy)
+    if (!selStrategy.isEnabled) {
+      throw new WIKI.Error.AuthProviderInvalid()   // 短路：策略禁用，直接失败
+    }
+    // ... Passport 认证
+  } else {
+    throw new WIKI.Error.AuthProviderInvalid()     // 短路：策略不存在，直接失败
+  }
+}
+```
+
+**关键点**：
+- 请求携带的 `strategy` 参数直接定位唯一策略
+- 不存在 `for...of` 遍历多个策略依次尝试的逻辑
+- 任一前置检查失败（策略不存在、未启用）立即短路返回错误，不继续执行
+
+### 9.2 Passport 认证失败的短路
+
+`passport.authenticate()` 的回调函数同样不做 fallback：
+
+```js
+// server/models/users.js:314-316
+async (err, user, info) => {
+  if (err) { return reject(err) }                 // 策略内部错误，短路
+  if (!user) { return reject(new WIKI.Error.AuthLoginFailed()) }  // 认证失败，短路
+  // ... 执行 afterLoginChecks
+}
+```
+
+例如 LDAP 认证失败、Google OAuth 返回错误、Local 密码错误等，均直接 `reject`，不会自动尝试下一个策略。
+
+### 9.3 策略初始化失败的容错：非短路
+
+与请求时的行为相反，**系统启动/重载时单个策略初始化失败不会导致整个系统瘫痪**：
+
+```js
+// server/core/auth.js:82-99
+for (let idx in enabledStrategies) {
+  const stg = enabledStrategies[idx]
+  try {
+    const strategy = require(`../modules/authentication/${stg.strategyKey}/authentication.js`)
+    strategy.init(passport, stg.config)
+    WIKI.auth.strategies[stg.key] = { ...strategy, ...stg }
+    WIKI.logger.info(`Authentication Strategy ${stg.displayName}: [ OK ]`)
+  } catch (err) {
+    WIKI.logger.error(`Authentication Strategy ${stg.displayName} (${stg.key}): [ FAILED ]`)
+    WIKI.logger.error(err)
+    // 不抛出，不短路，继续加载下一个策略
+  }
+}
+```
+
+这是容错（fault-tolerant）设计而非 fallback 设计——失败的策略只是从注册表中缺席，用户看不到也用不了，但其他策略正常工作。
+
+### 9.4 自动登录场景的 fallback
+
+`autoLogin` 场景下存在两处隐性 fallback：
+
+**Fallback 1：自动登录只跳转非表单策略**
+```js
+// server/controllers/auth.js:37-43
+if (WIKI.config.auth.autoLogin && !req.query.all) {
+  const stg = await WIKI.models.authentication.query().orderBy('order').first()
+  const stgInfo = _.find(WIKI.data.authentication, ['key', stg.strategyKey])
+  if (!stgInfo.useForm) {
+    return res.redirect(`/login/${stg.key}`)  // 社交策略：跳转
+  }
+  // 否则：不跳转，fallback 到正常登录页
+}
+```
+如果 order 最小的策略是 Local（`useForm=true`），不执行自动跳转，回退到让用户手动输入用户名密码。
+
+**Fallback 2：`?all` 参数绕过自动登录**
+用户可在 URL 加 `?all` 显式绕过 autoLogin 逻辑，强制显示完整策略列表。这是用户主动发起的 fallback 行为。
+
+### 9.5 自动登录选中禁用策略的失效场景
+
+注意 `autoLogin` 的 `orderBy('order').first()` **不检查 `isEnabled`**：
+```js
+const stg = await WIKI.models.authentication.query().orderBy('order').first()
+// 没有 where('isEnabled', true)
+```
+
+如果管理员把 order=0 的策略禁用了，`autoLogin` 仍会选中它。虽然随后 `User.login()` 会检查 `isEnabled` 并抛错，但自动登录已经失效了。这是一个设计上的不完善——禁用的策略应从 `autoLogin` 候选中排除。
+
+### 9.6 已禁用策略的 OAuth 回调短路
+
+策略被禁用后，`/login/:strategy/callback` 路由仍然存在，但 `User.login()` 会拦截：
+
+```
+用户发起 OAuth 登录 → 策略被管理员禁用 → 用户完成第三方授权 →
+回调到达 /login/google/callback → User.login() 检查 isEnabled=false →
+抛 AuthProviderInvalid → 用户看到登录失败页面
+```
+
+整个链路不会执行 Passport 认证逻辑，在策略查找阶段就短路了。
+
+### 9.7 Local 策略作为最终 fallback
+
+Local 策略的特殊保护机制使其成为系统的最终 fallback：
+- 不可禁用（管理后台开关灰显）
+- 不可删除（管理后台删除按钮灰显）
+- 初始 `order=0`，永远在策略列表中
+- 即使所有其他策略都初始化失败，Local 只要配置正确就一定可用
+
+这是关键的安全兜底设计——管理员永远不会把自己锁在系统外面。
+
+---
+
+## 十、策略组合的协同处理（LDAP 与 OAuth 互补场景）
+
+Wiki.js 没有内置的"LDAP 失败自动 fallback 到 OAuth"或"多策略合并认证"逻辑。但通过策略设计和业务配置，可以实现若干种组合协同模式。
+
+### 10.1 表单类策略的共用前端
+
+Local 和 LDAP 都是 `useForm: true` 的表单类策略，它们**共享同一个登录表单**：
+
+```js
+// client/components/login.vue:41-43
+template(v-if='screen === `login` && selectedStrategy.strategy.useForm')
+  v-text-field(v-model='username' :placeholder='isUsernameEmail ? ... : ...')
+  v-text-field(v-model='password' type='password')
+  v-btn(@click='login')
+```
+
+用户选择不同的表单类策略（Local / LDAP），表单字段的 placeholder 会变化（`isUsernameEmail` 计算属性），但表单 UI 是复用的。提交时 GraphQL mutation 携带 `strategy` 参数区分。
+
+### 10.2 外部认证 + 本地用户创建的协同
+
+**流程模式**：`外部身份源认证 → Wiki.js 自动创建/更新本地用户`
+
+这是所有社交策略和企业协议策略的标准协同模式，以 LDAP 为例：
+
+```js
+// server/modules/authentication/ldap/authentication.js:34-49
+async (req, profile, cb) => {
+  const user = await WIKI.models.users.processProfile({
+    providerKey: req.params.strategy,
+    profile: {
+      id: userId,
+      email: _.get(profile, conf.mappingEmail, ''),
+      displayName: _.get(profile, conf.mappingDisplayName, '???'),
+      picture: _.get(profile, `_raw.${conf.mappingPicture}`, '')
+    }
+  })
+  cb(null, user)
+}
+```
+
+`processProfile()` 内部协同逻辑：
+
+1. **查找已有用户**：用 `providerId + providerKey` 精确匹配
+2. **自动关联**：同策略下同邮箱且 `providerId` 为空的用户自动补上 `providerId`
+3. **自注册创建**：如果 `provider.selfRegistration=true` 且邮箱在白名单内，自动创建本地用户
+4. **属性同步**：每次登录更新 email、displayName、picture
+
+类似的协同也发生在 SAML、OIDC、Google、GitHub 等所有非 Local 策略中。
+
+### 10.3 组映射的协同（LDAP/SAML + 本地分组）
+
+LDAP 和 SAML 策略支持组映射，实现 `外部组 → Wiki.js 组` 的自动同步：
+
+```js
+// server/modules/authentication/ldap/authentication.js:51-63
+if (conf.mapGroups) {
+  const ldapGroups = _.get(profile, '_groups')
+  const expectedGroups = Object.values(WIKI.auth.groups)
+    .filter(g => ldapGroups.includes(g[conf.groupNameField]))
+    .map(g => g.id)
+  // 同步加入新组
+  for (const groupId of _.difference(expectedGroups, currentGroups)) {
+    await user.$relatedQuery('groups').relate(groupId)
+  }
+  // 同步移除不在 LDAP 中的组
+  for (const groupId of _.difference(currentGroups, expectedGroups)) {
+    await user.$relatedQuery('groups').unrelate().where('groupId', groupId)
+  }
+}
+```
+
+这是深度协同——不仅认证委托给外部，连用户的权限组也与外部源保持同步。
+
+### 10.4 多 OAuth 策略共存的组合
+
+多个社交策略可同时启用，它们之间是"并列选择"关系而非"顺序 fallback"关系：
+
+```
+登录页显示：
+  [ Google 图标 ] Sign in with Google
+  [ GitHub 图标 ] Sign in with GitHub
+  [ Azure 图标  ] Sign in with Azure AD
+```
+
+每个策略独立进行 OAuth 跳转，独立回调，独立创建本地用户。同一个人可以同时存在 `google-123` 和 `github-456` 两个不同的本地账号（`providerKey` 不同）。
+
+### 10.5 业务上的策略组合配置模式
+
+虽然代码没有内置组合逻辑，但管理员可以通过配置实现常见的业务组合：
+
+| 组合模式 | 配置方式 | 适用场景 |
+|---------|---------|---------|
+| **LDAP + Local 应急** | 同时启用 LDAP 和 Local；日常用 LDAP，LDAP 故障时管理员用 Local 登录 | 企业内部部署 |
+| **SAML + Local 应急** | 同时启用 SAML 和 Local；日常走 SSO，SSO 故障时 Local 作为逃生门 | 企业内部部署 |
+| **多 GitHub 组织** | 创建两个 `strategyKey=github` 实例，配置不同的 clientId，分别对应不同组织 | 多组织协作场景 |
+| **OAuth + Local 注册** | OAuth 仅用于登录，Local 策略开启自注册用于首次创建账号 | 混合场景 |
+| **OIDC + 组映射** | OIDC 登录时自动映射外部组到 Wiki.js 组，实现权限 SSO | 企业统一权限 |
+
+### 10.6 Local 与 LDAP 的用户隔离
+
+注意 Local 和 LDAP 是完全隔离的——即使邮箱相同，也是不同用户：
+
+```
+Local 用户 alice@company.com → providerKey='local'
+LDAP 用户 alice@company.com → providerKey='ldap'
+```
+
+`processProfile()` 不会跨策略关联用户。如果企业要从 Local 迁移到 LDAP，需要手动更新现有用户的 `providerKey` 和 `providerId`，或者让用户通过 LDAP 重新创建账号（邮箱会冲突，需要先删除或修改原 Local 用户的邮箱）。
+
+---
+
+## 十一、策略实例化与配置热刷新完整链路
+
+### 11.1 冷启动完整链路
+
+Wiki.js 启动时的策略实例化遵循严格的顺序：
+
+```
+┌─ server/core/kernel.js:init() ────────────────────────────────────┐
+│  1. WIKI.models = require('./db').init()                           │
+│  2. await WIKI.configSvc.loadFromDb()     // 从 DB 加载配置        │
+│  3. this.bootMaster()                                             │
+└────────────────────────┬──────────────────────────────────────────┘
+                         │
+                         ▼
+┌─ bootMaster() → postBootMaster() ─────────────────────────────────┐
+│                                                                    │
+│  第一步：从磁盘加载策略元数据                                       │
+│  ────────────────────────────────────                             │
+│  await WIKI.models.authentication.refreshStrategiesFromDisk()     │
+│    │                                                              │
+│    ├─ 扫描 server/modules/authentication/ 目录                     │
+│    ├─ 读取每个子目录的 definition.yml                              │
+│    ├─ 解析 props，存入 WIKI.data.authentication[]                 │
+│    ├─ 对比数据库：删除已移除的策略，补齐新增的 props                │
+│    └─ 写回数据库（如有变更）                                       │
+│                                                                    │
+│  第二步：策略初始化到运行时                                         │
+│  ────────────────────────────────────                             │
+│  await WIKI.auth.activateStrategies()                             │
+│    │                                                              │
+│    ├─ WIKI.auth.strategies = {}  // 清空内存                      │
+│    ├─ passport.unuse(...) 批量卸载                                │
+│    ├─ passport.use('jwt', ...) 注册 JWT 策略                      │
+│    └─ 遍历数据库 isEnabled 策略：                                  │
+│       ├─ require(`../modules/authentication/${stg.strategyKey}/...`)│
+│       ├─ stg.config.callbackURL = `${host}/login/${stg.key}/callback`│
+│       ├─ strategy.init(passport, stg.config)                      │
+│       └─ WIKI.auth.strategies[stg.key] = { ...strategy, ...stg }  │
+│                                                                    │
+│  第三步：HA 事件订阅                                               │
+│  ────────────────────────────────────                             │
+│  await WIKI.models.subscribeToNotifications()                     │
+│    └─ WIKI.auth.subscribeToEvents()                                │
+│       ├─ inbound.on('reloadAuthStrategies') → activateStrategies()│
+│       ├─ inbound.on('reloadGroups') → reloadGroups()              │
+│       └─ inbound.on('reloadApiKeys') → reloadApiKeys()            │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 单个策略的实例化细节
+
+每个策略模块 `authentication.js` 的 `init()` 方法完成 Passport 策略实例化：
+
+以 Local 策略为例：
+```js
+// server/modules/authentication/local/authentication.js:11-43
+module.exports = {
+  init (passport, conf) {
+    passport.use('local',
+      new LocalStrategy({
+        usernameField: 'email',
+        passwordField: 'password'
+      }, async (uEmail, uPassword, done) => {
+        // ... 具体认证逻辑
+      })
+    )
+  }
+}
+```
+
+关键点：
+- `passport.use(conf.key, new Strategy(...))` — 用策略实例的 `key` 作为 Passport 内部标识
+- 配置 `conf` 包含管理员在后台填写的所有 `props` 值
+- `callbackURL` 由 `activateStrategies()` 注入，确保与实例 `key` 对应
+- 实例化后的策略函数保存在 `passport._strategies[conf.key]`
+
+### 11.3 热更新触发源
+
+策略配置热更新可由以下操作触发：
+
+| 触发操作 | 触发点 | 直接调用 | 集群广播 |
+|---------|-------|---------|---------|
+| 管理员后台保存策略配置 | `updateStrategies` GraphQL | `activateStrategies()` | ✅ `reloadAuthStrategies` |
+| 证书重签 | `regenerateCertificates()` | `activateStrategies()` | ✅ `reloadAuthStrategies` |
+| 组变更 | 增删改组 | `reloadGroups()` | ✅ `reloadGroups` |
+| API Key 变更 | 增删 API Key | `reloadApiKeys()` | ✅ `reloadApiKeys` |
+| 系统启动 | `postBootMaster()` | `activateStrategies()` | ❌ |
+
+### 11.4 热更新完整链路（含 HA 集群）
+
+```
+┌─ 管理后台 admin-auth.vue ─────────────────────────────────────────┐
+│  save() → GraphQL mutation updateStrategies                        │
+│  variables.strategies = activeStrategies.map(...)                   │
+│  含：key, strategyKey, order, isEnabled, config, ...                │
+└────────────────────────┬──────────────────────────────────────────┘
+                         │
+                         ▼
+┌─ GraphQL Resolver updateStrategies() ──────────────────────────────┐
+│  server/graph/resolvers/authentication.js:200-249                   │
+│                                                                    │
+│  1. previousStrategies = getStrategies()  // 变更前快照            │
+│                                                                    │
+│  2. for...of args.strategies：                                      │
+│     ├─ 已存在 → patch（更新 isEnabled、order、config 等）           │
+│     └─ 新增 → insert                                               │
+│                                                                    │
+│  3. for...of 被删除策略：                                           │
+│     ├─ 有关联用户 → throw Error（阻止删除）                         │
+│     └─ 无关联用户 → delete                                          │
+│                                                                    │
+│  4. await WIKI.auth.activateStrategies()  // 本进程立即重载        │
+│                                                                    │
+│  5. WIKI.events.outbound.emit('reloadAuthStrategies')               │
+│     ↓ 被 db.js 的 onAny 捕获                                        │
+│     ↓ 通过 PG NOTIFY 广播到 wiki channel                            │
+└────────────────────────┬──────────────────────────────────────────┘
+                         │
+              ┌──────────┴──────────────────────┐
+              ▼                                 ▼
+┌─ 本进程（执行操作的进程） ─┐    ┌─ 其他进程（HA 集群节点） ───────┐
+│ 已执行 activateStrategies() │    │ PG LISTEN wiki channel        │
+│ 内存注册表已更新           │    │ 收到 payload.event = 'reload...'│
+│ Passport 已重新注册        │    │ source !== INSTANCE_ID         │
+│                            │    │ → WIKI.events.inbound.emit(...)│
+│                            │    │ → activateStrategies() 执行     │
+└────────────────────────────┘    └────────────────────────────────┘
+```
+
+### 11.5 `refreshStrategiesFromDisk()` 与 `activateStrategies()` 的区别
+
+| 维度 | `refreshStrategiesFromDisk()` | `activateStrategies()` |
+|------|-------------------------------|------------------------|
+| 作用 | 同步磁盘定义 ↔ 数据库 | 同步数据库 ↔ 内存运行时 |
+| 操作 | 扫描目录、读取 YAML、DB patch/delete | require 模块、Passport 注册、内存字典写入 |
+| 输出 | `WIKI.data.authentication[]`（元数据） | `WIKI.auth.strategies{}`（运行实例） |
+| 时机 | 系统启动 + 管理员手动刷新 | 启动 + 每次配置变更 |
+| 集群同步 | 不广播（仅本地执行） | 广播 `reloadAuthStrategies` 事件 |
+| 频率 | 低（启动一次，除非管理员刷新） | 高（每次策略配置变更） |
+
+### 11.6 热刷新期间的 JWT 连续性
+
+策略热刷新期间，**已登录用户的 JWT 不受影响**：
+
+1. JWT 策略在 `activateStrategies()` 中第一个被重新注册
+2. 请求鉴权中间件 `authenticate()` 使用 `'jwt'` 策略，与业务策略无关
+3. 业务策略（Google/LDAP/SAML 等）只影响登录流程，不影响已持 JWT 的请求
+
+因此管理员可以在白天正常业务时段调整策略配置，不会导致在线用户掉线。
+
+### 11.7 配置变更的原子性
+
+策略配置变更不是数据库事务级原子的：
+
+```js
+// server/graph/resolvers/authentication.js:203-229
+for (const str of args.strategies) {
+  if (_.some(previousStrategies, ['key', str.key])) {
+    await WIKI.models.authentication.query().patch(...).where('key', str.key)
+  } else {
+    await WIKI.models.authentication.query().insert(...)
+  }
+}
+// ... 然后遍历删除
+// ... 然后 activateStrategies()
+```
+
+- 多个策略的 update/insert 是独立数据库操作，非原子事务
+- 如果中途某个操作失败，已完成的操作不会回滚
+- 但失败时 `activateStrategies()` 不会被调用，运行时状态保持不变
+- 用户可见的影响仅限于未完成更新的策略在数据库层面不一致
+
+### 11.8 动态新增策略实例
+
+管理员可在管理后台"Add Strategy"动态创建新的策略实例：
+
+```js
+// client/components/admin/admin-auth.vue:268-289
+addStrategy (str) {
+  const newStr = {
+    key: uuid(),          // 随机生成实例 key
+    strategy: str,        // 关联到策略类型定义
+    config: str.props.map(c => ({
+      key: c.key,
+      value: { ...c, value: c.default }
+    })),
+    order: this.activeStrategies.length,
+    isEnabled: true,
+    displayName: str.title,
+    ...
+  }
+  this.activeStrategies = [...this.activeStrategies, newStr]
+}
+```
+
+保存后经过完整热更新链路，新的策略实例就出现在登录页上。
+
+---
+
+## 十二、关键源码位置索引
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -776,27 +1206,38 @@ async regenerateCertificates () {
 | JWT 中间件认证 `authenticate()` | `server/core/auth.js` | :113-212 |
 | HA 事件订阅 `subscribeToEvents()` | `server/core/auth.js` | :478-491 |
 | 证书重签 → 触发策略重载 | `server/core/auth.js` | :410-443 |
+| 认证缓存（`revocationList`） | `server/core/auth.js` | :23 |
 | 策略数据模型 | `server/models/authentication.js` | :13-131 |
-| 从磁盘刷新策略定义 | `server/models/authentication.js` | :78-130 |
-| 获取策略列表（按 order 排序） | `server/models/authentication.js` | :37-44 |
+| 从磁盘刷新策略定义 `refreshStrategiesFromDisk()` | `server/models/authentication.js` | :78-130 |
+| 获取策略列表（按 order 排序） `getStrategies()` | `server/models/authentication.js` | :37-44 |
 | 旧版客户端策略分类 | `server/models/authentication.js` | :46-76 |
-| 用户登录挑选逻辑 `login()` | `server/models/users.js` | :293-332 |
+| 用户登录挑选逻辑 `login()`（无策略链设计） | `server/models/users.js` | :293-332 |
+| Passport 认证回调（失败短路） | `server/models/users.js` | :314-316 |
 | 登录后检查 `afterLoginChecks()` | `server/models/users.js` | :337-413 |
-| 社交登录 Profile 处理 `processProfile()` | `server/models/users.js` | :165-288 |
+| 社交登录 Profile 处理 `processProfile()`（外部认证+本地创建协同） | `server/models/users.js` | :165-288 |
 | 路由分发 | `server/controllers/auth.js` | :25-96 |
-| 自动登录（取 order 最前策略） | `server/controllers/auth.js` | :37-43 |
+| 自动登录（取 order 最前策略 / 不检查 isEnabled） | `server/controllers/auth.js` | :37-43 |
 | GraphQL 策略更新 `updateStrategies()` | `server/graph/resolvers/authentication.js` | :200-249 |
 | 删除策略时的用户关联检查 | `server/graph/resolvers/authentication.js` | :232-238 |
+| `activeStrategies` 查询（enabledOnly 过滤） | `server/graph/resolvers/authentication.js` | :52-74 |
 | HA 集群 PG LISTEN/NOTIFY | `server/core/db.js` | :240-265 |
+| 冷启动时序 `postBootMaster()` | `server/core/kernel.js` | :71-90 |
+| 配置服务（`loadFromDb`/`saveToDb`） | `server/core/config.js` | :83-135 |
+| 通用缓存 `init()` | `server/core/cache.js` | :1-7 |
 | 前端登录组件 | `client/components/login.vue` | :1-697 |
 | 前端策略查询 Apollo（按 order 排序） | `client/components/login.vue` | :669-695 |
-| 前端 filteredStrategies（hideLocal 逻辑） | `client/components/login.vue` | :310-316 |
-| 前端 selectedStrategyKey watcher | `client/components/login.vue` | :328-342 |
-| 前端 filteredStrategies watcher（默认选中首项） | `client/components/login.vue` | :323-327 |
+| 前端 `filteredStrategies`（hideLocal 逻辑） | `client/components/login.vue` | :310-316 |
+| 前端 `selectedStrategyKey` watcher | `client/components/login.vue` | :328-342 |
+| 前端 `filteredStrategies` watcher（默认选中首项） | `client/components/login.vue` | :323-327 |
+| 前端表单模板（Local/LDAP 共用） | `client/components/login.vue` | :41-43 |
 | 管理后台策略配置页 | `client/components/admin/admin-auth.vue` | :1-433 |
 | 管理后台拖拽排序保存 | `client/components/admin/admin-auth.vue` | :294-339 |
 | Local 策略不可禁用/删除约束 | `client/components/admin/admin-auth.vue` | :68, :98 |
+| 动态新增策略实例 `addStrategy()` | `client/components/admin/admin-auth.vue` | :268-289 |
 | Local 策略实现 | `server/modules/authentication/local/authentication.js` | :1-44 |
-| Google 策略实现（含 conf.key 区分多实例） | `server/modules/authentication/google/authentication.js` | :11-64 |
+| Google 策略实现（含 `conf.key` 区分多实例） | `server/modules/authentication/google/authentication.js` | :11-64 |
 | SAML 策略实现 | `server/modules/authentication/saml/authentication.js` | :1-86 |
-| 初始化插入 Local 策略（order=0） | `server/setup.js` | :259-269 |
+| LDAP 策略实现（含组映射协同） | `server/modules/authentication/ldap/authentication.js` | :11-74 |
+| LDAP 策略定义（`useForm=true`） | `server/modules/authentication/ldap/definition.yml` | :1-165 |
+| Local 策略定义（`useForm=true`） | `server/modules/authentication/local/definition.yml` | :1-30 |
+| 初始化插入 Local 策略（`order=0`） | `server/setup.js` | :259-269 |
