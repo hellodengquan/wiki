@@ -1197,7 +1197,658 @@ addStrategy (str) {
 
 ---
 
-## 十二、关键源码位置索引
+## 十二、策略的审计日志与登录失败告警机制
+
+Wiki.js 的登录审计由 **三层防护** 构成：暴力破解防护（Brute Force）、速率限制（Rate Limit）、日志记录（Logging）。三者协同构成完整的登录安全监控体系。
+
+### 12.1 暴力破解防护：express-brute + Knex 存储
+
+针对旧版 IE 登录表单（`POST /login`），Wiki.js 使用 `express-brute` 中间件进行暴力破解防护：
+
+```js
+// server/controllers/auth.js:4-20
+const ExpressBrute = require('express-brute')
+const BruteKnex = require('../helpers/brute-knex')
+
+const bruteforce = new ExpressBrute(new BruteKnex({
+  createTable: true,
+  knex: WIKI.models.knex
+}), {
+  freeRetries: 5,           // 免费重试次数
+  minWait: 5 * 60 * 1000,   // 超过后首次等待 5 分钟
+  maxWait: 60 * 60 * 1000,  // 最大等待 1 小时
+  failCallback: (req, res, next) => {
+    res.status(401).send('Too many failed attempts. Try again later.')
+  }
+})
+
+router.post('/login', bruteforce.prevent, async (req, res, next) => {
+  // ... 登录逻辑
+  req.brute.reset()  // 登录成功，重置计数器
+})
+```
+
+**BruteKnex 存储**（`server/helpers/brute-knex.js`）将攻击记录持久化到数据库 `brute` 表中：
+
+| 字段 | 说明 |
+|------|------|
+| `key` | 客户端标识（IP + User-Agent 哈希） |
+| `count` | 失败次数 |
+| `firstRequest` | 首次请求时间戳 |
+| `lastRequest` | 最近请求时间戳 |
+| `lifetime` | 记录有效期（秒） |
+
+锁定算法是指数退避：失败 5 次后，第 6 次需等 5 分钟，第 7 次 10 分钟，依此类推直到 1 小时上限。
+
+### 12.2 GraphQL 速率限制：@rateLimit 指令
+
+GraphQL 登录接口使用 `graphql-rate-limit-directive` 进行细粒度限流，在 Schema 中声明：
+
+```graphql
+# server/graph/schemas/authentication.graphql:44-56
+login(
+  username: String!
+  password: String!
+  strategy: String!
+): AuthenticationLoginResponse @rateLimit(limit: 5, duration: 60)
+
+loginTFA(
+  securityCode: String!
+  continuationToken: String!
+  setup: Boolean = false
+): AuthenticationLoginResponse @rateLimit(limit: 5, duration: 60)
+
+loginWithoutPassword(
+  strategy: String!
+): AuthenticationLoginResponse @rateLimit(limit: 5, duration: 60)
+```
+
+规则：**同一策略的登录接口，每 60 秒最多调用 5 次**。限流基于客户端 IP，存储在内存 `NodeCache` 中（`server/core/cache.js`）。
+
+与 `express-brute` 的区别：
+- `express-brute` 针对旧版表单登录，有指数退避，数据持久化
+- `@rateLimit` 针对 GraphQL 接口，固定窗口限流，数据在内存
+- 两者独立计数，需同时满足才能登录
+
+### 12.3 登录失败的错误分类体系
+
+Wiki.js 定义了丰富的认证错误类型，便于日志分析和告警：
+
+| 错误类 | 触发场景 | 代码位置 |
+|--------|---------|---------|
+| `AuthProviderInvalid` | 策略不存在 / 未启用 | `users.js:297,330` |
+| `AuthLoginFailed` | 密码错误 / 凭证无效 / 认证失败 | `users.js:118,316` |
+| `AuthAccountBanned` | 用户被禁用 | `users.js:231,429` / `local.js:26` |
+| `AuthAccountNotVerified` | Local 用户邮箱未验证 | `local.js:28` |
+| `AuthTFAFailed` | 2FA 验证码错误 | `users.js:482` |
+| `AuthTFAInvalid` | TFA 请求参数无效 | `users.js:486` |
+| `AuthGenericError` | 认证流程异常 | `users.js:365,382,402,425` |
+| `AuthRegistrationDisabled` | 自注册未启用 | `auth.js:145` / `users.js:863` |
+| `AuthRegistrationDomainUnauthorized` | 邮箱不在白名单 | `users.js:256,811` |
+| `AuthAccountAlreadyExists` | 邮箱已被注册 | `users.js:672,691,860` |
+| `AuthValidationTokenInvalid` | 验证 Token 无效 | `userKeys.js:65,69` |
+
+每个策略模块内部也会抛出策略特定的错误，例如 Google 策略：
+```js
+// server/modules/authentication/google/authentication.js:43-46
+} catch (err) {
+  if (err instanceof WIKI.Error.AuthAccountBanned) {
+    cb(err, null)
+  } else {
+    cb(new Error(`Google authentication failed: ${err.message}`), null)
+  }
+}
+```
+
+### 12.4 审计日志记录
+
+Wiki.js 使用 Winston 日志系统记录登录事件，日志输出到控制台和文件。
+
+**登录成功日志**：
+- `afterLoginChecks()` 更新用户 `lastLoginAt` 字段（`users.js:437`）
+- JWT 签发成功无显式日志，但可通过日志级别配置开启
+- 管理后台"系统日志"页面可查看所有系统事件
+
+**登录失败日志**：
+- Local 策略密码错误：`WIKI.Error.AuthLoginFailed` 被全局错误处理器记录
+- LDAP 调试模式：`ldapdebug` flag 开启后打印详细错误（`ldap.js:67-69`）
+- 策略初始化失败：`WIKI.logger.error()` 记录错误堆栈（`auth.js:96-98`）
+- 暴力破解拦截：`express-brute` 返回 401，由 HTTP 日志记录
+
+**日志级别配置**（`config.yml`）：
+```yaml
+logLevel: info  # error, warn, info, verbose, debug, silly
+```
+
+设置为 `debug` 可看到 Passport 内部的详细认证流程日志。
+
+### 12.5 告警与通知机制
+
+Wiki.js 本身不内置告警推送，但可通过以下方式实现：
+
+1. **日志转发**：将 Winston 日志转发到 ELK、Splunk、Datadog 等 SIEM 系统，配置告警规则
+2. **Webhook 扩展**：在 `afterLoginChecks()` 中添加自定义 Webhook 调用
+3. **邮件通知**：多次失败后触发邮件告警（需自定义代码）
+4. **`WIKI.telemetry`**：系统会自动将严重错误发送到 Wiki.js 遥测服务（可在配置中关闭）
+
+---
+
+## 十三、自定义策略插件开发指南
+
+Wiki.js 的策略体系完全插件化，开发者可以按照标准模板开发自定义认证策略。本节提供完整的开发指南。
+
+### 13.1 插件目录结构
+
+每个策略插件必须放在 `server/modules/authentication/<策略名>/` 目录下，包含以下文件：
+
+```
+server/modules/authentication/
+  mystrategy/
+    ├── definition.yml      # 策略元数据定义（必需）
+    ├── authentication.js   # 策略实现（必需）
+    ├── icon.svg            # 图标（可选，推荐）
+    └── README.md           # 说明文档（可选）
+```
+
+### 13.2 definition.yml 完整规范
+
+```yaml
+# 唯一标识，全小写，无空格（必需）
+key: mystrategy
+
+# 显示名称（必需）
+title: My Custom Strategy
+
+# 描述（可选）
+description: Authenticate users against my custom identity provider
+
+# 作者（可选）
+author: yourcompany.com
+
+# Logo URL（可选）
+logo: https://yourcompany.com/logo.png
+
+# 品牌色，用于登录按钮（可选）
+color: indigo darken-2
+
+# 官方网站（可选）
+website: https://yourcompany.com
+
+# 是否可用（可选，默认 true）
+isAvailable: true
+
+# ================ 核心字段 ================
+
+# true=表单登录（用户名+密码），false=跳转登录（OAuth/OIDC/SAML等）（必需）
+useForm: true
+
+# 表单用户名字段类型：email / username（仅 useForm=true 时需要）
+usernameType: email
+
+# OAuth 授权范围（仅 useForm=false 时需要）
+scopes:
+  - openid
+  - profile
+  - email
+
+# ================ 配置项定义 ================
+# 管理员在后台可配置的参数列表
+
+props:
+  # 字符串类型示例
+  clientId:
+    title: Client ID
+    type: String
+    default: ''
+    hint: The OAuth client ID issued by your provider
+    order: 1
+    maxWidth: 600
+
+  # 密码类型示例（输入框遮罩）
+  clientSecret:
+    title: Client Secret
+    type: String
+    default: ''
+    order: 2
+
+  # 布尔类型示例
+  useSSL:
+    title: Use SSL
+    type: Boolean
+    default: true
+    order: 3
+
+  # 下拉选择示例
+  environment:
+    title: Environment
+    type: List
+    default: production
+    values:
+      - value: production
+        label: Production
+      - value: sandbox
+        label: Sandbox
+    order: 4
+
+  # 数字类型示例
+  timeout:
+    title: Timeout (seconds)
+    type: Number
+    default: 30
+    min: 5
+    max: 300
+    order: 5
+
+  # 多行文本示例
+  certificate:
+    title: Public Certificate
+    type: TextArea
+    default: ''
+    rows: 10
+    order: 6
+```
+
+**props 字段类型说明**：
+
+| 类型 | 渲染组件 | 说明 |
+|------|---------|------|
+| `String` | 单行文本输入 | 最常用，支持 `default`、`hint`、`maxWidth` |
+| `Number` | 数字输入 | 支持 `min`、`max` 校验 |
+| `Boolean` | 开关 | `true` / `false` |
+| `List` | 下拉选择 | 通过 `values` 数组定义选项 |
+| `TextArea` | 多行文本 | 支持 `rows` 定义高度 |
+
+### 13.3 authentication.js 标准接口
+
+策略实现模块必须导出 `init()` 方法，可选导出 `logout()` 方法。
+
+**模板一：表单类策略（useForm=true）**
+
+```js
+/* global WIKI */
+
+const MyStrategy = require('passport-mystrategy').Strategy
+
+module.exports = {
+  /**
+   * 初始化策略，注册到 Passport
+   * @param {Object} passport - Passport 实例
+   * @param {Object} conf - 配置对象（管理员填写的 props + callbackURL + key）
+   */
+  init (passport, conf) {
+    passport.use(conf.key,
+      new MyStrategy({
+        // 策略特定配置
+        serverUrl: conf.serverUrl,
+        useSSL: conf.useSSL,
+        timeout: conf.timeout,
+        usernameField: 'email',     // 表单字段映射
+        passwordField: 'password',
+        passReqToCallback: true     // 必须为 true，才能获取 req.params.strategy
+      }, async (req, username, password, cb) => {
+        try {
+          // 1. 调用你的认证逻辑验证用户名密码
+          const profile = await myCustomAuth(username, password, conf)
+
+          // 2. 调用 processProfile 创建/更新本地用户
+          const user = await WIKI.models.users.processProfile({
+            providerKey: req.params.strategy,
+            profile: {
+              id: profile.id,           // 必需：外部用户唯一标识
+              email: profile.email,     // 必需：用户邮箱
+              displayName: profile.name, // 推荐：显示名称
+              picture: profile.avatar    // 可选：头像 URL
+            }
+          })
+
+          // 3. 返回用户给 Passport
+          cb(null, user)
+        } catch (err) {
+          // 处理特定错误类型
+          if (err.code === 'USER_BANNED') {
+            cb(new WIKI.Error.AuthAccountBanned(), null)
+          } else if (err.code === 'INVALID_CREDENTIALS') {
+            cb(new WIKI.Error.AuthLoginFailed(), null)
+          } else {
+            cb(err, null)
+          }
+        }
+      })
+    )
+  }
+}
+```
+
+**模板二：跳转类策略（useForm=false）**
+
+```js
+/* global WIKI */
+
+const OAuth2Strategy = require('passport-oauth2').Strategy
+
+module.exports = {
+  init (passport, conf) {
+    passport.use(conf.key,
+      new OAuth2Strategy({
+        authorizationURL: conf.authorizationURL,
+        tokenURL: conf.tokenURL,
+        clientID: conf.clientId,
+        clientSecret: conf.clientSecret,
+        callbackURL: conf.callbackURL,  // 已由 activateStrategies 注入
+        scope: conf.scopes,
+        passReqToCallback: true
+      }, async (req, accessToken, refreshToken, profile, cb) => {
+        try {
+          // 可选：在 session 中存储 token 供登出使用
+          req.session.mystrategy_access_token = accessToken
+
+          // 调用 processProfile
+          const user = await WIKI.models.users.processProfile({
+            providerKey: req.params.strategy,
+            profile: {
+              id: profile.id,
+              email: profile.email,
+              name: profile.displayName,
+              picture: profile.photos ? profile.photos[0].value : ''
+            }
+          })
+
+          cb(null, user)
+        } catch (err) {
+          cb(err, null)
+        }
+      })
+    )
+  },
+
+  /**
+   * 可选：自定义登出逻辑
+   * @param {Object} conf - 策略配置
+   * @param {Object} context - 请求上下文（含 req）
+   * @returns {string} 登出后跳转 URL
+   */
+  logout (conf, context) {
+    if (conf.logoutUpstream && conf.logoutURL) {
+      const idToken = context.req.session.mystrategy_id_token
+      const returnUrl = encodeURIComponent(WIKI.config.host)
+      return `${conf.logoutURL}?post_logout_redirect_uri=${returnUrl}&id_token_hint=${idToken}`
+    }
+    return '/'  // 默认跳转到首页
+  }
+}
+```
+
+### 13.4 processProfile 调用规范
+
+`WIKI.models.users.processProfile()` 是所有非 Local 策略的标准入口，它处理：
+
+1. **精确查找**：`providerId + providerKey` 查找已有用户
+2. **自动关联**：同策略下同邮箱且 `providerId` 为空的用户自动关联
+3. **自注册创建**：`selfRegistration=true` 时自动创建新用户
+4. **属性同步**：每次登录更新 email、displayName、picture
+
+调用时必须传递：
+```js
+const user = await WIKI.models.users.processProfile({
+  providerKey: req.params.strategy,  // 必须，标识策略实例
+  profile: {
+    id: 'external-user-123',          // 必须，外部系统唯一 ID
+    email: 'user@example.com',        // 必须，用户邮箱
+    displayName: 'John Doe',          // 推荐，显示名称
+    picture: 'https://...'            // 可选，头像
+  }
+})
+```
+
+### 13.5 开发与调试流程
+
+1. **创建目录**：`server/modules/authentication/mystrategy/`
+2. **编写 definition.yml**：定义策略元数据和配置项
+3. **编写 authentication.js**：实现 `init()` 方法
+4. **重启服务**：Wiki.js 启动时会自动扫描 `refreshStrategiesFromDisk()` 加载新策略
+5. **后台配置**：登录管理后台 → 认证 → 添加策略 → 选择你的策略 → 填写配置 → 应用
+6. **测试登录**：访问 `/login?all` 查看策略是否出现在列表中
+
+**调试技巧**：
+- 设置 `logLevel: debug` 查看详细日志
+- 表单类策略可直接在前端填写用户名密码测试
+- 跳转类策略需确保 `callbackURL` 与 OAuth 提供商配置一致
+- 使用 `?all` 参数绕过 autoLogin 和 hideLocal 强制显示完整列表
+
+### 13.6 注意事项
+
+- **`passReqToCallback` 必须为 true**：否则无法获取 `req.params.strategy`，导致 `processProfile` 失败
+- **`callbackURL` 由系统注入**：不要在 `init()` 中硬编码，使用 `conf.callbackURL`
+- **`conf.key` 作为 Passport 策略名**：`passport.use(conf.key, strategy)`，确保多实例共存
+- **错误类型优先使用内置错误**：`WIKI.Error.AuthLoginFailed` 等，统一前端提示
+- **组映射可选实现**：参考 LDAP 策略，在 `init()` 回调中调用 `user.$relatedQuery('groups').relate()`
+
+---
+
+## 十四、策略与会话生命周期的耦合点
+
+Wiki.js 的认证体系采用 **双轨制**：OAuth/社交类策略使用 Express Session 存储中间状态，而 API 鉴权使用无状态 JWT。两者在策略实现中有多处耦合点。
+
+### 14.1 会话初始化：express-session + Knex 存储
+
+会话中间件在 `server/master.js:79-86` 初始化：
+
+```js
+app.use(session({
+  secret: WIKI.config.sessionSecret,     // 会话签名密钥，与 JWT 共用
+  resave: false,
+  saveUninitialized: false,              // 仅在有数据时创建会话
+  store: new KnexSessionStore({          // 持久化到数据库 session 表
+    knex: WIKI.models.knex
+  })
+}))
+app.use(WIKI.auth.passport.initialize())  // Passport 初始化
+app.use(WIKI.auth.passport.session())     // Passport 会话支持（但默认不使用）
+app.use(WIKI.auth.authenticate)           // JWT 鉴权中间件
+```
+
+关键配置：
+- `saveUninitialized: false`：匿名用户不创建会话，仅在 OAuth 跳转时才创建
+- `KnexSessionStore`：会话持久化到数据库，支持多实例部署
+- 会话 cookie 默认配置：`HttpOnly=true`，`Secure=auto`（HTTPS 时启用）
+
+### 14.2 useForm 决定 Session 模式
+
+`User.login()` 中根据策略类型决定是否使用 Session：
+
+```js
+// server/models/users.js:311-313
+WIKI.auth.passport.authenticate(selStrategy.key, {
+  session: !strInfo.useForm,   // 表单类=false，跳转类=true
+  scope: strInfo.scopes || null
+}, callback)
+```
+
+| 策略类型 | `session` 参数 | 行为 |
+|---------|---------------|------|
+| Local/LDAP（useForm=true） | `false` | 无状态，认证后立即签发 JWT，不使用 Passport Session |
+| Google/OAuth/SAML（useForm=false） | `true` | 有状态，OAuth 回调期间使用 Session 存储 state、nonce、token 等 |
+
+**为什么 OAuth 需要 Session**：
+1. OAuth 协议需要在授权请求和回调之间保持 `state` 参数防止 CSRF
+2. OIDC 的 `nonce` 参数需要持久化以防止重放攻击
+3. 部分策略（如 Keycloak）需要在 Session 中存储 `id_token` 供登出使用
+4. Passport OAuth 策略内部依赖 Session 存储中间状态
+
+### 14.3 Session 中的策略数据结构
+
+不同策略在 Session 中存储的数据不同，以 Keycloak 为例：
+
+```js
+// server/modules/authentication/keycloak/authentication.js:39
+req.session.keycloak_id_token = results.id_token  // 存储 id_token 供登出使用
+
+// server/modules/authentication/keycloak/authentication.js:51
+const idToken = context.req.session.keycloak_id_token  // 登出时读取
+```
+
+Session 中的数据命名约定：
+- `passport`：Passport 内部存储的用户信息（但 Wiki.js 不依赖这个）
+- `<strategy>_id_token`：策略特定的 id_token
+- `<strategy>_access_token`：策略特定的 access_token
+- `<strategy>_state`：OAuth state 参数
+- `oauth2:state`：通用 OAuth 2.0 state
+
+### 14.4 登录流程中的 Session 生命周期（OAuth 场景）
+
+```
+┌─ 用户点击 "Sign in with Google" ─────────────────────────────┐
+│  GET /login/google                                            │
+│                                                                │
+│  1. passport.authenticate('google', { session: true })        │
+│     → 生成 OAuth state、nonce                                  │
+│     → 存储到 req.session['oauth2:state']                      │
+│     → 重定向到 Google 授权页                                   │
+└──────────────────────────────────┬────────────────────────────┘
+                                   │
+                                   ▼
+┌─ 用户在 Google 完成授权 ─────────────────────────────────────┐
+│  GET /login/google/callback?code=xxx&state=yyy                │
+│                                                                │
+│  2. passport.authenticate('google', { session: true })        │
+│     → 从 req.session 读取 state 验证                          │
+│     → 用 code 换 token                                        │
+│     → 用 token 取用户 profile                                 │
+│     → 调用 processProfile 创建/更新本地用户                    │
+│                                                                │
+│  3. 调用 req.logIn(user, { session: false })                  │
+│     → 不写入 Passport Session（注意这里是 false!）             │
+│     → 直接签发 JWT                                            │
+│                                                                │
+│  4. 策略可选在 Session 存储 token                              │
+│     → req.session.keycloak_id_token = results.id_token        │
+│                                                                │
+│  5. 返回前端，Set-Cookie: jwt=xxx                             │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**注意第 3 步的矛盾**：虽然 `authenticate()` 时 `session=true`（用于 OAuth 状态保持），但 `logIn()` 时 `session=false`（不持久化用户到 Session）。最终认证结果还是通过 JWT 传递，Session 仅在 OAuth 往返期间临时使用。
+
+### 14.5 JWT 鉴权：完全无状态
+
+所有后续 API 请求通过 `authenticate()` 中间件使用 JWT 鉴权，不依赖 Session：
+
+```js
+// server/core/auth.js:113-114
+app.use(WIKI.auth.passport.authenticate('jwt', { session: false },
+  async (err, user, info) => {
+    // JWT 验证通过后，user 附加到 req.user
+  })
+)
+```
+
+JWT 本身包含：
+```json
+{
+  "id": 123,
+  "email": "user@example.com",
+  "name": "John Doe",
+  "groups": [1, 2, 3],
+  "permissions": ["read:pages", "write:pages"],
+  "exp": 1717234567,
+  "iat": 1717230967
+}
+```
+
+JWT 验证使用公钥（`WIKI.config.certs.public`），无需查询数据库，完全无状态。
+
+### 14.6 登出流程中的 Session 清理
+
+登出路由（`server/controllers/auth.js:129-134`）：
+
+```js
+router.get('/logout', async (req, res) => {
+  const redirURL = await WIKI.models.users.logout({ req, res })
+  req.logout()           // 清理 Passport 会话
+  res.clearCookie('jwt') // 删除 JWT cookie
+  res.redirect(redirURL) // 跳转
+})
+```
+
+`WIKI.models.users.logout()` 调用策略的 `logout()` 方法（如果定义）：
+
+```js
+// server/models/users.js:492-506
+static async logout ({ req }) {
+  const user = await WIKI.models.users.query()
+    .findById(req.user.id)
+    .select('providerKey')
+  const provider = _.find(WIKI.auth.strategies, ['key', user.providerKey])
+
+  // 清理策略特定的 Session 数据
+  if (provider && _.isFunction(provider.logout)) {
+    const redir = provider.logout(provider.config, { req })
+    // 可选：在这里清理 req.session 中的策略数据
+    return redir
+  }
+
+  // 可选：销毁整个 Session
+  // req.session.destroy()
+
+  return '/'
+}
+```
+
+**Keycloak 登出示例**：
+```js
+// server/modules/authentication/keycloak/authentication.js:47-67
+logout (conf, context) {
+  const idToken = context.req.session.keycloak_id_token
+  if (conf.logoutUpstream && conf.logoutURL && idToken) {
+    const redirURL = encodeURIComponent(WIKI.config.host)
+    return `${conf.logoutURL}?post_logout_redirect_uri=${redirURL}&id_token_hint=${idToken}`
+  }
+  return '/'
+}
+```
+
+### 14.7 JWT 吊销机制
+
+JWT 是无状态的，无法直接吊销。Wiki.js 使用 `revocationList` 缓存实现软吊销：
+
+```js
+// server/core/auth.js:23
+revocationList: require('./cache').init(),  // NodeCache 实例
+
+// server/core/auth.js:128-135
+const uRevalidate = WIKI.auth.revocationList.get(`u${user.id}`)
+if (uRevalidate && uRevalidate > iat) {
+  return next(new WIKI.Error.AuthTokenRevoked())
+}
+for (const gid of groups) {
+  const gRevalidate = WIKI.auth.revocationList.get(`g${gid}`)
+  if (gRevalidate && gRevalidate > iat) {
+    return next(new WIKI.Error.AuthTokenRevoked())
+  }
+}
+```
+
+- `u<user_id>`：用户级吊销时间戳
+- `g<group_id>`：组级吊销时间戳
+- 比较 JWT 的 `iat`（签发时间）与吊销时间戳，若签发早于吊销则拒绝
+- 缓存有效期与 JWT 有效期一致，到期自动清理
+
+### 14.8 耦合点总结表
+
+| 耦合点 | 表单类策略（Local/LDAP） | 跳转类策略（OAuth/SAML） |
+|-------|-------------------------|-------------------------|
+| `passport.authenticate` `session` 参数 | `false` | `true` |
+| 登录期间 Session 使用 | 不使用 | 存储 state/nonce/token |
+| `req.logIn` `session` 参数 | `false` | `false`（最终还是 JWT） |
+| Passport Session 用户持久化 | 否 | 否 |
+| `logout()` 自定义 | 不需要 | 通常需要（跳转第三方登出） |
+| Session 中存储的数据 | 无 | id_token/access_token 等 |
+| 后续请求鉴权方式 | JWT | JWT |
+| 依赖 `express-session` | 不依赖（但中间件仍加载） | 依赖（OAuth 状态保持） |
+
+---
+
+## 十五、关键源码位置索引
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1206,24 +1857,33 @@ addStrategy (str) {
 | JWT 中间件认证 `authenticate()` | `server/core/auth.js` | :113-212 |
 | HA 事件订阅 `subscribeToEvents()` | `server/core/auth.js` | :478-491 |
 | 证书重签 → 触发策略重载 | `server/core/auth.js` | :410-443 |
-| 认证缓存（`revocationList`） | `server/core/auth.js` | :23 |
+| 认证缓存（`revocationList`）JWT 吊销 | `server/core/auth.js` | :23, :128-135 |
 | 策略数据模型 | `server/models/authentication.js` | :13-131 |
 | 从磁盘刷新策略定义 `refreshStrategiesFromDisk()` | `server/models/authentication.js` | :78-130 |
 | 获取策略列表（按 order 排序） `getStrategies()` | `server/models/authentication.js` | :37-44 |
 | 旧版客户端策略分类 | `server/models/authentication.js` | :46-76 |
 | 用户登录挑选逻辑 `login()`（无策略链设计） | `server/models/users.js` | :293-332 |
 | Passport 认证回调（失败短路） | `server/models/users.js` | :314-316 |
-| 登录后检查 `afterLoginChecks()` | `server/models/users.js` | :337-413 |
-| 社交登录 Profile 处理 `processProfile()`（外部认证+本地创建协同） | `server/models/users.js` | :165-288 |
+| 登录后检查 `afterLoginChecks()`（更新 lastLoginAt） | `server/models/users.js` | :337-413, :437 |
+| 社交登录 Profile 处理 `processProfile()` | `server/models/users.js` | :165-288 |
+| 用户登出 `logout()`（调用策略 logout 方法） | `server/models/users.js` | :492-506 |
+| 认证错误定义体系（13 种错误类） | `server/models/users.js` | :118, :231, :256, :297, :316, :330, :365, :382, :402, :425, :429, :482, :486 |
 | 路由分发 | `server/controllers/auth.js` | :25-96 |
 | 自动登录（取 order 最前策略 / 不检查 isEnabled） | `server/controllers/auth.js` | :37-43 |
+| 暴力破解防护 `express-brute` 初始化 | `server/controllers/auth.js` | :4-20 |
+| 旧版登录表单 `POST /login`（bruteforce.prevent） | `server/controllers/auth.js` | :101-124 |
+| 登出路由 `GET /logout`（清理会话 + JWT） | `server/controllers/auth.js` | :129-134 |
+| BruteKnex 存储实现（持久化到 brute 表） | `server/helpers/brute-knex.js` | :1-170 |
+| GraphQL 登录限流 `@rateLimit` Schema | `server/graph/schemas/authentication.graphql` | :44-60 |
+| GraphQL 限流指令实现 | `server/graph/directives/rate-limit.js` | :1-30 |
 | GraphQL 策略更新 `updateStrategies()` | `server/graph/resolvers/authentication.js` | :200-249 |
 | 删除策略时的用户关联检查 | `server/graph/resolvers/authentication.js` | :232-238 |
 | `activeStrategies` 查询（enabledOnly 过滤） | `server/graph/resolvers/authentication.js` | :52-74 |
 | HA 集群 PG LISTEN/NOTIFY | `server/core/db.js` | :240-265 |
 | 冷启动时序 `postBootMaster()` | `server/core/kernel.js` | :71-90 |
 | 配置服务（`loadFromDb`/`saveToDb`） | `server/core/config.js` | :83-135 |
-| 通用缓存 `init()` | `server/core/cache.js` | :1-7 |
+| 通用缓存 `init()`（NodeCache） | `server/core/cache.js` | :1-7 |
+| 会话中间件初始化（express-session + KnexStore） | `server/master.js` | :79-88 |
 | 前端登录组件 | `client/components/login.vue` | :1-697 |
 | 前端策略查询 Apollo（按 order 排序） | `client/components/login.vue` | :669-695 |
 | 前端 `filteredStrategies`（hideLocal 逻辑） | `client/components/login.vue` | :310-316 |
@@ -1234,10 +1894,16 @@ addStrategy (str) {
 | 管理后台拖拽排序保存 | `client/components/admin/admin-auth.vue` | :294-339 |
 | Local 策略不可禁用/删除约束 | `client/components/admin/admin-auth.vue` | :68, :98 |
 | 动态新增策略实例 `addStrategy()` | `client/components/admin/admin-auth.vue` | :268-289 |
-| Local 策略实现 | `server/modules/authentication/local/authentication.js` | :1-44 |
+| Local 策略实现（`useForm=true`，`AuthAccountBanned`） | `server/modules/authentication/local/authentication.js` | :11-44, :26-28 |
+| Local 策略定义 | `server/modules/authentication/local/definition.yml` | :1-30 |
 | Google 策略实现（含 `conf.key` 区分多实例） | `server/modules/authentication/google/authentication.js` | :11-64 |
+| Google 策略错误处理（区分错误类型） | `server/modules/authentication/google/authentication.js` | :43-46 |
 | SAML 策略实现 | `server/modules/authentication/saml/authentication.js` | :1-86 |
 | LDAP 策略实现（含组映射协同） | `server/modules/authentication/ldap/authentication.js` | :11-74 |
-| LDAP 策略定义（`useForm=true`） | `server/modules/authentication/ldap/definition.yml` | :1-165 |
-| Local 策略定义（`useForm=true`） | `server/modules/authentication/local/definition.yml` | :1-30 |
+| LDAP 调试模式错误日志（`ldapdebug` flag） | `server/modules/authentication/ldap/authentication.js` | :67-69 |
+| LDAP 策略定义 | `server/modules/authentication/ldap/definition.yml` | :1-165 |
+| Keycloak 策略实现（Session 存储 id_token） | `server/modules/authentication/keycloak/authentication.js` | :11-68 |
+| Keycloak 登出逻辑（`logout()` 方法） | `server/modules/authentication/keycloak/authentication.js` | :47-67 |
+| Keycloak Session 读写 id_token | `server/modules/authentication/keycloak/authentication.js` | :39, :51 |
 | 初始化插入 Local 策略（`order=0`） | `server/setup.js` | :259-269 |
+| 验证 Token 错误 | `server/models/userKeys.js` | :65, :69 |
