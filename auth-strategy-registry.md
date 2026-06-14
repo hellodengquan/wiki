@@ -1848,7 +1848,645 @@ for (const gid of groups) {
 
 ---
 
-## 十五、关键源码位置索引
+## 十五、跨多个 Wiki.js 实例的 SSO 协同
+
+Wiki.js 本身不内置"多实例 SSO 中心"的概念，但通过共享基础设施和配置同步，可以实现多个 Wiki.js 实例之间的单点登录协同。本节详解其底层机制和配置方案。
+
+### 15.1 SSO 协同的基础设施前提
+
+多实例 SSO 协同依赖以下共享基础设施：
+
+| 组件 | 共享方式 | 目的 |
+|------|---------|------|
+| PostgreSQL 数据库 | 所有实例连接同一数据库 | 共享 `users`、`authentication`、`session`、`brute` 表 |
+| JWT 签名密钥 | 所有实例使用相同的 `certs` 和 `sessionSecret` | 确保一个实例签发的 JWT 在所有实例上可验证 |
+| Cookie 域 | 配置为同一父域名（如 `.company.com`） | JWT Cookie 可在 `wiki1.company.com`、`wiki2.company.com` 间共享 |
+| HA 事件通道 | 同一 PostgreSQL 的 `LISTEN/NOTIFY` | 策略配置变更实时同步到所有实例 |
+
+### 15.2 共享数据库的表级协同
+
+多个 Wiki.js 实例连接同一 PostgreSQL 数据库时，以下表是 SSO 协同的核心：
+
+| 表名 | 协同作用 |
+|------|---------|
+| `users` | 用户数据全局一致，`providerId + providerKey` 唯一标识用户 |
+| `authentication` | 策略配置全局一致，管理员在任一实例修改自动同步 |
+| `session` | 会话持久化到数据库，OAuth 回调可跨实例完成 |
+| `brute` | 暴力破解计数全局共享，攻击者无法通过切换实例绕过 |
+| `settings` | 全局配置（如 `sessionSecret`、`certs`）所有实例一致 |
+
+**关键约束**：
+- 所有实例必须使用相同的数据库用户权限
+- 数据库连接池配置需考虑多实例并发
+- `WIKI.INSTANCE_ID` 必须在每个实例上唯一（用于 HA 事件过滤）
+
+### 15.3 JWT Cookie 的跨域共享
+
+JWT Cookie 配置由 `getCookieOpts()` 控制（`server/helpers/common.js:45-50`）：
+
+```js
+getCookieOpts () {
+  return {
+    expires: DateTime.utc().plus({ days: 365 }).toJSDate(),
+    ...(WIKI.config.host.startsWith('https://') ? { secure: true } : {})
+  }
+}
+```
+
+**实现跨实例共享的配置修改**：
+
+```yaml
+# config.yml 中需要额外配置
+host: https://wiki1.company.com
+auth:
+  cookieDomain: .company.com  # 需扩展代码支持
+```
+
+Wiki.js 默认不设置 `domain` 字段，因此 Cookie 仅对当前实例域名有效。要实现跨实例共享，需要修改 `getCookieOpts()` 添加 `domain` 配置：
+
+```js
+// 修改 server/helpers/common.js:45-50
+getCookieOpts () {
+  return {
+    expires: DateTime.utc().plus({ days: 365 }).toJSDate(),
+    ...(WIKI.config.host.startsWith('https://') ? { secure: true } : {}),
+    ...(WIKI.config.auth.cookieDomain ? { domain: WIKI.config.auth.cookieDomain } : {})
+  }
+}
+```
+
+**跨实例登录验证流程**：
+```
+┌─ 实例 A (wiki1.company.com) ───────────────────────────────┐
+│  用户登录成功 → Set-Cookie: jwt=xxx; Domain=.company.com   │
+└───────────────────────────────┬───────────────────────────┘
+                                │
+                                ▼
+                    浏览器携带 Cookie 访问
+                                │
+                                ▼
+┌─ 实例 B (wiki2.company.com) ───────────────────────────────┐
+│  GET / → Cookie: jwt=xxx                                   │
+│  → authenticate() 中间件用共享公钥验证 JWT                  │
+│  → 验证通过 → 无需重复登录 → 直接访问                       │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 15.4 JWT 签名密钥的全局一致性
+
+JWT 使用 RS256 非对称签名，签发用私钥，验证用公钥：
+
+```js
+// server/models/users.js:440-460
+jwt.sign(payload, {
+  key: WIKI.config.certs.private,      // 私钥签发
+  passphrase: WIKI.config.sessionSecret
+}, {
+  algorithm: 'RS256',
+  expiresIn: WIKI.config.auth.tokenExpiration,
+  audience: WIKI.config.auth.audience,  // 默认为 'urn:wiki.js'
+  issuer: 'urn:wiki.js'
+})
+```
+
+**多实例一致性要求**：
+- `WIKI.config.certs.private` / `WIKI.config.certs.public` 必须在所有实例间相同
+- `WIKI.config.sessionSecret` 必须在所有实例间相同
+- `WIKI.config.auth.audience` 必须在所有实例间相同（默认 `urn:wiki.js`）
+- `WIKI.config.auth.tokenExpiration` 建议在所有实例间一致
+
+### 15.5 OAuth 回调的跨实例协同
+
+OAuth 认证需要请求和回调在同一个会话上下文中。多实例部署下，可通过以下方式确保协同：
+
+**方案一：会话粘性（Session Affinity）**
+- 负载均衡器配置：同一用户的请求始终路由到同一实例
+- 依赖：Cookie 或源 IP Hash
+- 优点：无需修改代码
+- 缺点：实例故障时用户需重新登录
+
+**方案二：共享 Session 存储（推荐）**
+- 已内置实现：`KnexSessionStore` 持久化到数据库
+- 所有实例可读写同一条 session 记录
+- OAuth 请求在实例 A 发起，回调可由实例 B 处理
+- 优点：高可用，无单点故障
+- 注意：`saveUninitialized: false`，仅在有实际数据时创建会话
+
+**方案三：中央认证网关**
+- 部署独立的认证服务（如 Keycloak、Auth0）
+- 所有 Wiki.js 实例配置为同一个 OIDC 客户端
+- 优点：支持更复杂的 SSO 场景（跨应用）
+- 缺点：架构复杂度增加
+
+### 15.6 策略配置变更的全局同步
+
+管理员在任一实例修改策略配置后，通过 HA 事件通道同步到所有实例：
+
+```
+┌─ 实例 A (管理员操作) ──────────────────────────────────────┐
+│  updateStrategies() → 写入 DB → activateStrategies()         │
+│  → WIKI.events.outbound.emit('reloadAuthStrategies')        │
+│  → PG NOTIFY wiki '{"event":"reloadAuthStrategies",...}'    │
+└───────────────────────────────┬───────────────────────────┘
+                                │
+                                ▼
+┌─ 实例 B (被动同步) ─────────────────────────────────────────┐
+│  PG LISTEN wiki → 收到通知 → source != INSTANCE_ID          │
+│  → WIKI.events.inbound.emit('reloadAuthStrategies')         │
+│  → activateStrategies() → 策略重新加载                       │
+└───────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─ 实例 C (被动同步) ─────────────────────────────────────────┐
+│  同上                                                        │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 15.7 用户级吊销的全局生效
+
+用户被禁用或权限变更后，`revocationList` 机制确保所有实例在 5 秒内生效：
+
+```js
+// server/core/auth.js:526-528
+WIKI.auth.revocationList.set(
+  `${kind}${_.toString(id)}`,
+  Math.round(DateTime.utc().minus({ seconds: 5 }).toSeconds()),
+  Math.ceil(ms(WIKI.config.auth.tokenExpiration) / 1000)
+)
+```
+
+- `u<user_id>`：用户级吊销，5 秒内所有实例的 `authenticate()` 中间件拒绝该用户的 JWT
+- `g<group_id>`：组级吊销，5 秒内所有实例拒绝该组用户的 JWT
+- 吊销事件同样通过 HA 通道同步到所有实例的 `revocationList` 缓存
+
+### 15.8 多实例 SSO 的注意事项
+
+1. **时钟同步**：所有实例服务器时钟必须同步（NTP），否则 JWT `exp` 和 `iat` 验证会出错
+2. **证书轮换**：`regenerateCertificates()` 会触发所有实例重新加载证书，期间需确保无用户登录
+3. **CORS 配置**：如果 API 跨域调用，需确保 `cors.origin` 配置包含所有实例域名
+4. **回调 URL**：每个 OAuth 策略的 `callbackURL` 是实例特定的（`/login/:key/callback`），需在 OAuth 提供商配置所有实例的回调 URL，或使用统一的认证网关
+5. **同一浏览器多实例**：同一浏览器登录多个实例时，JWT Cookie 会相互覆盖（因为 domain 相同），需使用不同的 cookie 名或路径区分
+
+---
+
+## 十六、策略的灰度发布与 AB 测试
+
+Wiki.js 没有内置的灰度发布（Canary Release）或 AB 测试功能，但通过其灵活的策略实例机制和前端扩展，可以实现多种发布策略。本节详解可行的方案及其实现。
+
+### 16.1 灰度发布的基础：同类型多实例
+
+Wiki.js 策略体系天然支持同类型多实例共存：
+
+```
+数据库 authentication 表：
+┌───────────┬─────────────┬───────────┬──────────┐
+│ key       │ strategyKey │ isEnabled │ order    │
+├───────────┼─────────────┼───────────┼──────────┤
+│ github-v1 │ github      │ true      │ 0        │
+│ github-v2 │ github      │ true      │ 1        │
+└───────────┴─────────────┴───────────┴──────────┘
+```
+
+两个 `strategyKey=github` 的实例，配置不同的 `clientId` / `clientSecret`，指向不同的 GitHub OAuth App（或不同环境）。
+
+在 `activateStrategies()` 中，两者都会被注册到 Passport：
+```js
+passport.use('github-v1', new GitHubStrategy(conf1))
+passport.use('github-v2', new GitHubStrategy(conf2))
+```
+
+### 16.2 基于用户属性的灰度路由
+
+通过修改前端登录组件和后端 `login()` 方法，可以实现按用户属性路由到不同策略实例。
+
+**方案 1：按邮箱域名分流**
+```js
+// 扩展 client/components/login.vue 的 filteredStrategies
+filteredStrategies () {
+  // 用户输入邮箱后
+  const emailDomain = this.username.split('@')[1]
+  if (emailDomain === 'beta.company.com') {
+    // beta 用户走 v2 策略
+    return _.filter(this.strategies, s => s.key === 'github-v2')
+  } else {
+    // 普通用户走 v1 策略
+    return _.filter(this.strategies, s => s.key === 'github-v1')
+  }
+}
+```
+
+**方案 2：按用户 ID 哈希百分比分流**
+```js
+// 后端扩展 login() 或前端策略选择
+const userIdHash = hashCode(username) % 100
+if (userIdHash < 10) {
+  // 10% 流量走 v2
+  selectedStrategy = 'github-v2'
+} else {
+  // 90% 流量走 v1
+  selectedStrategy = 'github-v1'
+}
+```
+
+**方案 3：按地理位置分流**
+```js
+// 结合 IP 地理位置库
+const userCountry = getCountryFromIP(req.ip)
+if (userCountry === 'CN') {
+  selectedStrategy = 'github-cn'  // 针对中国的 GitHub 镜像
+} else {
+  selectedStrategy = 'github-global'
+}
+```
+
+### 16.3 AB 测试的指标采集
+
+灰度发布需要配合指标采集来评估新旧策略的表现：
+
+| 指标 | 采集点 | 说明 |
+|------|-------|------|
+| 登录成功率 | `afterLoginChecks()` 成功分支 vs 失败分支 | 统计 v1 vs v2 的成功/失败比例 |
+| 登录耗时 | `login()` 入口 vs 出口打点 | 统计新旧策略的认证耗时 |
+| 错误类型分布 | `catch(err)` 中按错误类型分类 | 统计特定错误在新旧策略中的发生率 |
+| 用户留存 | `lastLoginAt` 更新频率 | 分析使用新旧策略登录的用户后续活跃度 |
+
+**采集实现示例**：
+```js
+// 扩展 server/models/users.js:319-323
+const startTime = Date.now()
+const resp = await WIKI.models.users.afterLoginChecks(user, context, {
+  skipTFA: !strInfo.useForm,
+  skipChangePwd: !strInfo.useForm
+})
+const duration = Date.now() - startTime
+
+// 记录指标（可输出到日志或发送到监控系统）
+WIKI.logger.info(`[METRICS] login strategy=${selStrategy.key} success=true duration=${duration}ms`)
+
+resolve(resp)
+```
+
+### 16.4 基于 `domainWhitelist` 的简单 AB 测试
+
+利用 Local 策略的 `domainWhitelist` 配置，可以实现按邮箱域名的简单分流：
+
+```
+策略实例 local-vip:
+  domainWhitelist: {v: ['vip.com', 'executive.com']}
+  order: 0
+
+策略实例 local-regular:
+  domainWhitelist: {v: []}  // 空列表 = 允许所有域名
+  order: 1
+```
+
+但注意 Wiki.js 本身不会根据 `domainWhitelist` 自动选择策略实例——`domainWhitelist` 仅用于自注册时的域名校验，不是登录时的路由依据。要实现自动路由，需在 `processProfile()` 或前端选择逻辑中扩展。
+
+### 16.5 灰度发布的回滚机制
+
+Wiki.js 策略的 `isEnabled` 开关提供了快速回滚能力：
+
+| 回滚场景 | 操作 | 生效时间 |
+|---------|------|---------|
+| 新策略有 bug | 管理后台将 `github-v2` 的 `isEnabled` 设为 false → Apply | 即时（activateStrategies 重新加载） |
+| 需要切回旧版本 | 将 `github-v2` 的 `order` 设为 99，`github-v1` 的 `order` 设为 0 | 即时 |
+| 完全废弃新策略 | 删除 `github-v2` 策略实例（检查无用户关联） | 即时 |
+
+**回滚注意事项**：
+- 已使用 `github-v2` 登录的用户，其 `providerKey='github-v2'` 固定绑定
+- 回滚后这些用户无法登录（因为 `github-v2` 被禁用）
+- 需要手动更新这些用户的 `providerKey` 为 `github-v1`，或保留 `github-v2` 为 `isEnabled=true` 但 `order=99`
+
+### 16.6 策略权重的扩展实现
+
+当前 `order` 字段仅用于排序显示，不用于流量分配。可以扩展 `authentication` 表增加 `weight` 字段实现权重路由：
+
+```js
+// 扩展 client/components/login.vue 策略选择逻辑
+const totalWeight = _.sumBy(this.strategies, 'weight')
+let random = Math.random() * totalWeight
+for (const stg of this.strategies) {
+  random -= stg.weight
+  if (random <= 0) {
+    this.selectedStrategyKey = stg.key
+    break
+  }
+}
+```
+
+配置示例：
+- `github-v1.weight = 90`（90% 流量）
+- `github-v2.weight = 10`（10% 流量）
+
+### 16.7 内置功能的限制
+
+Wiki.js 没有内置以下灰度发布功能，需要自定义开发：
+
+| 功能 | 现状 | 实现难度 |
+|------|------|---------|
+| 按百分比分流 | 无，需自定义 | 中（扩展前端选择逻辑） |
+| 按用户属性分流 | 无，需自定义 | 低（前端逻辑） |
+| 按请求 IP/地理位置分流 | 无，需自定义 | 中（需 IP 库） |
+| 蓝绿发布（新旧版本互备） | 可通过多实例模拟 | 低（多实例 + order） |
+| 金丝雀发布（逐步放量） | 无，需手动调整 weight | 低（手动调整 + 自定义权重） |
+| AB 测试指标面板 | 无，需对接监控系统 | 高（完整监控链路） |
+| 自动回滚（错误率阈值） | 无，需手动 | 高（监控 + 自动 API 调用） |
+
+### 16.8 灰度发布的最佳实践
+
+1. **用户标识不变更**：灰度期间不要修改用户的 `providerKey`，避免数据混乱
+2. **新策略先小流量**：从 1% ~ 5% 开始，观察指标后逐步放量
+3. **新旧策略共用用户表**：确保 `providerId` 在新旧策略间一致，避免创建重复用户
+4. **监控告警**：为新策略配置独立的错误告警，及时发现问题
+5. **回滚预案**：提前准备好 SQL 语句，用于批量更新用户 `providerKey`
+6. **文档记录**：记录每个灰度批次的用户范围、时间、观测指标
+
+---
+
+## 十七、OAuth 的 Refresh Token 链路
+
+Wiki.js 的 OAuth Refresh Token 机制分为两层：**第三方 OAuth 平台的 Refresh Token** 和 **Wiki.js 自身的 JWT 续期机制**。两者职责不同，协同工作。
+
+### 17.1 两层 Refresh Token 架构
+
+```
+┌─ 第三方 OAuth 平台 (Google/GitHub/Keycloak) ──────────────┐
+│                                                            │
+│  access_token: 短期（15分钟 ~ 1小时），用于调用 API        │
+│  refresh_token: 长期（数天 ~ 数月），用于换发新的 access_token │
+│                                                            │
+└──────────────────────────┬─────────────────────────────────┘
+                           │ pass req, accessToken, refreshToken
+                           ▼
+┌─ Wiki.js 策略模块 ────────────────────────────────────────┐
+│  authentication.js 回调：                                  │
+│  async (req, accessToken, refreshToken, profile, cb) => {  │
+│    // ✅ 收到了 refreshToken，但 Wiki.js 默认不存储        │
+│    // ✅ 仅用 access_token 获取用户信息后即丢弃             │
+│    const user = processProfile(...)                        │
+│    cb(null, user)                                          │
+│  }                                                         │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+┌─ Wiki.js JWT 层 ──────────────────────────────────────────┐
+│  签发自有 JWT: RS256 签名，包含用户信息和权限              │
+│  expiresIn: 默认为 30 分钟（WIKI.config.auth.tokenExpiration）│
+│                                                            │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+┌─ JWT 自动续期 ────────────────────────────────────────────┐
+│  authenticate() 中间件检测到 JWT 即将过期 → refreshToken()│
+│  签发新的 JWT → 通过 new-jwt header 或 jwt cookie 返回       │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 17.2 第三方 Refresh Token 的接收与丢弃
+
+所有 OAuth 类策略的回调函数都会收到 `refreshToken` 参数：
+
+```js
+// server/modules/authentication/google/authentication.js:17
+new OAuth2Strategy({ ... },
+  async (req, accessToken, refreshToken, profile, cb) => {
+    // refreshToken 在这里，但默认不存储也不使用
+    try {
+      const user = await WIKI.models.users.processProfile(...)
+      cb(null, user)
+    } catch (err) {
+      cb(err, null)
+    }
+  }
+)
+```
+
+**为什么不存储第三方 Refresh Token**：
+1. **Wiki.js 不需要调用第三方 API**：OAuth 仅用于认证身份，获取用户 profile 后即完成使命
+2. **安全风险**：存储大量高权限的 refresh_token 增加攻击面
+3. **会话管理**：Wiki.js 使用自己的 JWT 管理会话，不依赖第三方 token 有效期
+4. **无后台任务**：Wiki.js 没有需要后台运行的任务来刷新第三方 token
+
+**可以扩展的使用场景**：
+如果需要调用 Google Drive API、GitHub API 等，可扩展策略模块存储 refresh_token：
+
+```js
+// 扩展 google/authentication.js
+async (req, accessToken, refreshToken, profile, cb) => {
+  try {
+    const user = await WIKI.models.users.processProfile(...)
+
+    // 存储 refresh_token 到 user 表的扩展字段
+    await user.$query().patch({
+      googleRefreshToken: refreshToken,
+      googleAccessToken: accessToken,
+      googleTokenExpiresAt: new Date(Date.now() + 3600 * 1000)
+    })
+
+    cb(null, user)
+  } catch (err) {
+    cb(err, null)
+  }
+}
+```
+
+### 17.3 `offline_access` Scope 配置
+
+要获取 refresh_token，OAuth 请求必须包含 `offline_access` scope。Wiki.js 默认策略配置中：
+
+| 策略 | 默认 scopes | 含 offline_access |
+|------|------------|------------------|
+| `google` | `profile`, `email`, `openid` | ❌ |
+| `github` | `read:user`, `user:email` | ❌ |
+| `oidc` | `openid`, `profile`, `email` | ❌ |
+| `keycloak` | （无默认，由策略模块动态设置） | ❌ |
+| `auth0` | `openid`, `profile`, `email` | ❌ |
+
+**添加 offline_access scope**：
+
+修改 `definition.yml`：
+```yaml
+# server/modules/authentication/google/definition.yml
+scopes:
+  - profile
+  - email
+  - openid
+  - offline_access    # 添加这一行
+```
+
+或在管理后台的策略配置中，如果支持自定义 scopes 字段。
+
+### 17.4 Wiki.js 自身的 JWT Refresh Token 机制
+
+Wiki.js 的 JWT 续期完全独立于第三方 OAuth，由 `refreshToken()` 方法实现：
+
+```js
+// server/models/users.js:418-463
+static async refreshToken(user) {
+  // 1. 参数处理：支持传入 user ID 或 user 对象
+  if (_.isSafeInteger(user)) {
+    user = await WIKI.models.users.query().findById(user).withGraphFetched('groups')
+    if (!user || !user.isActive) {
+      throw new WIKI.Error.AuthGenericError()
+    }
+  } else if (_.isNil(user.groups)) {
+    user.groups = await user.$relatedQuery('groups').select('groups.id', 'permissions')
+  }
+
+  // 2. 更新 lastLoginAt
+  await WIKI.models.knex('users').where('id', user.id).update({
+    lastLoginAt: new Date().toISOString()
+  })
+
+  // 3. 签发新 JWT
+  return {
+    token: jwt.sign({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      av: user.pictureUrl,
+      tz: user.timezone,
+      lc: user.localeCode,
+      df: user.dateFormat,
+      ap: user.appearance,
+      permissions: user.getGlobalPermissions(),
+      groups: user.getGroups()
+    }, {
+      key: WIKI.config.certs.private,
+      passphrase: WIKI.config.sessionSecret
+    }, {
+      algorithm: 'RS256',
+      expiresIn: WIKI.config.auth.tokenExpiration,  // 默认为 '30m'
+      audience: WIKI.config.auth.audience,
+      issuer: 'urn:wiki.js'
+    }),
+    user
+  }
+}
+```
+
+### 17.5 自动续期触发点：`mustRevalidate` 机制
+
+`authenticate()` 中间件会检测 JWT 是否即将过期，自动触发续期：
+
+```js
+// server/core/auth.js:144-167
+// Revalidate and renew token
+if (mustRevalidate) {
+  const jwtPayload = jwt.decode(securityHelper.extractJWT(req))
+  try {
+    // 1. 调用 refreshToken 签发新 JWT
+    const newToken = await WIKI.models.users.refreshToken(jwtPayload.id)
+    user = newToken.user
+    user.permissions = user.getGlobalPermissions()
+    user.groups = user.getGroups()
+    req.user = user
+
+    // 2. 根据请求类型返回新 token
+    if (req.get('content-type') === 'application/json') {
+      res.set('new-jwt', newToken.token)  // API 请求：response header
+    } else {
+      res.cookie('jwt', newToken.token, commonHelper.getCookieOpts())  // 页面请求：cookie
+    }
+
+    // 3. 禁止缓存
+    res.set('Cache-Control', 'no-store')
+  } catch (errc) {
+    WIKI.logger.warn(errc)
+    return next()
+  }
+}
+```
+
+**`mustRevalidate` 的判定条件**（`server/core/auth.js:120-142`）：
+- JWT 已过期？→ `mustRevalidate = true`
+- JWT 剩余有效期 < 配置的 `revalidate` 阈值？→ `mustRevalidate = true`
+- 用户/组被吊销（在 `revocationList` 中）？→ 拒绝，不续期
+
+### 17.6 手动续期触发点
+
+除了自动续期，以下场景也会主动调用 `refreshToken()` 签发新 JWT：
+
+| 场景 | 代码位置 | 原因 |
+|------|---------|------|
+| 用户资料更新 | `user.js:211` | 新的用户名/头像等需要写入 JWT |
+| 用户邮箱验证 | `auth.js:160` | 验证成功后签发正式 JWT |
+| 用户密码重置 | `user.js:247` | 密码变更后续签新 JWT |
+| 用户首次登录 | `users.js:409` | 登录成功后签发 JWT |
+| 用户密码登录 | `users.js:514` | Local 策略登录成功后签发 JWT |
+
+### 17.7 新 Token 的返回方式
+
+续期后的新 JWT 通过两种方式返回给客户端：
+
+**方式 1：API 请求（Content-Type: application/json）**
+- Response Header: `new-jwt: <new-token>`
+- 客户端需检测此 header 并更新本地存储的 token
+
+**方式 2：页面请求**
+- Set-Cookie: `jwt=<new-token>; Expires=...; HttpOnly`
+- 浏览器自动处理，无需前端代码干预
+
+### 17.8 Refresh Token 的完整生命周期时序
+
+```
+┌─ 用户登录 ────────────────────────────────────────────────┐
+│  POST /graphql (login mutation)                            │
+│  → User.login() → Passport 认证 → afterLoginChecks()       │
+│  → refreshToken() → 签发 JWT（有效期 30 分钟）              │
+│  → 返回 jwt 给客户端                                       │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+┌─ 用户第 25 分钟时请求页面 ────────────────────────────────┐
+│  GET /some-page                                           │
+│  Cookie: jwt=<old-jwt>                                    │
+│  → authenticate() 中间件                                  │
+│  → 检测到 JWT 还有 5 分钟过期 → mustRevalidate = true      │
+│  → refreshToken() → 签发新 JWT（再延长 30 分钟）           │
+│  → Set-Cookie: jwt=<new-jwt>                              │
+│  → 返回页面内容                                            │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+┌─ 用户第 55 分钟时请求 API ─────────────────────────────────┐
+│  POST /graphql                                            │
+│  Header: Authorization: Bearer <new-jwt>                  │
+│  → authenticate() 中间件                                  │
+│  → JWT 还有 5 分钟过期 → mustRevalidate = true              │
+│  → refreshToken() → 再次续期                               │
+│  → Response Header: new-jwt: <newer-jwt>                   │
+└───────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─ 用户被吊销（第 60 分钟） ────────────────────────────────┐
+│  管理员禁用用户 → WIKI.auth.revokeUserTokens(user.id)     │
+│  → revocationList.set('u123', now - 5s, 1800)             │
+└──────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+┌─ 用户第 61 分钟请求 ──────────────────────────────────────┐
+│  authenticate() 中间件检测到 u123 在 revocationList 中     │
+│  → 比较 iat < 吊销时间戳 → AuthTokenRevoked                │
+│  → 拒绝请求，不续期                                        │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 17.9 配置参数
+
+`config.yml` 中与 Refresh Token 相关的配置：
+
+```yaml
+auth:
+  tokenExpiration: 30m          # JWT 有效期
+  audience: urn:wiki.js         # JWT audience 声明
+  revalidate: 5m                # 剩余有效期少于此值时自动续期
+  sessionSecret: "your-secret"  # JWT 签名密钥的 passphrase
+```
+
+---
+
+## 十八、关键源码位置索引
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1907,3 +2545,19 @@ for (const gid of groups) {
 | Keycloak Session 读写 id_token | `server/modules/authentication/keycloak/authentication.js` | :39, :51 |
 | 初始化插入 Local 策略（`order=0`） | `server/setup.js` | :259-269 |
 | 验证 Token 错误 | `server/models/userKeys.js` | :65, :69 |
+| Cookie 选项 `getCookieOpts()`（SSO 跨域扩展点） | `server/helpers/common.js` | :45-50 |
+| JWT 刷新 `refreshToken()`（核心实现） | `server/models/users.js` | :418-463 |
+| JWT 自动续期 `mustRevalidate` 机制 | `server/core/auth.js` | :120-167 |
+| `mustRevalidate` 判定条件 | `server/core/auth.js` | :120-142 |
+| JWT 续期返回（new-jwt header / jwt cookie） | `server/core/auth.js` | :155-162 |
+| 用户级/组级 Token 吊销 `revokeUserTokens()` | `server/core/auth.js` | :516-529 |
+| JWT audience 配置（多实例一致性） | `server/setup.js` | :80 |
+| 用户资料更新触发 `refreshToken()` | `server/graph/resolvers/user.js` | :211 |
+| 密码变更触发 `refreshToken()` | `server/graph/resolvers/user.js` | :247 |
+| 邮箱验证触发 `refreshToken()` | `server/controllers/auth.js` | :160 |
+| OIDC 策略回调（接收 refreshToken 参数） | `server/modules/authentication/oidc/authentication.js` | :25 |
+| OAuth2 策略回调（接收 refreshToken 参数） | `server/modules/authentication/oauth2/authentication.js` | :23 |
+| GitHub 策略回调（接收 refreshToken 参数） | `server/modules/authentication/github/authentication.js` | :28 |
+| OIDC 策略定义（scopes 配置） | `server/modules/authentication/oidc/definition.yml` | :10-13 |
+| Google 策略定义（scopes 配置） | `server/modules/authentication/google/definition.yml` | :10-13 |
+| 会话中间件 `KnexSessionStore`（共享 Session） | `server/master.js` | :79-88 |
