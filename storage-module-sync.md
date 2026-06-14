@@ -1678,9 +1678,483 @@ static async pageEvent({ event, page }) {
 
 ---
 
-## 18. 关键设计模式总结
+## 18. 存储迁移工具与零停机切换
 
-### 18.1 防循环写入
+### 18.1 迁移工具：Wiki.js 1.x → 2.x 导入
+
+系统提供了从 Wiki.js 1.x 版本迁移到 2.x 的官方导入工具，管理后台路径：**Administration → Utilities → Import from Wiki.js 1.x**。
+
+**代码位置：**
+- 前端：`client/components/admin/admin-utilities-importv1.vue`
+- 后端：复用现有的 storage 模块 `importAll()` / sync 机制
+
+#### 迁移内容选项
+
+| 可迁移内容 | 数据源 | 实现方式 |
+|-----------|-------|---------|
+| **Content + Uploads**（页面+资产） | Git 仓库 或 本地磁盘文件夹 | 配置对应 storage 模块后执行 `importAll()` |
+| **Users**（用户） | Wiki.js 1.x MongoDB 数据库 | 直接连接 MongoDB 读取用户数据写入 PG |
+
+#### Git 迁移流程（推荐）
+
+```
+管理员选择 "Import from Git Connection" → 填写 Git 配置（与 Git 存储模块配置相同）
+  ↓
+前端调用 storage.updateTargets mutation
+  ├─ 将 Git 模块配置写入 DB（替换任何已有的 Git 配置）
+  └─ 将 Git 模块 isEnabled 设为 true
+  ↓
+Storage.initTargets()
+  ├─ 初始化 Git 模块 → git clone 远程仓库到本地 repoPath
+  └─ 注册 sync-storage 定时任务
+  ↓
+轮询 storage.status 直到状态变为 operational
+  ↓
+调用 storage.executeAction('git', 'importAll')
+  └─ git.importAll() → 遍历所有文件 → processFiles(importAll:true) → 逐个写入 DB
+  ↓
+迁移完成 → 页面/资产出现在 Wiki 中
+```
+
+**注意事项（管理后台明确提示）：**
+- 新的本地 repoPath 必须为空或不存在，**不要指向旧的 1.x 仓库文件夹**
+- v1 和 v2 可以共用同一个远程 Git 仓库，但**不应同时编辑相同页面**
+- 迁移过程中，原有 Git 配置会被替换
+- 迁移用户时，必须先删除目标系统中要迁移的同名用户
+
+#### 本地磁盘迁移流程
+
+```
+管理员选择 "Import from local folder" → 填写 contentPath（1.x content 目录绝对路径）
+  ↓
+启用 Disk 存储模块，mode = push，path = contentPath
+  ↓
+执行 disk.importAll() → klaw 遍历所有文件 → 写入 DB
+```
+
+### 18.2 存储后端切换（存储迁移）
+
+**场景**：从 Local Disk 切换到 Git，或从 Git 切换到 S3。
+
+系统**没有提供专门的"一键切换"工具**，但可以通过以下手动步骤实现接近零停机的切换：
+
+```
+零停机切换步骤（示例：Disk → Git）：
+
+1. 在管理后台启用 Git 模块（不要禁用 Disk）
+   → 此时写入会同时推送到 Disk 和 Git
+   → 已有内容通过 Force Sync 或 syncUntracked 全量同步到 Git
+
+2. 等待 Git 同步完成，状态变为 operational
+   → 验证 Git 仓库内容完整性
+
+3. 在管理后台禁用 Disk 模块（只保留 Git）
+   → 读写不中断（DB 始终是主存储）
+   → 新的写入只会推送到 Git
+
+4. （可选）执行一次 purge + importAll 从 Git 回导到 DB
+   → 确保 DB 与新存储完全一致
+```
+
+**零停机的核心保证：DB 是唯一的 Source of Truth**
+- 所有读写操作直接走 DB，存储模块只做异步备份/同步
+- 存储模块的启用/禁用/切换完全不影响用户的读写操作
+- 多个存储模块可以同时启用并行推送
+
+### 18.3 迁移风险与保护
+
+| 风险场景 | 现有保护 | 手动建议 |
+|---------|---------|---------|
+| 迁移中途网络中断，Git clone 失败 | ❌ 无断点续传，下次重新 clone | 网络稳定时执行，大仓库建议预下载 |
+| importAll 中途失败，部分页面已导入 | ✅ 幂等：已导入页面下次会 update 而非重复 | 重新执行 importAll 即可 |
+| 迁移期间用户修改页面 → 冲突 | ⚠️ Git importAll 会用 Git 内容覆盖 DB 最新 | 迁移期间建议设置公告，限制编辑 |
+| 迁移完成后旧存储残留数据 | ❌ 无自动清理 | 手动删除旧存储中的文件 |
+
+### 18.4 其他迁移工具
+
+| 工具 | 用途 | 代码位置 |
+|------|------|---------|
+| **Locale Migration** | 将页面从一个语言批量迁移到另一个语言 | `pages.migrateToLocale()` in `models/pages.js:1133` |
+| **Content Export**（System → Utilities） | 将内容/用户/配置导出为 JSON 文件 | `core/system.js:100-450`（全量流式导出） |
+| **Content Import**（System → Utilities） | 将 JSON 备份文件导入回系统 | 导入功能在 `core/system.js` 中以 TODO 标记 |
+
+> ⚠️ 注意：Content Import 功能（从 JSON 备份恢复）在当前代码中**尚未实现**，方法体仅包含 TODO 注释。
+
+### 18.5 零停机架构本质
+
+Wiki.js 的存储架构天然支持零停机切换，关键设计决策：
+
+1. **DB 中心化**：PostgreSQL 是唯一可信源，存储模块是附加层
+2. **事件驱动异步推送**：pageEvent 不阻塞主操作，失败可重试
+3. **多模块并行**：支持同时启用多个存储目标，并行推送
+4. **幂等操作**：importAll / syncUntracked 可重复执行，不会产生重复数据
+
+---
+
+## 19. 附件大文件流式处理与分片上传
+
+### 19.1 上传流程总览
+
+附件（资产）上传的完整链路：
+
+```
+客户端浏览器
+  │  POST /u  multipart/form-data
+  ▼
+server/controllers/upload.js
+  ├─ multer 中间件接收文件到临时目录
+  │   dest: ./data/uploads
+  │   limits: { fileSize: maxFileSize, files: maxFiles }
+  │   一次只能上传一个文件（req.files.length > 1 拒绝）
+  ├─ 权限检查（write:assets / manage:system）
+  ├─ 路径权限检查（checkAccess）
+  └─ 调用 assets.upload(opts)
+       │
+       ▼
+server/models/assets.js upload()
+  ├─ 计算 fileHash = assetHelper.generateHash(assetPath)
+  ├─ SVG 安全扫描（可选，worker 子进程）
+  ├─ fs.readFile(opts.path) → 读取整个文件到内存 Buffer
+  ├─ DB：UPSERT assets 表 + assetData 表（bytea 存完整二进制）
+  ├─ fs.move/copy 到缓存目录 ./data/cache/${hash}.dat
+  └─ skipStorage ? skip : storage.assetEvent('uploaded', asset)
+       └─ for each target: target.fn.assetUploaded(asset)
+            ├─ Git: fs.writeFile + git add + git commit
+            ├─ S3: s3.putObject({ Body: asset.data })
+            ├─ Azure: blockBlobClient.upload(asset.data, asset.data.length)
+            └─ SFTP: sftp.put(fileBuffer, remotePath)
+```
+
+**代码位置：**
+- `controllers/upload.js:1-99` — HTTP 上传入口
+- `models/assets.js:81-167` — 上传处理核心逻辑
+
+### 19.2 文件大小限制
+
+**配置项**（管理后台 → Settings → Uploads）：
+
+| 配置 | 默认值 | 作用位置 |
+|------|--------|---------|
+| `maxFileSize` | 未明确（由 multer 限制） | `multer({ limits: { fileSize } })` — 超过时 MulterError: File too large |
+| `maxFiles` | 1 | `multer({ limits: { files } })` — 一次请求最多上传文件数 |
+| `allowedExtensions` | 可配置列表 | 前端校验，不在列表中的文件不能选择 |
+| `scanSVG` | true | SVG 文件上传后自动触发 sanitize-svg job 扫描恶意内容 |
+| `forceDownload` | 可配置 | 非图片类扩展名强制下载而非浏览器打开 |
+
+**硬限制**：`upload.js:32-36` 硬编码 `req.files.length > 1` 拒绝多文件上传，即使配置 maxFiles > 1 也无效。
+
+### 19.3 流式处理 vs 全量加载
+
+**当前实现：全量加载到内存**
+
+```javascript
+// models/assets.js:120
+const fileBuffer = await fs.readFile(opts.path)  // ← 整个文件读入内存 Buffer
+
+// S3 上传
+await this.s3.putObject({ Key: asset.path, Body: asset.data }).promise()
+// asset.data 是完整 Buffer → 内存占用 = 文件大小
+
+// Azure 上传
+await blockBlobClient.upload(asset.data, asset.data.length, { tier: this.config.storageTier })
+// 同上，完整 Buffer 上传
+
+// Git 本地写入
+await fs.outputFile(filePath, asset.data)
+// 完整 Buffer 写磁盘
+```
+
+**问题**：上传 500MB 视频文件时，至少需要 **500MB 内存**用于存放 Buffer，加上 assetData 表写入和多个存储目标的推送，峰值内存可能达到 **文件大小 × (1 + 存储目标数)**。
+
+### 19.4 各存储后端的流式能力
+
+虽然资产上传使用全量 Buffer，但不同存储 SDK 本身支持流式上传，只是 Wiki.js 没有利用：
+
+| 后端 | SDK 流式上传能力 | Wiki.js 当前用法 |
+|------|-----------------|-----------------|
+| **Git** | 不适用（本地文件系统） | `fs.outputFile` 可接受 stream，但使用完整 Buffer |
+| **Local Disk** | `fs.createWriteStream()` | 同上，使用完整 Buffer |
+| **S3** | `upload({ Body: ReadableStream })` 自动分片 | `putObject({ Body: Buffer })` 全量 |
+| **Azure Blob** | `uploadStream()` / `uploadFile()` 断点续传 | `upload(Buffer, length)` 全量 |
+| **SFTP** | `sftp.createWriteStream()` + pipe | `sftp.put(fileBuffer, ...)` 全量 |
+
+**S3 的 `upload()` 方法（未使用）**：
+```javascript
+// AWS SDK 支持的流式分片上传（Wiki.js 未用）
+await s3.upload({
+  Key: asset.path,
+  Body: fs.createReadStream(localPath)  // ← 流式，内存占用 O(chunk_size)
+}, {
+  partSize: 5 * 1024 * 1024,  // 5MB 分片
+  queueSize: 4                // 并发上传分片数
+}).promise()
+```
+
+这会自动处理分片、并发、失败重试，内存占用仅 ~20MB（4×5MB），无论文件多大。
+
+### 19.5 资产下载的流式优化
+
+**资产下载链路**使用了更优化的流式处理：
+
+```javascript
+// models/assets.js:196-233
+getAsset(assetPath, res)
+  ├─ 尝试本地缓存：res.sendFile(cachePath)
+  │  → Express 自动使用流式传输，不占用服务器内存
+  ├─ 尝试存储模块本地路径：res.sendFile(location.path)
+  │  → 同上，流式
+  └─ 降级从 DB 读取：res.send(assetData.data)
+     → 一次性发送完整 Buffer（但 assetData 存于 DB，已加载到内存）
+     → 同时写入本地缓存：fs.outputFile(cachePath, assetData.data)
+```
+
+**关键优化**：
+- `res.sendFile()` 使用 `send` 库，内部通过 `fs.createReadStream()` + `pipe(res)` 实现零拷贝传输
+- HTTP 响应自动设置 `Content-Length`、`Accept-Ranges`，支持断点续传
+- 本地缓存命中时，服务器内存占用 ≈ 0
+
+### 19.6 下载的三级回退策略
+
+```
+getAsset(assetPath)
+  │
+  ├─ Level 1: 本地文件缓存（./data/cache/${hash}.dat）
+  │   → 最快，零内存占用
+  │   → 由 purgeUploads 定时任务每 15 分钟清理
+  │
+  ├─ Level 2: 存储模块本地路径（Git/Disk 本地副本）
+  │   → 次快，零内存占用
+  │   → S3/Azure/SFTP 返回空字符串，跳过此级
+  │
+  └─ Level 3: DB assetData 表（bytea 字段）
+      → 最慢，占用内存 = 文件大小
+      → 成功后写入 Level 1 缓存，下次访问提速
+```
+
+**代码位置：** `models/assets.js:169-194`
+
+### 19.7 分片上传实现状态
+
+| 功能 | 实现状态 | 说明 |
+|------|---------|------|
+| 客户端分片上传（tus 协议 / resumable.js） | ❌ 未实现 | 整个文件一次性上传，大文件网络中断需重传 |
+| 服务端接收分片 | ❌ 未实现 | multer 接收整个文件到磁盘 |
+| 云存储 SDK 分片上传（S3 multipart / Azure block blob） | ❌ 未利用 | SDK 支持但 Wiki.js 使用全量 Buffer 上传 |
+| 断点续传 | ❌ 未实现 | 上传中断需从头开始 |
+| 并发上传多个文件 | ❌ 前端限制 | 一次只能上传一个文件 |
+
+### 19.8 大文件上传性能瓶颈
+
+| 阶段 | 性能瓶颈 | 内存占用 | 可优化方向 |
+|------|---------|---------|-----------|
+| 1. HTTP 接收 | multer 写临时文件 | ≈ 0（流式写磁盘） | 已优化 |
+| 2. 读入内存 Buffer | `fs.readFile(opts.path)` | = 文件大小 | 改为流式处理，传递 Stream |
+| 3. 写入 DB | `knex('assetData').insert({ data: fileBuffer })` | 2× 文件大小（PG 协议 + 驱动 Buffer） | PG large object API / 禁用 bytea hex 转义 |
+| 4. 写入缓存 | `fs.move/copy` → `./data/cache/${hash}.dat` | ≈ 0（fs.move 是 rename 系统调用） | 已优化 |
+| 5. 推送至各存储 | `for...of await target.fn.assetUploaded()` | 文件大小 × (1 + 存储目标数) | 并行 Promise.all + 传递 Stream |
+
+---
+
+## 20. 存储加密 At-Rest 链路
+
+### 20.1 加密现状总览
+
+Wiki.js 的 at-rest 加密（静态数据加密）**严重依赖底层基础设施**，应用层本身实现的加密非常有限。
+
+| 层级 | 加密实现 | 密钥管理 |
+|------|---------|---------|
+| **DB 连接加密**（传输中） | ✅ 可选 | 由 PostgreSQL/MariaDB 客户端 SSL 配置控制 |
+| **DB 数据加密**（at-rest） | ❌ 应用层未实现 | 依赖数据库透明数据加密（TDE）或磁盘加密 |
+| **资产数据加密**（at-rest） | ❌ 应用层未实现 | assetData bytea 明文存储 |
+| **存储模块数据加密**（at-rest） | ❌ 应用层未实现 | 依赖云存储 SSE（服务端加密）或磁盘加密 |
+| **敏感配置加密**（存储凭证） | ❌ DB 明文存储 | 仅前端展示打码 |
+| **会话 Cookie 加密** | ✅ AES-256-CBC | `sessionSecret` 作为 passphrase |
+| **内部证书加密** | ✅ AES-256-CBC | `sessionSecret` 作为 passphrase |
+
+### 20.2 传输加密（In-Transit）
+
+#### PostgreSQL 连接加密
+
+**代码位置：** `core/db.js:60-136`
+
+```javascript
+if (WIKI.config.db.ssl) {
+  if (WIKI.config.db.type === 'postgres') {
+    if (WIKI.config.db.ssl === true) {
+      dbConfig.ssl = { rejectUnauthorized: true }
+    } else {
+      // CA 证书配置，支持从环境变量读取 64 字符分段的 CA
+      const chunks = []
+      for (let i = 0; i < process.env.DB_SSL_CA.length; i += 64) {
+        chunks.push(process.env.DB_SSL_CA.substring(i, i + 64))
+      }
+      dbConfig.ssl = {
+        rejectUnauthorized: true,
+        ca: '-----BEGIN CERTIFICATE-----\n' + chunks.join('\n') + '\n-----END CERTIFICATE-----\n'
+      }
+    }
+    _.set(dbConfig, 'options.encrypt', true)
+  }
+  // ... MSSQL 支持 encrypt 选项
+}
+```
+
+**支持的数据库 SSL 模式**：
+- PostgreSQL：`ssl: true`（验证服务端证书）或自定义 CA 证书
+- MySQL/MariaDB：不支持（代码中仅处理 postgres 和 mssql）
+- MSSQL：`encrypt: true`（Azure 要求）
+- SQLite：不适用（本地文件）
+
+#### HTTPS / SSL
+
+**代码位置：** `core/servers.js:1-100`、`core/letsencrypt.js`
+
+- 支持 Let's Encrypt 自动申请和续期证书
+- 支持自定义 SSL 证书（key + cert + chain）
+- 支持 HTTP/2（spdy 模块）
+- 支持 HSTS（Strict-Transport-Security）头
+
+### 20.3 应用层加密使用
+
+应用层仅在两个地方使用了加密，都与存储无关：
+
+#### 1. 安装时生成的内部证书
+
+**代码位置：** `setup.js:155-167`
+
+```javascript
+const certs = crypto.generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: 'pkcs1', format: 'pem' },
+  privateKeyEncoding: {
+    type: 'pkcs1',
+    format: 'pem',
+    cipher: 'aes-256-cbc',           // ← AES-256-CBC 加密
+    passphrase: WIKI.config.sessionSecret  // ← 使用 sessionSecret 作为密码
+  }
+})
+```
+
+**用途**：SAML 认证的签名/解密、JWT 签名验证。
+
+#### 2. 认证策略重生成证书
+
+**代码位置：** `core/auth.js:414-426`
+
+与安装时相同的 AES-256-CBC 加密，用途相同。
+
+> **重要**：这两处加密保护的是**内存中的私钥导出**，不是存储在 DB 中的数据。私钥加密后存储在 `WIKI.config.certs.private`，但这个配置对象整体以明文 JSON 存储在 DB 的 `config` 表中。
+
+### 20.4 存储后端的 SSE（服务端加密）
+
+虽然应用层不加密数据，但可以通过云存储的**服务端加密（Server-Side Encryption, SSE）**实现 at-rest 加密，这需要在云存储控制台配置，Wiki.js 不需要改动：
+
+| 后端 | SSE 选项 | Wiki.js 是否需要配置 |
+|------|---------|-------------------|
+| **Amazon S3** | SSE-S3（AES-256，由 S3 管理密钥）<br>SSE-KMS（AWS KMS 管理密钥）<br>SSE-C（客户提供密钥） | SSE-S3/SSE-KMS：在 Bucket 策略中配置默认加密，Wiki.js 无需改动<br>SSE-C：Wiki.js 当前不支持（每次请求需传密钥） |
+| **Azure Blob** | Azure Storage Service Encryption（AES-256，默认启用）<br>客户管理密钥（CMK） | 所有新存储账户默认启用，无需 Wiki.js 配置 |
+| **Git** | 不支持（明文文件） | 依赖仓库所在磁盘加密（LUKS / BitLocker）或使用 git-crypt / git-remote-gcrypt 透明加密 |
+| **Local Disk** | 不支持（明文文件） | 依赖操作系统磁盘加密（LUKS / BitLocker / FileVault） |
+| **SFTP** | 不支持（明文文件） | 依赖远程服务器磁盘加密 |
+| **PostgreSQL** | 不支持应用层字段加密 | 依赖 PG TDE（透明数据加密，仅商业版支持）或 pgcrypto 扩展（需应用层代码改动） |
+
+### 20.5 S3 SDK 的加密能力（未启用）
+
+AWS SDK 支持客户端加密，但 Wiki.js 的 S3 上传代码完全没有启用：
+
+```javascript
+// 当前用法（明文）
+await this.s3.putObject({
+  Key: asset.path,
+  Body: asset.data          // ← 明文 Buffer
+}).promise()
+
+// 可启用但未启用的 SSE（服务端加密）
+await this.s3.putObject({
+  Key: asset.path,
+  Body: asset.data,
+  ServerSideEncryption: 'AES256',  // ← SSE-S3
+  // 或 SSEKMSKeyId: 'arn:aws:kms:...'  // SSE-KMS
+}).promise()
+```
+
+**Azure Blob** 类似，SDK 支持 `customerProvidedKey` 选项（客户端提供加密密钥），但 Wiki.js 未使用。
+
+### 20.6 敏感数据存储安全
+
+| 数据类型 | 存储位置 | 加密状态 | 风险 |
+|---------|---------|---------|------|
+| Git SSH 私钥 / 密码 | storage.config JSONB | ❌ 明文 | DB 泄露即全泄露 |
+| S3 Secret Access Key | storage.config JSONB | ❌ 明文 | DB 泄露即全泄露 |
+| Azure Account Key | storage.config JSONB | ❌ 明文 | DB 泄露即全泄露 |
+| SFTP 私钥 / 密码 | storage.config JSONB | ❌ 明文 | DB 泄露即全泄露 |
+| 资产二进制数据 | assetData.bytea | ❌ 明文 | DB 备份泄露即所有文件泄露 |
+| 页面内容 | pages.content | ❌ 明文 | DB 备份泄露即所有内容泄露 |
+| 用户密码哈希 | users.password | ✅ bcrypt | 相对安全 |
+| 会话密钥 | config.sessionSecret | ❌ 明文（config 表） | 泄露可伪造所有会话 |
+
+**前端打码保护（非加密）**：
+```javascript
+// resolvers/storage.js:31
+value: (configData.sensitive && value.length > 0) ? '********' : value
+```
+仅在 GraphQL 响应中对敏感字段打码，**DB 中仍然是明文**。
+
+### 20.7 应用层加密的可行改造路径
+
+如果需要在应用层实现 at-rest 加密，可按以下方式扩展（当前均未实现）：
+
+```
+建议的加密架构：
+
+1. 新增 KMS 配置
+   - 支持 AWS KMS / Azure Key Vault / HashiCorp Vault
+   - 主密钥（CMK）存于 KMS，数据加密密钥（DEK）由 KMS 生成并加密保存
+   - 每个资产/页面使用独立 DEK
+
+2. 资产上传加密链路
+   assetUploaded(asset)
+     ├─ 生成随机 DEK
+     ├─ 使用 DEK + AES-256-GCM 加密 asset.data
+     ├─ 使用 CMK 加密 DEK，存储在 assets.metadata
+     └─ 上传加密后的密文到存储模块
+
+3. 资产下载解密链路
+   getAsset(assetPath)
+     ├─ 从 DB 读取加密的 DEK + 密文
+     ├─ 调用 KMS 解密 DEK
+     ├─ 使用 DEK 解密内容
+     └─ 返回明文给用户
+
+4. 数据库加密
+   - 对 pages.content 和 assetData.data 字段使用 pgcrypto 扩展
+   - 或切换到支持 TDE 的 PG 商业版
+```
+
+### 20.8 加密总结
+
+**当前实现的加密：**
+- ✅ DB 连接 SSL/TLS（可配置）
+- ✅ HTTPS / HTTP/2（可配置）
+- ✅ 内部私钥 AES-256-CBC 加密（使用 sessionSecret）
+- ✅ 用户密码 bcrypt 哈希
+
+**未实现但基础设施可补的加密：**
+- ⚠️ DB 静态数据加密：依赖 PG TDE 或磁盘加密
+- ⚠️ 云存储静态数据加密：依赖 S3 SSE / Azure Storage Encryption
+- ⚠️ 本地文件加密：依赖操作系统磁盘加密
+
+**完全未实现的加密：**
+- ❌ 存储凭证加密（DB 明文）
+- ❌ 资产数据应用层加密
+- ❌ 页面内容应用层加密
+- ❌ 客户端分片上传加密
+
+---
+
+## 21. 关键设计模式总结
+
+### 21.1 防循环写入
 
 所有从外部存储 → DB 的写入操作均传入 `skipStorage: true`：
 - `commonDisk.processPage()` → `updatePage({ skipStorage: true })` / `createPage({ skipStorage: true })`
@@ -1688,7 +2162,7 @@ static async pageEvent({ event, page }) {
 
 这确保 Pull 路径不会触发 Push 路径的 `Storage.pageEvent()`，避免无限循环。
 
-### 18.2 事件驱动 Push
+### 21.2 事件驱动 Push
 
 所有 DB → 存储的写入通过事件模型：
 ```
@@ -1696,7 +2170,7 @@ Page Model 操作 → Storage.pageEvent({ event, page }) → 遍历所有 target
 ```
 每个存储模块只需实现 `created / updated / deleted / renamed` 四个接口即可自动接收 DB 变更。
 
-### 18.3 增量 Diff 同步
+### 21.3 增量 Diff 同步
 
 Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 diff：
 1. 记录 sync 前的 HEAD hash
@@ -1704,7 +2178,7 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 3. `diffSummary(oldHash, newHash)` 只处理两次 sync 之间的变更
 4. 无变更则跳过处理
 
-### 18.4 编辑器冲突的乐观锁模式
+### 21.4 编辑器冲突的乐观锁模式
 
 ```
 用户A打开编辑 → checkoutDate = page.updatedAt
@@ -1716,23 +2190,31 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 
 ---
 
-## 19. 涉及的关键文件索引
+## 22. 涉及的关键文件索引
 
 | 文件路径 | 职责 |
 |---------|------|
 | `server/core/kernel.js` | 启动时序，初始化存储模块 |
 | `server/core/scheduler.js` | 定时任务调度器 |
-| `server/core/db.js` | PG LISTEN/NOTIFY 多实例缓存失效 |
+| `server/core/db.js` | PG LISTEN/NOTIFY 多实例缓存失效 + DB SSL 配置 |
 | `server/core/cache.js` | 内存缓存（NodeCache） |
 | `server/core/config.js` | 配置加载，WIKI.data = appdata 含jobs定义 |
 | `server/core/telemetry.js` | 匿名遥测（仅系统信息，不追踪存储状态） |
 | `server/core/worker.js` | 子进程 worker 执行器 |
+| `server/core/auth.js` | 认证策略，证书 AES-256-CBC 加密 |
+| `server/core/servers.js` | HTTPS/HTTP2 服务 + Let's Encrypt |
+| `server/core/letsencrypt.js` | Let's Encrypt 证书自动申请续期 |
+| `server/core/system.js` | Content Export 全量 JSON 导出 |
 | `server/jobs/sync-storage.js` | sync-storage job 入口 |
+| `server/jobs/rebuild-tree.js` | 导航树重建（chunk 分批插入参考） |
+| `server/jobs/sanitize-svg.js` | SVG 安全扫描 worker |
 | `server/models/storage.js` | Storage 模型：target 管理、事件分发、状态追踪 |
-| `server/models/pages.js` | Page 模型：CRUD、parseMetadata |
+| `server/models/pages.js` | Page 模型：CRUD、parseMetadata、migrateToLocale |
 | `server/models/pageHistory.js` | 页面版本历史快照、版本链查询 |
-| `server/models/assets.js` | 资产上传流程、缓存/存储写入 |
+| `server/models/assets.js` | 资产上传/下载流程、缓存/存储写入 |
 | `server/helpers/page.js` | 路径解析、frontmatter 注入/提取、hash 生成 |
+| `server/helpers/asset.js` | 资产路径解析、hash 生成 |
+| `server/controllers/upload.js` | HTTP 上传入口（multer） |
 | `server/modules/storage/git/storage.js` | Git 存储模块（唯一完整双向同步实现） |
 | `server/modules/storage/git/definition.yml` | Git 模块配置定义（含 actions 列表） |
 | `server/modules/storage/disk/storage.js` | Disk 存储模块（push + 备份） |
@@ -1745,12 +2227,15 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 | `server/modules/storage/s3/common.js` | S3 兼容存储 单向 push 实现 |
 | `server/modules/storage/s3/definition.yml` | S3 模块配置定义 |
 | `server/modules/search/elasticsearch/engine.js` | Elasticsearch 批量优化模式参考 |
-| `server/graph/resolvers/page.js` | GraphQL: checkConflicts / conflictLatest |
+| `server/graph/resolvers/page.js` | GraphQL: checkConflicts / conflictLatest / restoreVersion |
 | `server/graph/schemas/page.graphql` | GraphQL Schema: PageConflictLatest 类型 |
 | `server/graph/resolvers/storage.js` | GraphQL: 存储 targets 查询 + status 状态 + 更新 + 执行 action |
+| `server/graph/resolvers/system.js` | GraphQL: 系统配置、telemetry 开关 |
 | `server/app/data.yml` | 系统内置任务配置（jobs 定义） |
+| `server/setup.js` | 安装向导，内部证书 AES-256-CBC 加密生成 |
 | `client/components/editor.vue` | 编辑器主组件：冲突检测轮询 + 保存流程 |
 | `client/components/editor/editor-modal-conflict.vue` | Markdown/Code 编辑器的冲突解决 UI |
 | `client/components/editor/ckeditor/conflict.vue` | CKEditor 的冲突解决 UI |
 | `client/components/admin/admin-storage.vue` | 管理后台存储配置 + 状态监控面板 |
+| `client/components/admin/admin-utilities-importv1.vue` | Wiki.js 1.x → 2.x 迁移工具 UI |
 | `client/libs/codemirror-merge/diff-match-patch.js` | 文本差异计算库 |
