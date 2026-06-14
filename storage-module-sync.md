@@ -908,9 +908,413 @@ pageHistory for Page P:
 
 ---
 
-## 12. 关键设计模式总结
+## 12. 跨集群多节点同步的冲突仲裁
 
-### 12.1 防循环写入
+### 12.1 架构前提：无分布式锁/选主
+
+本项目的多实例（HA）部署基于 **PostgreSQL LISTEN/NOTIFY**，但**没有实现分布式锁、选主或冲突仲裁机制**：
+
+| 分布式协调功能 | 实现状态 | 说明 |
+|---------------|---------|------|
+| Leader 选举 | ❌ 未实现 | 无 Raft/ZooKeeper/Redis 选主，所有节点都是对等的 |
+| 分布式锁 | ❌ 未实现 | 无 `pg_advisory_lock` / Redis Redlock / 数据库行级锁 `FOR UPDATE` |
+| 全局序列号 | ❌ 未实现 | 无逻辑时钟（Lamport）、向量时钟或 HLC |
+| 事务冲突仲裁 | ❌ 未实现 | 没有 Last-Writer-Wins 的自动决策逻辑在跨节点层面 |
+| 缓存失效 | ✅ PG LISTEN/NOTIFY | 节点间通过 Postgres pub/sub 清除缓存 |
+
+**代码位置：**
+- `server/core/db.js:229-288` — HA 模式下的缓存失效通知
+- `server/index.js:17` — `IS_MASTER: true` 是硬编码的，所有节点都认为自己是 master
+- `server/core/db.js:210-216` — 只有 `IS_MASTER=true` 的节点运行数据库迁移
+
+### 12.2 多实例冲突场景
+
+**场景：3 节点集群（A、B、C）都启用了 Git 双向同步**
+
+```
+T0: 三个节点各自独立运行 sync-storage job，默认每 5 分钟一次
+
+T1: 节点A执行 sync()
+    → git pull --rebase → 拉取远程变更 → git push → 处理 diff → updatePage
+    → updatePage 更新 DB updatedAt = 10:00:01
+    → WIKI.events.outbound.emit('deletePageFromCache', page.hash)
+    → notifyViaDB() → pg NOTIFY 'wiki' { source: INSTANCE_A, event:'deletePageFromCache' }
+
+T2: 节点B和节点C收到通知
+    → pg LISTEN 'wiki' → payload.source !== INSTANCE_B → WIKI.events.inbound.emit
+    → pages.subscribeToEvents → 清除本节点内存中的 page 缓存
+
+T3: 几乎同时，节点B也触发 sync()
+    → git pull --rebase（正常，因为节点A刚 push，远程 HEAD 已更新）
+    → 本地仓库与远程一致，diffSummary 为空 → 不处理任何页面
+    → 无事发生（幂等）
+
+T4: 极端冲突：节点A和节点B在完全相同的时间点开始 sync()
+    节点A: git pull --rebase（远程 HEAD = X）→ 本地 commit → git push
+    节点B: git pull --rebase（远程 HEAD = X，因为A还没 push）
+         → 本地 commit → git push（失败！因为远程 HEAD 已被节点A推进）
+         → 抛出 "non-fast-forward" 错误
+         → sync-storage.js 捕获 → state.status = 'error'
+         → 下次调度时重试，自动恢复
+```
+
+### 12.3 现有保护机制
+
+#### 12.3.1 Git 协议级保护
+
+Git 本身提供了**写保护**：
+- `git push` 默认是 fast-forward 检查，无法覆盖他人已推送的 commit
+- 节点B在 T4 的 push 失败不会影响节点A已成功的 push
+- 失败节点下一次调度会自动 `git pull --rebase` 拉取节点A的 commit，然后重试
+- **最终一致性**：只要有一个节点 push 成功，下次 sync 时所有节点都会同步
+
+#### 12.3.2 DB 层面乐观锁
+
+页面更新时使用 `updatedAt` 时间戳作为乐观锁：
+- `checkConflicts(id, checkoutDate)` → 检测 DB 中的 `updatedAt` 是否比本地 `checkoutDate` 更新
+- 这在跨节点场景下也生效，因为所有节点共享同一个 PostgreSQL 数据库
+- 节点A的 `updatePage` 更新了 `updatedAt`，节点B上正在编辑的用户会通过 Apollo 轮询检测到冲突
+
+#### 12.3.3 事件源排除（source 过滤）
+
+PG NOTIFY 的 payload 中包含 `source: WIKI.INSTANCE_ID`：
+```javascript
+// db.js:251
+if (_.has(payload, 'event') && payload.source !== WIKI.INSTANCE_ID) {
+  WIKI.events.inbound.emit(payload.event, payload.value)
+}
+```
+- 节点只处理其他节点发出的事件，避免自己发的事件自己又处理（循环广播）
+- 保证缓存失效不会形成广播风暴
+
+### 12.4 关键缺陷与风险
+
+| 风险场景 | 后果 | 严重程度 |
+|---------|------|---------|
+| 多个节点同时执行 `syncUntracked()` | 重复 git add + git commit → 多个空 commit 或冲突 | 中 |
+| 多个节点同时执行 `importAll()` | 重复 `updatePage` → 页面内容后写入的覆盖先写入的（无事务保护） | 高 |
+| 节点A执行 `importAll()` 中途，节点B执行 `sync()` | 部分导入的页面被节点B的 sync 重新从 Git 拉取 → 可能丢失 DB 未提交的变更 | 高 |
+| 多个节点同时 purge() | 多个节点同时清空并 clone 同一仓库 → 无功能影响但浪费资源 | 低 |
+
+**重要：所有同步操作（sync/importAll/syncUntracked/purge）在多节点环境下都是并发执行的，没有互斥保护。** 管理员在多实例部署下手动触发这些操作时，必须确保只有一个节点执行。
+
+### 12.5 IS_MASTER 的真实含义
+
+`server/index.js:17` 中 `IS_MASTER: true` 是**每节点独立的硬编码标记**，不是集群选举结果：
+
+- 所有节点都 `IS_MASTER: true`
+- 仅在 `db.js:210` 中用于决定是否运行数据库迁移任务
+- 所有节点都会：注册 sync-storage job、执行同步、处理 pageEvent
+- 没有"工作节点/主节点"的角色区分
+
+---
+
+## 13. 同步任务的优先级调度与限流
+
+### 13.1 调度器设计
+
+**代码位置：** `server/core/scheduler.js`
+
+本项目的调度器是一个**极简的 setTimeout 包装器**，不支持优先级队列。
+
+#### Job 类结构
+
+```javascript
+class Job {
+  constructor({
+    name,
+    immediate = false,     // 是否立即执行
+    schedule = 'P1D',      // 首次执行延迟，或两次执行之间的间隔
+    repeat = false,        // 是否重复调度
+    worker = false         // 是否在子进程中执行
+  }, queue)
+```
+
+#### 调度方式分类
+
+| 配置 | 触发时机 | 适用场景 |
+|------|---------|---------|
+| `immediate: true, repeat: false` | 注册后立即执行一次，执行完退出 | 一次性任务：rebuildTree |
+| `immediate: true, repeat: true` | 注册后立即执行，执行完按 schedule 间隔重复 | 启动即执行：syncGraphLocales |
+| `immediate: false, repeat: false` | 延迟 schedule 时间后执行一次 | 单次延迟任务 |
+| `immediate: false, repeat: true` | 延迟 schedule 时间后首次执行，之后按间隔重复 | 定时轮询：sync-storage（Git PT5M） |
+
+### 13.2 系统内置任务优先级
+
+**代码位置：** `server/app/data.yml:120-141`
+
+系统启动时自动注册 4 个内置任务：
+
+```yaml
+jobs:
+  purgeUploads:           # 清理上传临时文件
+    onInit: true          # 启动时立即执行
+    schedule: PT15M       # 每 15 分钟
+    repeat: true
+  syncGraphLocales:       # 同步多语言图数据
+    onInit: true
+    schedule: P1D         # 每天一次
+    offlineSkip: true     # 离线模式跳过
+    repeat: true
+  syncGraphUpdates:       # 同步图更新
+    onInit: true
+    schedule: P1D
+    offlineSkip: true
+    repeat: true
+  rebuildTree:            # 重建页面导航树
+    onInit: true
+    immediate: true
+    worker: true          # 在独立子进程中执行
+    repeat: false
+```
+
+此外，每个存储目标独立注册自己的 `sync-storage` job，间隔由模块 `definition.yml` 的 `schedule` 字段或用户配置的 `syncInterval` 决定。
+
+### 13.3 限流与并发控制
+
+#### 13.3.1 无全局并发限制
+
+**当前实现不提供任何限流机制：**
+
+- 调度器的 `queue` 只是一个数组 `jobs: []`，用于存引用方便 stop，没有实际队列逻辑
+- 没有 `maxConcurrent` / `concurrency` 限制
+- 没有任务去重：同一个存储目标重复调用 `initTargets()` 会注册多个相同的 sync 任务
+- 没有背压（backpressure）：如果一次 sync 执行了 6 分钟，而下一个 5 分钟间隔已到，**会并发执行**
+
+**风险场景：**
+- Git 远程仓库响应慢，一次 sync 执行超过 5 分钟 → 下一次 sync 启动，并发执行
+- 两次并发的 `git pull --rebase` 操作同一本地仓库 → git 锁冲突（`.git/index.lock`）
+- 第二次 sync 失败 → `state.status = 'error'`，但下次调度仍按 5 分钟间隔启动
+
+#### 13.3.2 Worker 子进程隔离
+
+**代码位置：** `scheduler.js:55-79`
+
+`worker: true` 的任务会通过 `childProcess.fork` 在独立子进程中执行：
+
+```javascript
+const proc = childProcess.fork(`server/core/worker.js`, [
+  `--job=${this.name}`,
+  `--data=${data}`
+], { cwd: WIKI.ROOTPATH, stdio: ['inherit', 'inherit', 'pipe', 'ipc'] })
+```
+
+**作用：**
+- CPU 密集型任务（如 rebuildTree）不阻塞主事件循环
+- 内存密集型任务执行完进程退出，自动释放内存
+- 但**不限制并发子进程数**，多个 worker 任务可以同时 fork
+
+**当前使用 worker 的任务：**
+- `rebuildTree` — 重建导航树（大量路径计算）
+- `sanitize-svg` — SVG 安全扫描（`assets.js:110` 手动注册）
+- `render-page` — 页面渲染（手动注册）
+
+#### 13.3.3 存储模块的隐式互斥
+
+Git 模块通过 git 自身的锁机制（`.git/index.lock`）提供**隐式并发保护**：
+- 如果前一次 sync 还在进行（本地仓库被锁），后一次 sync 执行 `git pull` 时会抛出 "Another git process seems to be running"
+- 异常被捕获 → sync 标记为 error
+- 下次调度自动重试
+
+**SFTP/Azure/S3 模块没有任何隐式互斥**，并发 push 时可能对同一文件执行多次 putObject/rename。
+
+#### 13.3.4 离线模式限流
+
+`offlineSkip: true` 配置（`scheduler.js:111-114`）：
+```javascript
+if (WIKI.config.offline && queueParams.offlineSkip) {
+  WIKI.logger.warn(`Skipping job ${queueName} because offline mode is enabled. [SKIPPED]`)
+  return
+}
+```
+在离线模式下自动跳过需要联网的任务（syncGraphLocales、syncGraphUpdates）。
+
+### 13.4 sync-storage 调度细节
+
+**代码位置：** `server/models/storage.js:145-153`
+
+```javascript
+if (targetDef.schedule && target.syncInterval !== `P0D`) {
+  const schedule = target.syncInterval || targetDef.schedule
+  WIKI.scheduler.registerJob({
+    name: `sync-storage`,
+    schedule: schedule,
+    repeat: true
+  }, target.key)
+}
+```
+
+- 每个存储目标**独立注册**自己的 sync-storage job
+- 任务名称都是 `sync-storage`，通过传入的 `target.key` 区分执行目标
+- 多个存储目标并行执行，互不影响
+- 如果配置了 `internalSchedule`（Git 没有），则使用内部调度间隔
+
+### 13.5 优先级缺失的实际影响
+
+由于没有优先级队列，任务调度具有以下特性：
+
+1. **FIFO 但并行**：`registerJob` 顺序决定 `setTimeout` 注册顺序，但 setTimeout 到期后都是并行执行
+2. **无抢占**：正在执行的任务不会被高优先级任务打断
+3. **无动态优先级调整**：网络波动后不会自动提高 sync 频率加速恢复
+4. **手动触发优先级最高**：管理员通过 GUI 触发的 Force Sync 立即执行，不排队
+
+---
+
+## 14. 冷启动全量初始化的性能优化
+
+冷启动包括两种场景：
+1. **首次激活**：存储模块从无到有建立同步
+2. **故障恢复**：purge 之后重新初始化
+
+### 14.1 首次激活 Git 存储的流程
+
+```
+管理员启用 Git 模块并保存配置
+  ↓
+Storage.initTargets()
+  ├─ require git/storage.js
+  ├─ target.fn.init()
+  │   ├─ 检查本地 repoPath 目录是否存在
+  │   ├─ 不存在 → fs.ensureDir → git.clone(remoteUrl)
+  │   ├─ 存在且非空 → 检查是否为有效 git 仓库
+  │   ├─ git.checkout(branch)
+  │   ├─ git.addConfig('user.name', config.defaultName)
+  │   └─ git.addConfig('user.email', config.defaultEmail)
+  └─ 注册 sync-storage job（PT5M）
+
+首次 sync() 触发（5分钟后，或管理员 Force Sync）
+  ├─ git.pull --rebase
+  ├─ git.push
+  ├─ diffSummary（空，因为刚 clone）
+  └─ 发现 diff 为空，跳过处理
+
+此时 DB 中有页面，但 Git 仓库中没有 → 需要管理员手动触发 syncUntracked
+  └─ syncUntracked() → 流式导出所有页面和资产到 git → git add → git commit
+```
+
+### 14.2 流式处理（Stream + Pipeline）
+
+所有全量操作（`importAll`、`syncUntracked`、`exportAll`、`dump`）都使用 **Node.js Stream + Transform + pipeline** 模式，避免一次性加载所有数据到内存。
+
+**代码模式：** `git/storage.js:437-464`
+
+```javascript
+const { pipeline } = require('node:stream/promises')
+const { Transform } = require('node:stream')
+
+await pipeline(
+  // 源：knex query stream → 从数据库流式读取，每次一批
+  WIKI.models.knex.column('id', 'path', ...).select().from('pages').where({...}).stream(),
+
+  // 转换：Transform 流，每次处理一行
+  new Transform({
+    objectMode: true,
+    transform: async (page, enc, cb) => {
+      // 处理单个页面：injectMetadata + fs.outputFile + git add
+      const filePath = path.join(this.repoPath, `${page.path}.md`)
+      await fs.outputFile(filePath, pageHelper.injectPageMetadata(page))
+      await this.git.add(`./${page.path}.md`)
+      cb()
+    }
+  })
+)
+```
+
+**优化点：**
+- `knex().stream()` 使用数据库游标，每次 fetch 一批（默认 100 行），内存占用 O(batch_size)
+- `pipeline` 自动处理背压（Transform 处理不过来时，自动暂停上游读取）
+- `objectMode: true` 允许在流中传递 JS 对象而非 Buffer
+- 出错时 `pipeline` 自动销毁所有流，防止资源泄漏
+
+### 14.3 全量导入的幂等性
+
+**代码位置：** `git/storage.js:452-459`
+
+`importAll()` 传入 `importAll: true` 标志：
+
+```javascript
+await this.processFiles([{
+  ...
+  deletions: 0,
+  insertions: 0,
+  importAll: true      // ← 关键标志
+}], rootUser)
+```
+
+**`importAll: true` 对 processFiles 的影响：**
+- 跳过 rename 检测逻辑（`git/storage.js:202, 216, 245, 261`）
+- 跳过 delete 检测逻辑
+- 所有文件统一走 `commonDisk.processPage` / `processAsset`
+- `commonDisk.processPage` 中 `getPageFromDb` 检查是否存在：
+  - 已存在 → `updatePage`（内容覆盖）
+  - 不存在 → `createPage`（新增）
+
+**性能特性：**
+- 遍历仓库所有文件（包括 `.git` 之外的全部）
+- 对每个文件执行 DB 查询（`getPageFromDb`）
+- 无论内容是否变化都会执行 `updatePage`（即使内容相同）
+- 每次 `updatePage` 都会：`addVersion` → `patch` → `renderPage` → `search.updated`
+- **这是一个 O(N) 的"暴力"全量覆盖操作**，在页面数量大时（>10000）可能耗时较长
+
+### 14.4 批处理优化（仅在搜索模块实现）
+
+批量写入的优化模式在搜索模块中实现（`elasticsearch/engine.js:320-399`），但**同步模块没有采用**：
+
+```javascript
+// Elasticsearch 批量优化（参考模式）
+const MAX_INDEXING_BYTES = 10 * 1024 * 1024  // 10MB
+const MAX_INDEXING_COUNT = 500
+
+let chunks = []
+let bytes = 0
+
+const flushBuffer = async () => {
+  await this.client.bulk({ body: flatten(chunks) })
+  chunks.length = 0
+  bytes = 0
+}
+
+// 每条记录累积，达到大小或数量阈值时 flush
+```
+
+**同步模块为什么不批量：**
+- 每个页面处理涉及：fs 读写 + git add + DB 查询 + DB 更新 + 搜索索引更新
+- 多个页面之间没有依赖，可以流式串行处理
+- 但**没有并行处理**（`Transform` 是串行的，`async (page, enc, cb)` 中 `await` 完成才调用 `cb()`）
+- 搜索模块的批量模式是因为 Elasticsearch bulk API 有显著的性能收益，而同步模块没有对应的批量接口
+
+### 14.5 缓存机制
+
+- **磁盘路径缓存**：`commonDisk.clearFolderCache()` 在 `importAll()` 完成后清除
+- **页面缓存**：NodeCache 内存缓存，HA 模式下通过 LISTEN/NOTIFY 失效
+- **Git 对象缓存**：由 git 自身管理（`.git/objects`），无需应用层干预
+
+### 14.6 性能瓶颈与优化空间
+
+| 操作 | 时间复杂度 | 主要瓶颈 | 潜在优化 |
+|------|-----------|---------|---------|
+| `sync()` 增量 | O(changed_files) | git pull/push 网络 RTT | 可接受，5分钟一次 |
+| `importAll()` | O(total_files × DB_latency) | 逐文件 getPageFromDb 查询 | 改为批量查询（WHERE path IN (...)） |
+| `syncUntracked()` | O(total_pages + total_assets) | fs.outputFile 单文件写入 | 可并行写入（Promise.all 分批） |
+| `purge()` | O(1) | git clone 网络 RTT + 仓库大小 | 可接受，手动操作 |
+| `dump()`（disk） | O(total_pages + total_assets) | fs.outputFile 串行写入 | 可并行 |
+
+### 14.7 冷启动性能数据估算
+
+假设 10000 个页面，平均每个页面 5KB：
+
+| 操作 | 估算耗时 | 说明 |
+|------|---------|------|
+| 首次 `git clone`（100MB 仓库） | 5-30s | 取决于网络 |
+| `syncUntracked()`（10000 页面） | 50-100s | 5-10ms per page（fs + git add）+ 一次 commit |
+| `importAll()`（10000 页面） | 100-200s | 10-20ms per page（fs read + frontmatter parse + DB query + DB update + search index）|
+| 首次 `sync()` 空 diff | < 1s | 几乎无成本 |
+
+---
+
+## 15. 关键设计模式总结
+
+### 15.1 防循环写入
 
 所有从外部存储 → DB 的写入操作均传入 `skipStorage: true`：
 - `commonDisk.processPage()` → `updatePage({ skipStorage: true })` / `createPage({ skipStorage: true })`
@@ -918,7 +1322,7 @@ pageHistory for Page P:
 
 这确保 Pull 路径不会触发 Push 路径的 `Storage.pageEvent()`，避免无限循环。
 
-### 12.2 事件驱动 Push
+### 15.2 事件驱动 Push
 
 所有 DB → 存储的写入通过事件模型：
 ```
@@ -926,7 +1330,7 @@ Page Model 操作 → Storage.pageEvent({ event, page }) → 遍历所有 target
 ```
 每个存储模块只需实现 `created / updated / deleted / renamed` 四个接口即可自动接收 DB 变更。
 
-### 12.3 增量 Diff 同步
+### 15.3 增量 Diff 同步
 
 Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 diff：
 1. 记录 sync 前的 HEAD hash
@@ -934,7 +1338,7 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 3. `diffSummary(oldHash, newHash)` 只处理两次 sync 之间的变更
 4. 无变更则跳过处理
 
-### 12.4 编辑器冲突的乐观锁模式
+### 15.4 编辑器冲突的乐观锁模式
 
 ```
 用户A打开编辑 → checkoutDate = page.updatedAt
@@ -946,13 +1350,16 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 
 ---
 
-## 13. 涉及的关键文件索引
+## 16. 涉及的关键文件索引
 
 | 文件路径 | 职责 |
 |---------|------|
 | `server/core/kernel.js` | 启动时序，初始化存储模块 |
 | `server/core/scheduler.js` | 定时任务调度器 |
 | `server/core/db.js` | PG LISTEN/NOTIFY 多实例缓存失效 |
+| `server/core/cache.js` | 内存缓存（NodeCache） |
+| `server/core/config.js` | 配置加载，WIKI.data = appdata 含jobs定义 |
+| `server/core/worker.js` | 子进程 worker 执行器 |
 | `server/jobs/sync-storage.js` | sync-storage job 入口 |
 | `server/models/storage.js` | Storage 模型：target 管理、事件分发 |
 | `server/models/pages.js` | Page 模型：CRUD、parseMetadata |
@@ -966,9 +1373,11 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 | `server/modules/storage/sftp/storage.js` | SFTP 单向 push 实现 |
 | `server/modules/storage/azure/storage.js` | Azure Blob 单向 push 实现 |
 | `server/modules/storage/s3/common.js` | S3 兼容存储 单向 push 实现 |
+| `server/modules/search/elasticsearch/engine.js` | Elasticsearch 批量优化模式参考 |
 | `server/graph/resolvers/page.js` | GraphQL: checkConflicts / conflictLatest |
 | `server/graph/schemas/page.graphql` | GraphQL Schema: PageConflictLatest 类型 |
 | `server/graph/resolvers/storage.js` | GraphQL: 存储管理接口 |
+| `server/app/data.yml` | 系统内置任务配置（jobs 定义） |
 | `client/components/editor.vue` | 编辑器主组件：冲突检测轮询 + 保存流程 |
 | `client/components/editor/editor-modal-conflict.vue` | Markdown/Code 编辑器的冲突解决 UI |
 | `client/components/editor/ckeditor/conflict.vue` | CKEditor 的冲突解决 UI |
