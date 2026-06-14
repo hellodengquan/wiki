@@ -430,26 +430,373 @@ login(opts, context)
 
 ---
 
-## 五、关键源码位置索引
+## 六、策略加载顺序对选中结果的影响
+
+`order` 字段是贯穿整个策略体系的核心排序依据，它在 **注册**、**展示**、**自动登录** 三个阶段持续发挥作用。
+
+### 6.1 order 在各阶段的流转
+
+| 阶段 | 排序执行点 | 代码位置 | 影响 |
+|------|-----------|---------|------|
+| 数据库查询 | `getStrategies()` 以 `orderBy('order')` 返回 | `server/models/authentication.js:38` | 决定 `activateStrategies()` 遍历顺序 |
+| 内存注册 | `activateStrategies()` 按查询结果顺序遍历 | `server/core/auth.js:79-99` | 遍历顺序不影响字典结构，但影响日志输出顺序 |
+| 前端展示 | Apollo `update` 回调以 `_.sortBy(strategies, ['order'])` 排序 | `client/components/login.vue:690` | 决定登录页策略列表从上到下的排列 |
+| 自动登录 | 服务端 `orderBy('order').first()` 取排序最前的策略 | `server/controllers/auth.js:38` | 决定 autoLogin 场景下使用哪个策略 |
+| 管理后台 | 管理页 `_.sortBy(activeStrategies, ['order'])` 排序 | `client/components/admin/admin-auth.vue:404` | 决定管理页策略列表从上到下的排列 |
+| 管理后台保存 | `order: idx` 用数组下标重算 | `client/components/admin/admin-auth.vue:317` | 拖拽排序后新 order 写入数据库 |
+
+### 6.2 自动登录场景：order 的决定性作用
+
+当 `WIKI.config.auth.autoLogin = true` 时，用户访问 `/login` 会被自动跳转，此时 **order 值最小的策略被选中**：
+
+```js
+// server/controllers/auth.js:37-43
+if (WIKI.config.auth.autoLogin && !req.query.all) {
+  const stg = await WIKI.models.authentication.query().orderBy('order').first()
+  const stgInfo = _.find(WIKI.data.authentication, ['key', stg.strategyKey])
+  if (!stgInfo.useForm) {
+    return res.redirect(`/login/${stg.key}`)
+  }
+}
+```
+
+关键细节：
+- **不检查 `isEnabled`**：`orderBy('order').first()` 未加 `where('isEnabled', true)` 过滤，如果 order 最小的策略被禁用，仍会被选中。但后续 `User.login()` 的 `isEnabled` 检查会拦截，导致自动登录失败
+- **仅跳转非表单策略**：如果 order 最小的策略 `useForm=true`（如 Local），不跳转，而是照常渲染登录页让用户手动填写
+- **`?all` 参数绕过**：用户可在 URL 加 `?all` 强制显示策略选择列表，无视 autoLogin
+
+### 6.3 前端默认选中：filteredStrategies 的首项
+
+前端登录组件通过 `watch: filteredStrategies` 自动选中排序后第一个表单策略：
+
+```js
+// client/components/login.vue:323-327
+filteredStrategies (newValue, oldValue) {
+  if (_.head(newValue).strategy.useForm) {
+    this.selectedStrategyKey = _.head(newValue).key
+  }
+}
+```
+
+这意味着：
+- 如果 `hideLocal=true`，Local 被过滤后，排序最靠前的非 Local 策略若为表单类则自动选中
+- 如果排序最靠前的策略为社交类（`useForm=false`），不自动选中，用户需手动点击，点击后立即触发跳转
+
+### 6.4 管理后台拖拽排序 → order 重算
+
+管理后台使用 `vuedraggable` 组件实现拖拽排序，保存时以数组下标作为新 order 值：
+
+```js
+// client/components/admin/admin-auth.vue:313-323
+strategies: this.activeStrategies.map((str, idx) => ({
+  key: str.key,
+  strategyKey: str.strategy.key,
+  order: idx,  // 数组下标即为新 order
+  isEnabled: str.isEnabled,
+  ...
+}))
+```
+
+因此管理员在后台拖拽调整策略顺序后点击 Apply，即重写了所有策略的 order 值，直接影响登录页展示和自动登录行为。
+
+---
+
+## 七、多策略并存时的优先级与冲突解决
+
+Wiki.js 的认证体系是 **用户显式选择策略**，而非系统自动尝试多个策略，因此不存在传统意义上的"回退链"或"优先级链"。但多策略并存时仍有几类冲突需要关注。
+
+### 7.1 用户-策略绑定模型
+
+每个用户记录通过 `providerKey` 字段绑定到创建该用户的策略实例：
+
+```js
+// server/models/users.js:170-173
+let user = await WIKI.models.users.query().findOne({
+  providerId: _.toString(profile.id),
+  providerKey
+})
+```
+
+这意味着：
+- 用户由策略 A 创建后，其 `providerKey = A.key` 是固定的
+- 用户登录时必须通过同一个策略 A 认证，**不能跨策略登录**
+- Local 策略的用户只能用邮箱+密码登录，不能通过 Google 登录同一账号（即使邮箱相同）
+
+### 7.2 同邮箱跨策略的冲突处理
+
+`processProfile()` 中有针对邮箱冲突的特殊处理逻辑：
+
+```js
+// server/models/users.js:194-205
+if (!user) {
+  user = await WIKI.models.users.query().findOne({
+    email: primaryEmail,
+    providerId: null,
+    providerKey
+  })
+  if (user) {
+    user = await user.$query().patchAndFetch({
+      providerId: _.toString(profile.id)
+    })
+  }
+}
+```
+
+这段逻辑处理的是 **同一策略下** 的"待关联用户"：如果存在同邮箱且 `providerId` 为空（即尚未完成社交登录关联）的用户，自动补上 `providerId`。但 **不会跨策略关联**——`providerKey` 是查询条件之一。
+
+### 7.3 hideLocal 场景：策略可见性冲突
+
+配置 `WIKI.config.auth.hideLocal = true` 时，Local 策略从前端列表中隐藏：
+
+```js
+// client/components/login.vue:310-316
+filteredStrategies () {
+  const qParams = new URLSearchParams(window.location.search)
+  if (this.hideLocal && !qParams.has('all')) {
+    return _.reject(this.strategies, ['key', 'local'])
+  } else {
+    return this.strategies
+  }
+}
+```
+
+隐藏只是前端展示层面的——Local 策略仍在内存注册表和 Passport 中活跃。如果用户直接构造 GraphQL 请求 `strategy: 'local'`，仍然可以登录。这不是安全机制，而是 UX 简化。
+
+### 7.4 删除策略时的用户关联冲突
+
+管理员尝试删除策略时，系统检查是否有用户仍在使用：
+
+```js
+// server/graph/resolvers/authentication.js:232-238
+for (const str of _.differenceBy(previousStrategies, args.strategies, 'key')) {
+  const hasUsers = await WIKI.models.users.query().count('* as total').where({ providerKey: str.key }).first()
+  if (_.toSafeInteger(hasUsers.total) > 0) {
+    throw new Error(`Cannot delete ${str.displayName} as 1 or more users are still using it.`)
+  } else {
+    await WIKI.models.authentication.query().delete().where('key', str.key)
+  }
+}
+```
+
+这是硬性约束：有用户的策略不可删除，只能禁用。禁用后已绑定该策略的用户将无法登录。
+
+### 7.5 策略初始化失败时的容错
+
+`activateStrategies()` 中单个策略初始化失败不影响其他策略：
+
+```js
+// server/core/auth.js:82-98
+for (let idx in enabledStrategies) {
+  const stg = enabledStrategies[idx]
+  try {
+    const strategy = require(`../modules/authentication/${stg.strategyKey}/authentication.js`)
+    strategy.init(passport, stg.config)
+    WIKI.auth.strategies[stg.key] = { ...strategy, ...stg }
+    WIKI.logger.info(`Authentication Strategy ${stg.displayName}: [ OK ]`)
+  } catch (err) {
+    WIKI.logger.error(`Authentication Strategy ${stg.displayName} (${stg.key}): [ FAILED ]`)
+    WIKI.logger.error(err)
+    // 不抛出，继续加载下一个策略
+  }
+}
+```
+
+失败的策略不会进入 `WIKI.auth.strategies`，因此用户在登录页看不到也无法使用它。但数据库中它仍是 `isEnabled=true`，只是运行时未成功注册。
+
+### 7.6 同类型多实例共存
+
+由于 `key`（实例标识）和 `strategyKey`（类型标识）的分离设计，管理员可以创建同一策略类型的多个实例。例如添加两个 Google 策略实例，key 分别为 `google-team-a` 和 `google-team-b`，各自配置不同的 clientId/clientSecret 和 hostedDomain。
+
+这在登录页上会显示为两个独立条目，用户选择其中一个进行认证。两个实例的 Passport 策略通过 `conf.key` 区分（见 `server/modules/authentication/google/authentication.js:59`：`passport.use(conf.key, strategy)`），互不干扰。
+
+---
+
+## 八、策略动态启用/禁用与运行时切换链路
+
+### 8.1 完整切换链路
+
+管理员在后台修改策略配置并点击 Apply 后，触发以下链路：
+
+```
+┌─ 前端 admin-auth.vue ─────────────────────────────────────────────┐
+│  save() → GraphQL mutation updateStrategies                        │
+│  变量：activeStrategies.map((str, idx) => ({                       │
+│    key: str.key,                                                   │
+│    strategyKey: str.strategy.key,                                  │
+│    order: idx,                                                     │
+│    isEnabled: str.isEnabled,    ← 禁用/启用开关                    │
+│    config: [...],               ← 配置变更                         │
+│    ...                                                             │
+│  }))                                                               │
+└────────────────────────┬──────────────────────────────────────────┘
+                         │
+                         ▼
+┌─ 后端 GraphQL Resolver ───────────────────────────────────────────┐
+│  updateStrategies() — server/graph/resolvers/authentication.js:200│
+│                                                                    │
+│  1. 获取 previousStrategies（变更前快照）                            │
+│                                                                    │
+│  2. 遍历 args.strategies：                                         │
+│     ├─ 已存在 → patch 更新（含 isEnabled、order、config 等）         │
+│     └─ 新增 → insert 新行                                          │
+│                                                                    │
+│  3. 遍历被删除的策略：                                              │
+│     ├─ 有关联用户 → 抛错，整个事务回滚                               │
+│     └─ 无关联用户 → delete 删除                                     │
+│                                                                    │
+│  4. await WIKI.auth.activateStrategies()  ← 本进程立即重载          │
+│                                                                    │
+│  5. WIKI.events.outbound.emit('reloadAuthStrategies')              │
+│     ← 通知集群其他进程重载                                          │
+└────────────────────────┬──────────────────────────────────────────┘
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+┌─ 本进程 activateStrategies() ─┐  ┌─ 其他进程（HA 集群）──────────┐
+│  1. WIKI.auth.strategies = {}  │  │                              │
+│  2. passport.unuse() 卸载全部  │  │  PG LISTEN/NOTIFY 通道       │
+│  3. passport.use('jwt', ...)   │  │  → wiki channel              │
+│  4. 遍历数据库已启用策略：      │  │  → payload.event             │
+│     require → init → 写入      │  │    = 'reloadAuthStrategies'  │
+│     WIKI.auth.strategies[key]  │  │  → WIKI.events.inbound.emit  │
+│                                │  │    ('reloadAuthStrategies')   │
+│  效果：                        │  │  → WIKI.auth.activateStrategies()│
+│  - 被禁用的策略从内存移除       │  │    在另一进程重新执行         │
+│  - 新启用的策略注册到 Passport  │  │                              │
+│  - 配置变更的策略重新初始化     │  │                              │
+└────────────────────────────────┘  └──────────────────────────────┘
+```
+
+### 8.2 activateStrategies() 的全量重载策略
+
+`activateStrategies()` 不是增量更新，而是 **全量清空重建**：
+
+```js
+// server/core/auth.js:61-65
+WIKI.auth.strategies = {}
+const currentStrategies = _.keys(passport._strategies)
+_.pull(currentStrategies, 'session')
+_.forEach(currentStrategies, stg => { passport.unuse(stg) })
+```
+
+步骤分解：
+1. 清空内存注册表 `WIKI.auth.strategies = {}`
+2. 从 Passport 内部注册表 `passport._strategies` 取出所有已注册策略名
+3. 排除 `session`（Passport 内置策略，不可卸载）
+4. 逐个 `passport.unuse()` 卸载
+5. 重新注册 JWT 策略（固定的，用于请求鉴权）
+6. 从数据库查询 `isEnabled` 的策略，逐个 `require → init → 写入`
+
+这意味着每次策略变更都触发一次 **完整的卸载-重装周期**，不存在"只禁用某个策略"的增量操作。
+
+### 8.3 HA 集群间的运行时同步
+
+在多实例部署（HA 模式）下，策略变更需要同步到所有进程。同步机制基于 PostgreSQL 的 `LISTEN/NOTIFY`：
+
+```js
+// server/core/db.js:250-256
+this.listener.addChannel('wiki', payload => {
+  if (_.has(payload, 'event') && payload.source !== WIKI.INSTANCE_ID) {
+    WIKI.events.inbound.emit(payload.event, payload.value)
+  }
+})
+WIKI.events.outbound.onAny(this.notifyViaDB)
+```
+
+关键设计：
+- **`source !== WIKI.INSTANCE_ID`**：过滤掉自己发出的通知，避免重复执行
+- **inbound 事件映射**（`server/core/auth.js:478-491`）：
+
+| 事件名 | 触发动作 |
+|--------|---------|
+| `reloadAuthStrategies` | `WIKI.auth.activateStrategies()` |
+| `reloadGroups` | `WIKI.auth.reloadGroups()` |
+| `reloadApiKeys` | `WIKI.auth.reloadApiKeys()` |
+| `addAuthRevoke` | `WIKI.auth.revokeUserTokens(args)` |
+
+### 8.4 运行时切换的瞬时行为
+
+策略重载期间，系统的行为如下：
+
+1. **`passport.unuse()` 瞬间生效**：被卸载的策略如果此时恰好有 OAuth 回调到达，Passport 找不到对应策略会返回 `authenticate` 失败
+2. **重载是同步阻塞的**：`activateStrategies()` 内部虽然用了 `for...in` 遍历，但每个策略的 `init()` 是同步调用（策略模块的 `passport.use()` 本身同步），因此重载窗口极短
+3. **JWT 策略优先恢复**：`passport.use('jwt', ...)` 在业务策略之前注册，确保正在使用 JWT 的用户请求不受影响
+4. **已持有 JWT 的用户不受影响**：策略重载只影响登录流程，不影响 `authenticate()` 中间件对已有 JWT 的验证
+
+### 8.5 Local 策略的特殊保护
+
+Local 策略在管理后台有特殊约束：
+
+```html
+<!-- client/components/admin/admin-auth.vue:98 -->
+:disabled='strategy.key === `local`'
+```
+
+- **不可禁用**：Local 策略的启用开关始终灰显，无法关闭
+- **不可删除**：删除按钮在 Local 策略上同样灰显
+- **初始 order=0**：系统初始化时 Local 策略 order 固定为 0（`server/setup.js:266`），在排序中默认最靠前
+
+这是安全兜底设计：确保管理员不会把自己锁在系统外面（至少总有 Local 方式可以登录）。
+
+### 8.6 策略禁用后的影响范围
+
+一个策略被禁用（`isEnabled: false`）后的影响：
+
+| 维度 | 行为 |
+|------|------|
+| 内存注册表 | 该策略不进入 `WIKI.auth.strategies`，无法被 `User.login()` 查找 |
+| Passport | 该策略不被 `passport.use()` 注册，无法通过 `passport.authenticate()` 调用 |
+| 登录页 | `activeStrategies(enabledOnly: true)` 不返回该策略，前端不显示 |
+| 已绑定用户 | 这些用户的 `providerKey` 仍指向该策略，但他们无法登录 |
+| 数据库记录 | 记录保留，`isEnabled` 标记为 `false` |
+| OAuth 回调 | `/login/:strategy/callback` 路由仍存在，但 `User.login()` 查找不到策略会抛 `AuthProviderInvalid` |
+
+### 8.7 证书重签触发策略重载
+
+`regenerateCertificates()` 在重签 RSA 证书后也需要重载策略，因为 JWT 策略使用证书进行验证：
+
+```js
+// server/core/auth.js:410-441
+async regenerateCertificates () {
+  // 生成新证书...
+  await WIKI.configSvc.saveToDb(['certs', 'sessionSecret'])
+  await WIKI.auth.activateStrategies()     // 本进程重载
+  WIKI.events.outbound.emit('reloadAuthStrategies')  // 集群同步
+}
+```
+
+---
+
+## 九、关键源码位置索引
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
 | 内存注册表定义 | `server/core/auth.js` | :17 |
 | 策略激活 `activateStrategies()` | `server/core/auth.js` | :59-104 |
 | JWT 中间件认证 `authenticate()` | `server/core/auth.js` | :113-212 |
+| HA 事件订阅 `subscribeToEvents()` | `server/core/auth.js` | :478-491 |
+| 证书重签 → 触发策略重载 | `server/core/auth.js` | :410-443 |
 | 策略数据模型 | `server/models/authentication.js` | :13-131 |
 | 从磁盘刷新策略定义 | `server/models/authentication.js` | :78-130 |
-| 获取策略列表（排序） | `server/models/authentication.js` | :37-44 |
+| 获取策略列表（按 order 排序） | `server/models/authentication.js` | :37-44 |
 | 旧版客户端策略分类 | `server/models/authentication.js` | :46-76 |
 | 用户登录挑选逻辑 `login()` | `server/models/users.js` | :293-332 |
 | 登录后检查 `afterLoginChecks()` | `server/models/users.js` | :337-413 |
 | 社交登录 Profile 处理 `processProfile()` | `server/models/users.js` | :165-288 |
 | 路由分发 | `server/controllers/auth.js` | :25-96 |
-| 自动登录逻辑 | `server/controllers/auth.js` | :37-43 |
-| GraphQL 策略更新 | `server/graph/resolvers/authentication.js` | :200-249 |
+| 自动登录（取 order 最前策略） | `server/controllers/auth.js` | :37-43 |
+| GraphQL 策略更新 `updateStrategies()` | `server/graph/resolvers/authentication.js` | :200-249 |
+| 删除策略时的用户关联检查 | `server/graph/resolvers/authentication.js` | :232-238 |
+| HA 集群 PG LISTEN/NOTIFY | `server/core/db.js` | :240-265 |
 | 前端登录组件 | `client/components/login.vue` | :1-697 |
-| 前端策略查询 Apollo | `client/components/login.vue` | :669-695 |
+| 前端策略查询 Apollo（按 order 排序） | `client/components/login.vue` | :669-695 |
+| 前端 filteredStrategies（hideLocal 逻辑） | `client/components/login.vue` | :310-316 |
+| 前端 selectedStrategyKey watcher | `client/components/login.vue` | :328-342 |
+| 前端 filteredStrategies watcher（默认选中首项） | `client/components/login.vue` | :323-327 |
+| 管理后台策略配置页 | `client/components/admin/admin-auth.vue` | :1-433 |
+| 管理后台拖拽排序保存 | `client/components/admin/admin-auth.vue` | :294-339 |
+| Local 策略不可禁用/删除约束 | `client/components/admin/admin-auth.vue` | :68, :98 |
 | Local 策略实现 | `server/modules/authentication/local/authentication.js` | :1-44 |
-| Google 策略实现 | `server/modules/authentication/google/authentication.js` | :1-64 |
+| Google 策略实现（含 conf.key 区分多实例） | `server/modules/authentication/google/authentication.js` | :11-64 |
 | SAML 策略实现 | `server/modules/authentication/saml/authentication.js` | :1-86 |
-| 初始化插入 Local 策略 | `server/setup.js` | :259-269 |
+| 初始化插入 Local 策略（order=0） | `server/setup.js` | :259-269 |
