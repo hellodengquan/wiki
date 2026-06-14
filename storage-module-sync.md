@@ -1312,9 +1312,375 @@ const flushBuffer = async () => {
 
 ---
 
-## 15. 关键设计模式总结
+## 15. 存储模块容量预估与监控告警
 
-### 15.1 防循环写入
+### 15.1 容量预估：各存储后端的空间消耗
+
+Wiki.js 的存储内容主要由**页面文本**和**资产二进制**两部分组成，不同存储后端的额外开销不同：
+
+| 存储后端 | 内容存储 | 元数据开销 | 历史版本开销 | 冗余副本 | 典型空间倍率（相对 DB） |
+|---------|---------|-----------|------------|---------|----------------------|
+| **PostgreSQL DB**（主存储） | pages.content + assetData (bytea) | 索引 + 表结构 | pageHistory 全量快照 | 0（单副本，依赖 DB 备份） | 1×（基线） |
+| **Git** | 与 DB 相同的明文文件 | frontmatter（~100B per file） | `.git/objects` 打包压缩所有历史 commit | 本地 1 份 + 远程 1 份 | 1.5-3×（历史越多倍率越高） |
+| **Local Disk** | 与 DB 相同的明文文件 | frontmatter（~100B per file） | 可选 daily backup tar.gz（`createDailyBackups`） | 本地 1 份（可挂 NFS 多副本） | 1-10×（备份保留 30 天） |
+| **S3** | 每个对象独立存储 | 对象元数据（HTTP headers） | 可选 S3 Versioning（Wiki.js 不主动开启） | 配置的 replication factor（默认 3×） | 3-10×（含云厂商复制） |
+| **Azure Blob** | 每个 blob 独立存储 | blob 属性 + 存储层元数据 | 可选 Blob Versioning（Wiki.js 不主动开启） | 3× LRS / 12× GRS | 3-15× |
+| **SFTP** | 明文文件传输 | 无额外元数据 | 无内置版本控制 | 远端 1 份（依赖远端策略） | 1× |
+
+#### 容量估算公式
+
+```
+单页面存储大小估算：
+  Git/Disk/SFTP:  frontmatter(100B) + content_size + fs_block_overhead(4KB 取整)
+  S3/Azure:       content_size + object_overhead(≈200B)
+
+资产存储大小估算：
+  所有后端: asset_binary_size（资产不携带 frontmatter）
+
+Git 额外开销：
+  .git 目录 ≈ (总内容大小 × 0.3 压缩比) × 历史 commit 数量因子
+  粗略估算：每 1000 次 commit 增加 0.1-0.5× 当前内容大小
+```
+
+**估算示例：** 10000 页面，平均 5KB；1000 资产，平均 500KB
+- DB: ≈ 10000×5KB + 1000×500KB = 50MB + 500MB ≈ **550MB**
+- Git（本地 + 远程，含历史）: ≈ 550MB × 2 × 1.5 ≈ **1.6GB**
+- S3（3× 复制）: ≈ 550MB × 3 ≈ **1.6GB**
+- Disk（含 30 天每日备份）: ≈ 550MB + 550MB×30（压缩比 0.5）≈ **8.8GB**
+
+### 15.2 监控机制：三态状态机
+
+存储目标的状态通过 `state` JSONB 字段追踪，暴露在 GraphQL `storage.status` 查询中：
+
+```javascript
+// models/storage.js → storage 表 state 字段
+state: {
+  status: 'pending' | 'operational' | 'error',
+  message: '错误详情字符串',
+  lastAttempt: 'ISO 8601 时间戳'
+}
+```
+
+**状态流转：**
+
+```
+        initTargets() → init()
+  ┌────────────── pending ──────────────┐
+  │                                      │
+  │  init()成功 / sync()成功             │ sync()失败 / init()失败
+  │                                      │
+  ▼                                      ▼
+operational ──────────────────────► error
+  ▲   │                                │
+  │   │ 下一次 sync()成功              │ 管理员 Force Sync 成功
+  │   │                                │
+  │   └────────────────────────────────┘
+  │
+  │ updateTargets() → 重置为 pending
+  └───────────────────────────────────────
+```
+
+**代码位置：**
+- `sync-storage.js:15-31` — 每次 sync 更新 state（成功 operational / 失败 error + message）
+- `resolvers/storage.js:40-52` — `StorageQuery.status` 查询暴露给管理后台
+- `resolvers/storage.js:55-89` — `StorageMutation.updateTargets` 重置 state 为 pending
+
+### 15.3 管理后台监控面板
+
+**代码位置：** `client/components/admin/admin-storage.vue:37-80`
+
+管理后台 `Storage` 页实时展示：
+
+| 状态 | 图标 | 颜色 | 显示内容 |
+|------|-----|------|---------|
+| `pending` | `mdi-clock-outline` | 紫色 | 状态 + 进度环 |
+| `operational` | `mdi-check-circle` | 绿色 | "最后同步于 X 时间前"（moment from） |
+| `error` | `mdi-close-circle-outline` | 红色 | "最后一次尝试 X 时间前" + 详情按钮弹出错误 message |
+
+**刷新机制：** Apollo `pollInterval` 定时轮询 GraphQL `storage.status` 查询，不是 WebSocket 推送。
+
+### 15.4 告警机制
+
+**当前实现：无主动告警推送。**
+
+| 告警能力 | 实现状态 | 说明 |
+|---------|---------|------|
+| 管理后台可视化告警 | ✅ | 红色状态 + 错误详情 |
+| 日志记录 | ✅ | `WIKI.logger.warn(err)` + `sync-storage.js` 写 message 到 DB |
+| 邮件告警 | ❌ | 未实现 |
+| Webhook 告警 | ❌ | 未实现 |
+| Prometheus 指标 | ❌ | 未暴露 `/metrics` endpoint |
+| 容量告警 | ❌ | 无磁盘/空间/配额监控 |
+| 失败次数阈值告警 | ❌ | 不统计连续失败次数，没有"连续失败 N 次自动禁用"逻辑 |
+
+管理员只能通过登录管理后台查看状态，或扫描服务器日志发现同步失败。
+
+### 15.5 Telemetry（遥测）
+
+**代码位置：** `server/core/telemetry.js`
+
+WIKI.telemetry 存在但用途极有限：
+- 仅在 `sendInstanceEvent('STARTUP'/'INSTALL')` 时向官方遥测端点发送匿名系统信息（OS、DB 类型、CPU、RAM、Node 版本）
+- `sendEvent()` 和 `sendError()` 方法体为空（`// TODO`）
+- 不追踪存储模块的任何运行数据
+- 可在管理后台开关（`system.js:80`）
+
+---
+
+## 16. 不同存储后端的能力差异
+
+### 16.1 配置定义层面的差异
+
+各存储后端的 `definition.yml` 定义了模块的能力边界：
+
+| 特性 | Git | Local Disk | S3 | Azure Blob | SFTP | 云端占位* |
+|------|:-:|:----------:|:--:|:----------:|:----:|:--------:|
+| `isAvailable` | ✅ true | ✅ true | ✅ true | ✅ true | ✅ true | ✅ true |
+| `supportedModes` | `sync/push/pull` | `push` | `push` | `push` | `push` | 仅 `push` |
+| `defaultMode` | `sync` | `push` | `push` | `push` | `push` | `push` |
+| `schedule` | PT5M | false | false | false | false | false |
+| `internalSchedule` | — | P1D | — | — | — | — |
+| 模块文件实现完整度 | 100% | 90% | 80% | 80% | 80% | 5%（空桩） |
+
+> *云端占位 = dropbox / gdrive / onedrive / box，`definition.yml` 存在但 `storage.js` 方法体全部为空或 return null
+
+### 16.2 核心接口能力矩阵
+
+| 接口 | 职责 | Git | Disk | S3 | Azure | SFTP |
+|------|------|:-:|:----:|:--:|:-----:|:----:|
+| `init()` | 初始化连接/仓库 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `sync()` | 双向同步调度 | ✅ | — | — | — | — |
+| `created(page)` | 页面创建推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `updated(page)` | 页面更新推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `deleted(page)` | 页面删除推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `renamed(page)` | 页面重命名推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `assetUploaded(asset)` | 资产上传推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `assetDeleted(asset)` | 资产删除推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `assetRenamed(asset)` | 资产重命名推送 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `getLocalLocation(asset)` | 获取资产本地访问路径 | ✅（读本地仓库） | ✅（读本地备份目录） | ⚠️（空字符串，需走 HTTP URL） | ⚠️（空字符串） | ⚠️（空字符串） |
+| `dump()` | DB→存储 全量导出 | ✅（含 git commit） | ✅（tar.gz 备份） | — | — | — |
+| `backup()` | 创建本地备份归档 | — | ✅ | — | — | — |
+| `syncUntracked()` | DB→仓库 增量补全 | ✅ | — | — | — | — |
+| `importAll()` | 存储→DB 全量导入 | ✅ | ✅ | — | — | — |
+| `exportAll()` | DB→存储 全量覆盖 | — | — | ✅ | ✅ | ✅ |
+| `purge()` | 销毁并重建本地仓库 | ✅ | — | — | — | — |
+
+### 16.3 管理操作（Actions）差异
+
+每个模块在 `definition.yml` 的 `actions` 中暴露给管理员可手动执行的操作：
+
+| 操作 | Git | Disk | S3 | Azure | SFTP |
+|------|:-:|:----:|:--:|:-----:|:----:|
+| Force Sync（立即同步） | ✅ sync | — | — | — | — |
+| Add Untracked（补全 DB→仓库） | ✅ syncUntracked | — | — | — | — |
+| Import Everything（存储→DB） | ✅ importAll | ✅ importAll | — | — | — |
+| Purge Local Repository | ✅ purge | — | — | — | — |
+| Dump all content to disk | — | ✅ dump | — | — | — |
+| Create Backup | — | ✅ backup | — | — | — |
+| Export All（DB→存储全量） | — | — | ✅ exportAll | ✅ exportAll | ✅ exportAll |
+
+### 16.4 内容格式差异
+
+所有模块输出的页面文件格式基本一致，但细节有差异：
+
+| 特性 | Git / Disk | S3 / Azure / SFTP |
+|------|:----------:|:-----------------:|
+| Frontmatter 注入 | ✅ 完整 `injectPageMetadata` | ✅ 完整 |
+| 内容类型 | `.md` / `.html` 按 contentType 区分 | ✅ 相同 |
+| 路径命名空间 | `locale/path.ext`（可配置 alwaysNamespace） | ✅ 相同 |
+| 资产路径 | `_assets/filename.ext`（含 folder 层级） | ✅ 相同 |
+| 实时版本控制 | ✅ git commit 自动记录 | ❌ 对象覆盖写 |
+| 每日归档 | — | ✅ Disk 可选 tar.gz（保留 30 天） | ❌ — |
+| 文件系统访问 | ✅ 本地路径可用（`getLocalLocation` 返回实际路径） | ❌ 需走云存储 URL |
+
+### 16.5 认证与安全
+
+| 后端 | 支持的认证方式 | 敏感字段加密 |
+|------|--------------|------------|
+| **Git** | SSH Key（path 或 content） / Basic（用户名+密码/PAT） | SSH key 内容、密码：DB 中 `config.*` 未加密，仅前端展示打码为 `********` |
+| **Local Disk** | 操作系统文件权限 | 无 |
+| **S3** | Access Key ID + Secret Access Key | Secret：同上，DB 明文存储 |
+| **Azure Blob** | Account Name + Account Key | Account Key：同上，DB 明文存储 |
+| **SFTP** | 私钥（+ Passphrase） / 密码 | 私钥内容、密码、passphrase：同上，DB 明文存储 |
+
+> **安全隐患**：`sensitive: true` 字段仅在前端 GraphQL 响应中打码（`resolvers/storage.js:31`），DB 中存储明文。如果攻击者获取到数据库，所有存储凭证即泄露。
+
+### 16.6 多模块并存策略
+
+系统支持**同时启用多个存储目标**：
+
+```
+pageEvent(page) → for each enabled target:
+                    target.fn.created(page)  // 并发执行
+```
+
+- 多个模块并行推送，互不干扰
+- 一个模块推送失败不影响其他模块（`pageEvent` 的 `try/catch` 在循环外，一个失败将中断后续所有模块）
+  - ⚠️ 注意：`storage.js:179-189` 中的 for/of + try/catch 包在循环外层，单个 target 抛异常将跳过剩余 targets
+- sync 方向（双向）与 push 方向（单向）模块可并存
+
+---
+
+## 17. 存储失败后回退到只读模式的链路
+
+### 17.1 架构前提：无全局只读模式
+
+**本项目没有实现存储失败后自动回退到"系统只读"的功能。** 代码中不存在任何 read-only / degraded / maintenance 模式的实现：
+
+```bash
+$ grep -rn "readOnly\|read-only\|readonly\|maintenance\|failover\|degraded" server/
+# 无任何匹配结果
+```
+
+### 17.2 存储失败后的实际行为
+
+存储模块失败（同步失败、推送失败）时的真实行为链路如下：
+
+```
+场景 A：用户保存页面时存储推送失败
+
+  pages.updatePage(opts)
+    ├─ ✅ DB updatePage 成功（写入 pages 表）
+    ├─ ✅ pageHistory.addVersion() 成功（写入历史版本）
+    ├─ ✅ renderPage() 成功（更新 render 缓存）
+    ├─ ✅ searchEngine.updated() 成功（写入搜索索引）
+    └─ ❌ storage.pageEvent({ event:'updated', page })
+         └─ for (let target of this.targets) {
+              await target.fn.updated(page)   ← 此处抛异常
+              // 注意：try/catch 在 for 循环外层！
+            }
+         └─ catch (err) {
+              WIKI.logger.warn(err)           // 仅写日志
+              throw err                        // 重新抛出！
+            }
+    └─ ❌ updatePage 整体抛出异常给 GraphQL resolver
+         └─ graphHelper.generateError(err)
+              → 返回给前端：保存失败的错误消息
+              → DB 已提交的更改不回滚！（无事务）
+```
+
+**结果：**
+- 页面内容已保存到 DB、已更新历史、已更新搜索、已更新缓存（全部成功）
+- 但外部存储（Git/S3/Azure/SFTP）未更新，产生 DB ↔ 存储不一致
+- 前端用户看到"保存失败"错误提示，但实际上数据已写入主存储
+- 用户再次点击保存时，可能因 DB 已最新但用户无感知而产生困惑
+
+```
+场景 B：定时 sync 失败（网络波动、远程仓库不可达）
+
+  sync-storage.js job
+    ├─ target.fn.sync() → 抛出异常
+    ├─ await WIKI.models.storage.query().patch({
+         state: { status: 'error', message: err.message, lastAttempt: now }
+       })
+    └─ WIKI.logger.warn(err)
+  → 下一次 sync 调度到时自动重试
+  → 用户读写页面完全不受影响（因为 DB 是主存储）
+```
+
+**结果：**
+- 存储模块状态标记为 error，管理后台显示红色告警
+- 前台用户完全感知不到，Wiki 继续正常读写
+- DB ↔ 外部存储差距逐渐扩大，直到 sync 恢复正常后增量补偿
+
+### 17.3 不一致的风险窗口
+
+| 操作路径 | 存储失败对用户可见性 | 数据一致性风险 |
+|---------|-------------------|-------------|
+| **用户保存页面时** pageEvent 抛异常 | ⚠️ 前端提示"保存失败"但实际 DB 已保存 | 低（DB 有最新，外部存储滞后，下次 sync 补偿） |
+| **定时 sync 失败** | ❌ 用户不可见，仅管理员可见 | 中（Git 模块：断连期间远程变更不会同步到 DB） |
+| **资产上传时** assetEvent 抛异常 | ⚠️ 前端提示上传失败但 DB assetData 已写入 | 中（资产 DB 记录存在但外部存储缺失） |
+| **页面删除时** storage.deleted 抛异常 | ⚠️ 前端提示删除失败但 DB 已删除 | 高（DB 中页面已不存在，但外部存储中残留文件） |
+| **页面重命名时** storage.renamed 抛异常 | ⚠️ 前端提示失败但 DB 已重命名 | 高（DB 路径已变，外部存储中残留旧路径文件，新路径缺失） |
+
+### 17.4 隐含的降级模式
+
+虽然没有显式的只读模式，但系统存在一些**隐式降级行为**：
+
+#### 17.4.1 DB 是唯一可信源（Source of Truth）
+
+所有用户读写操作都直接操作 DB：
+- 读页面：`pages.getPage()` → 直接查 DB，完全不经过存储模块
+- 写页面：`pages.updatePage()` → 写 DB，存储推送是附加操作
+- 资产访问：`Storage.getLocalLocations()` 只在资产需要读取本地路径时调用存储模块，assetData 存于 DB
+
+**这意味着：存储模块完全不可用时，Wiki 仍可 100% 正常读、写、搜索页面。** 外部存储只是"备份/同步副本"，不是主路径。
+
+#### 17.4.2 资产降级路径
+
+当资产的外部存储路径不可用时，系统可从 DB assetData 表恢复：
+```
+访问资产时：
+  1. 优先从本地文件缓存读取（cache/${asset.folder}/${asset.filename}）
+  2. 缓存不存在时，尝试从已启用的存储模块 getLocalLocation 获取
+  3. 都不可用时，从 DB assetData 表读取 bytea 二进制数据写入缓存
+```
+**实际代码中第 3 步的降级逻辑仅在资产上传时启用（用于生成缓存文件），资产下载时主要依赖本地缓存路径。**
+
+#### 17.4.3 离线模式
+
+**代码位置：** `config.js:27`、`scheduler.js:111-114`
+
+系统有一个全局 `offline` 模式配置：
+```yaml
+# config.yml
+offline: true
+```
+- 禁用遥测（telemetry）
+- 所有标记了 `offlineSkip: true` 的调度任务（syncGraphLocales、syncGraphUpdates）自动跳过
+- 但存储模块的 sync-storage job **不**受 offline 配置影响，继续执行
+
+### 17.5 pageEvent 异常传播分析
+
+**代码位置：** `server/models/storage.js:178-199`
+
+```javascript
+static async pageEvent({ event, page }) {
+  try {
+    for (let target of this.targets) {
+      await target.fn[event](page)   // 串行！一个失败，后续全部跳过
+    }
+  } catch (err) {
+    WIKI.logger.warn(err)
+    throw err   // ← 重新抛出给调用方
+  }
+}
+```
+
+**两个问题：**
+1. **串行执行**：target1 推送 300ms、target2 推送 300ms → total 600ms。没有 `Promise.all` 并行
+2. **第一个失败即中断全部**：target1 失败，target2（即使是另一个完全独立的存储）不会被尝试。对于启用了多个存储目标（如 Git + S3 同时推送）的部署，这会导致所有目标状态不一致
+
+### 17.6 理论上的只读模式实现路径（基于现有代码的可行改造）
+
+如果需要实现存储失败后自动切换只读模式，可基于以下现有组件扩展：
+
+```
+建议的改造链路：
+
+1. 在 sync-storage job 中增加连续失败计数：
+   state: { status, message, lastAttempt, consecutiveFailures: N }
+
+2. 当 consecutiveFailures > 阈值（如 3 次）：
+   - 通过 PG NOTIFY 广播 "storageDegraded" 事件
+   - 在 WIKI 全局状态中标记 isStorageDegraded = true
+
+3. 在 pages.createPage / updatePage / deletePage 入口增加检查：
+   if (WIKI.isStorageDegraded && WIKI.config.storage.failoverToReadOnly) {
+     throw new Error('系统处于只读维护模式，请稍后再试')
+   }
+
+4. 页面渲染时增加 banner 提示：
+   "当前处于只读模式，部分功能暂不可用"
+```
+
+**但在当前代码中，以上逻辑均未实现。** 存储失败后没有任何自动故障切换机制。
+
+---
+
+## 18. 关键设计模式总结
+
+### 18.1 防循环写入
 
 所有从外部存储 → DB 的写入操作均传入 `skipStorage: true`：
 - `commonDisk.processPage()` → `updatePage({ skipStorage: true })` / `createPage({ skipStorage: true })`
@@ -1322,7 +1688,7 @@ const flushBuffer = async () => {
 
 这确保 Pull 路径不会触发 Push 路径的 `Storage.pageEvent()`，避免无限循环。
 
-### 15.2 事件驱动 Push
+### 18.2 事件驱动 Push
 
 所有 DB → 存储的写入通过事件模型：
 ```
@@ -1330,7 +1696,7 @@ Page Model 操作 → Storage.pageEvent({ event, page }) → 遍历所有 target
 ```
 每个存储模块只需实现 `created / updated / deleted / renamed` 四个接口即可自动接收 DB 变更。
 
-### 15.3 增量 Diff 同步
+### 18.3 增量 Diff 同步
 
 Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 diff：
 1. 记录 sync 前的 HEAD hash
@@ -1338,7 +1704,7 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 3. `diffSummary(oldHash, newHash)` 只处理两次 sync 之间的变更
 4. 无变更则跳过处理
 
-### 15.4 编辑器冲突的乐观锁模式
+### 18.4 编辑器冲突的乐观锁模式
 
 ```
 用户A打开编辑 → checkoutDate = page.updatedAt
@@ -1350,7 +1716,7 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 
 ---
 
-## 16. 涉及的关键文件索引
+## 19. 涉及的关键文件索引
 
 | 文件路径 | 职责 |
 |---------|------|
@@ -1359,26 +1725,32 @@ Git 模块的 `sync()` 不是全量比对，而是基于 commit hash 的增量 d
 | `server/core/db.js` | PG LISTEN/NOTIFY 多实例缓存失效 |
 | `server/core/cache.js` | 内存缓存（NodeCache） |
 | `server/core/config.js` | 配置加载，WIKI.data = appdata 含jobs定义 |
+| `server/core/telemetry.js` | 匿名遥测（仅系统信息，不追踪存储状态） |
 | `server/core/worker.js` | 子进程 worker 执行器 |
 | `server/jobs/sync-storage.js` | sync-storage job 入口 |
-| `server/models/storage.js` | Storage 模型：target 管理、事件分发 |
+| `server/models/storage.js` | Storage 模型：target 管理、事件分发、状态追踪 |
 | `server/models/pages.js` | Page 模型：CRUD、parseMetadata |
 | `server/models/pageHistory.js` | 页面版本历史快照、版本链查询 |
 | `server/models/assets.js` | 资产上传流程、缓存/存储写入 |
 | `server/helpers/page.js` | 路径解析、frontmatter 注入/提取、hash 生成 |
 | `server/modules/storage/git/storage.js` | Git 存储模块（唯一完整双向同步实现） |
-| `server/modules/storage/git/definition.yml` | Git 模块配置定义 |
+| `server/modules/storage/git/definition.yml` | Git 模块配置定义（含 actions 列表） |
 | `server/modules/storage/disk/storage.js` | Disk 存储模块（push + 备份） |
+| `server/modules/storage/disk/definition.yml` | Disk 模块配置定义 |
 | `server/modules/storage/disk/common.js` | Disk/Git 共享的 processPage / processAsset 逻辑 |
 | `server/modules/storage/sftp/storage.js` | SFTP 单向 push 实现 |
+| `server/modules/storage/sftp/definition.yml` | SFTP 模块配置定义 |
 | `server/modules/storage/azure/storage.js` | Azure Blob 单向 push 实现 |
+| `server/modules/storage/azure/definition.yml` | Azure 模块配置定义 |
 | `server/modules/storage/s3/common.js` | S3 兼容存储 单向 push 实现 |
+| `server/modules/storage/s3/definition.yml` | S3 模块配置定义 |
 | `server/modules/search/elasticsearch/engine.js` | Elasticsearch 批量优化模式参考 |
 | `server/graph/resolvers/page.js` | GraphQL: checkConflicts / conflictLatest |
 | `server/graph/schemas/page.graphql` | GraphQL Schema: PageConflictLatest 类型 |
-| `server/graph/resolvers/storage.js` | GraphQL: 存储管理接口 |
+| `server/graph/resolvers/storage.js` | GraphQL: 存储 targets 查询 + status 状态 + 更新 + 执行 action |
 | `server/app/data.yml` | 系统内置任务配置（jobs 定义） |
 | `client/components/editor.vue` | 编辑器主组件：冲突检测轮询 + 保存流程 |
 | `client/components/editor/editor-modal-conflict.vue` | Markdown/Code 编辑器的冲突解决 UI |
 | `client/components/editor/ckeditor/conflict.vue` | CKEditor 的冲突解决 UI |
+| `client/components/admin/admin-storage.vue` | 管理后台存储配置 + 状态监控面板 |
 | `client/libs/codemirror-merge/diff-match-patch.js` | 文本差异计算库 |
