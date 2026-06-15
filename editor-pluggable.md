@@ -730,3 +730,408 @@ graph/resolvers/page.js: PageMutation.create/update
 3. 新 CKEditor 实例从 Vuex 的 `editor/content` 读内容 → 开启自己全新的 undo 栈
 
 切换编辑器是**断点**：之前在另一个编辑器里做的编辑，Ctrl+Z 追不回来。
+
+---
+
+## 九、编辑器主题切换
+
+Wiki.js **没有独立的 ThemeManager 类**，编辑器主题切换完全依赖 Vuetify 的 `$vuetify.theme.dark` 响应式属性，各编辑器组件自行读取并适配。
+
+### 9.1 全局暗色模式开关
+
+暗色模式的源头是 `siteConfig.darkMode`（从服务端注入到前端全局变量），前端初始化时赋给 Vuetify：
+
+```js
+// 客户端初始化（各页面入口处）
+WIKI.$vuetify.theme.dark = siteConfig.darkMode
+```
+
+用户在个人设置中切换时，修改 store 中的偏好，触发 `$vuetify.theme.dark` 的响应式更新。所有组件里 `$vuetify.theme.dark` 的引用自动重新求值。
+
+### 9.2 CodeMirror 主题适配
+
+CodeMirror 的主题在创建实例时通过 `theme` 配置项设定。Wiki.js 自定义了一个 `wikijs-dark` 主题（在 `editor-code.vue:371-446` 的 `<style>` 块中以 `.cm-s-wikijs-dark` 选择器定义）。
+
+各 CodeMirror 编辑器的主题处理：
+
+| 编辑器 | 代码位置 | 做法 |
+|--------|----------|------|
+| Markdown | `editor-markdown.vue:745` | `theme: 'wikijs-dark'` — 固定使用暗色主题 |
+| Code | `editor-code.vue:187` | `theme: 'wikijs-dark'` — 固定使用暗色主题 |
+| AsciiDoc | `editor-asciidoc.vue:394-403` | `theme: 'wikijs-dark'` — 固定使用暗色主题 |
+
+**关键发现**：CodeMirror 的 `theme` 是在 `mounted()` 创建实例时硬编码的，**没有监听 `$vuetify.theme.dark` 的变化做动态切换**。也就是说，编辑器区域永远是暗色主题，不跟随系统明暗切换。
+
+Mermaid 图表初始化（`editor-markdown.vue:735-738`）则读取了 dark 模式：
+
+```js
+mermaid.initialize({
+  theme: this.$vuetify.theme.dark ? 'dark' : 'default'
+})
+```
+
+但这也只在 `mounted()` 时读取一次，后续切换不生效。
+
+### 9.3 CKEditor 主题适配
+
+CKEditor 5 通过 DecoupledEditor 创建时没有传入主题配置。它的视觉样式完全由外部 CSS 控制。在 `editor-ckeditor.vue:143-156` 的样式中：
+
+```scss
+.editor-ckeditor {
+  background-color: mc('grey', '200');
+  @at-root .theme--dark & {
+    background-color: mc('grey', '900');
+  }
+}
+```
+
+CKEditor 依赖 Vuetify 在根元素上切换 `theme--dark` 类名，配合 `@at-root .theme--dark &` 选择器实现样式跟随。这种方案**可以实时响应暗色切换**，因为 CSS 类名是响应式的。
+
+### 9.4 编辑器外框（editor.vue）与弹窗的主题适配
+
+`editor.vue` 的外层始终是暗色背景：
+
+```scss
+.editor {
+  background-color: mc('grey', '900') !important;
+}
+```
+
+各弹窗组件（media、properties、conflict 等）大量使用 `$vuetify.theme.dark` 三元表达式动态选择颜色，例如：
+
+```pug
+v-card(:light='!$vuetify.theme.dark', :dark='$vuetify.theme.dark')
+v-toolbar(:color='$vuetify.theme.dark ? `teal` : `teal lighten-5`')
+```
+
+这些可以在运行时响应主题切换。
+
+### 9.5 总结
+
+| 层级 | 主题切换能力 | 机制 |
+|------|-------------|------|
+| 编辑器外框 | 固定暗色 | CSS 硬编码 |
+| CodeMirror 编辑区 | 固定暗色 | `theme: 'wikijs-dark'` 在 mounted 时硬编码，不监听变化 |
+| CKEditor 编辑区 | 可切换 | `@at-root .theme--dark &` CSS 选择器跟随 |
+| 弹窗/工具栏 | 可切换 | `$vuetify.theme.dark` 三元表达式 |
+| Markdown 预览区 | 可切换 | `@at-root .theme--dark &` CSS 选择器 |
+
+---
+
+## 十、快捷键绑定（Keymap）
+
+Wiki.js **没有统一的 KeymapRegistry**，各编辑器组件在 `mounted()` 中独立注册自己的快捷键，机制取决于底层库的 API。
+
+### 10.1 CodeMirror 系：extraKeys
+
+CodeMirror 通过 `cm.setOption('extraKeys', keyBindings)` 注册自定义快捷键，**不影响内置的 undo/redo/search**。
+
+#### 平台检测
+
+```js
+// editor-markdown.vue:235
+const CtrlKey = /Mac/.test(navigator.platform) ? 'Cmd' : 'Ctrl'
+```
+
+所有 CodeMirror 编辑器共享此检测，确保 Mac 上用 `Cmd`、其他平台用 `Ctrl`。
+
+#### 各编辑器的快捷键注册
+
+| 编辑器 | 代码位置 | 注册的快捷键 |
+|--------|----------|-------------|
+| Markdown | `editor-markdown.vue:773-805` | `Ctrl+S` 保存、`Ctrl+B` 加粗、`Ctrl+I` 斜体、`Ctrl+Alt+Right` 降标题级、`Ctrl+Alt+Left` 升标题级 |
+| Code | `editor-code.vue:211-219` | `F11` 全屏、`Esc` 退出全屏（仅此两个） |
+| AsciiDoc | `editor-asciidoc.vue:426-443` | `Ctrl+B` 加粗(`*`）、`Ctrl+I` 斜体(`_`）、`F11` 全屏、`Esc` 退出全屏 |
+
+注意 Code 编辑器**没有注册 Ctrl+S**——保存按钮在顶部导航栏，Code 编辑器里按 Ctrl+S 不会触发保存。Markdown 编辑器注册了 `Ctrl+S` 绑定到 `this.save()`。
+
+#### 注册方式
+
+```js
+const keyBindings = {
+  'F11' (c) { c.setOption('fullScreen', !c.getOption('fullScreen')) },
+  'Esc' (c) { if (c.getOption('fullScreen')) c.setOption('fullScreen', false) }
+}
+_.set(keyBindings, `${CtrlKey}-S`, c => { this.save(); return false })
+_.set(keyBindings, `${CtrlKey}-B`, c => { this.toggleMarkup({ start: `**` }) })
+this.cm.setOption('extraKeys', keyBindings)
+```
+
+`_.set()` 动态拼键名字符串，返回 `false` 阻止 CodeMirror 默认行为。
+
+### 10.2 CKEditor 系：内置快捷键
+
+CKEditor 5 的 DecoupledEditor 自带快捷键系统（Bold=Ctrl+B、Italic=Ctrl+I、Link=Ctrl+K 等），Wiki.js **没有额外注册或覆盖**。
+
+CKEditor 的 save 快捷键也是**未注册**的，保存只通过顶部导航栏按钮触发。
+
+### 10.3 编辑器间快捷键不一致问题
+
+| 功能 | Markdown | Code | AsciiDoc | CKEditor |
+|------|----------|------|----------|----------|
+| Ctrl+S 保存 | ✅ | ❌ | ❌ | ❌ |
+| Ctrl+B 加粗 | ✅ `**` | ❌ | ✅ `*` | ✅ (内置) |
+| Ctrl+I 斜体 | ✅ `*` | ❌ | ✅ `_` | ✅ (内置) |
+| 标题升降级 | ✅ | ❌ | ❌ | ❌ |
+| F11 全屏 | ❌ | ✅ | ✅ | ❌ |
+
+各编辑器快捷键**完全独立注册**，没有共享的 keymap 配置层，无法全局统一。
+
+---
+
+## 十一、文件上传与图片嵌入
+
+### 11.1 整体架构
+
+```
+前端 Media 弹窗 → FilePond 上传 → POST /u (multer) → assets.upload() → DB
+                                                                       ↓
+前端选文件插入 → $root.$emit('editorInsert') → 各编辑器组件监听 → 按格式插入到光标位置
+```
+
+### 11.2 上传端点：POST /u
+
+`server/controllers/upload.js:13-99`：
+
+1. **multer 中间件**接收文件，存储到 `data/uploads/` 临时目录
+2. **权限校验**：`WIKI.auth.checkAccess(req.user, ['write:assets', 'manage:system'])`
+3. **单文件限制**：即使 FilePond 配置 `allow-multiple`，后端只接受单文件（多个 file 返回 400）
+4. **文件夹元数据**：从 `body.mediaUpload` JSON 中解析 `folderId`
+5. **路径权限校验**：拼接 assetPath 后 `checkAccess(user, ['write:assets'], { path: assetPath })`
+6. **文件名清洗**：`sanitize()` + 小写 + 空格/逗号替换为下划线
+7. **调用 `WIKI.models.assets.upload()`** 处理实际入库
+
+### 11.3 assets.upload() 入库逻辑
+
+`server/models/assets.js:81-100`：
+
+```js
+static async upload(opts) {
+  const fileInfo = path.parse(opts.originalname)
+  const fileHash = assetHelper.generateHash(opts.assetPath)
+  // 检查是否已有同 hash 同 folder 的资产
+  let asset = await WIKI.models.assets.query().where({ hash, folderId }).first()
+  let assetRow = {
+    filename: opts.originalname,
+    hash: fileHash,
+    ext: fileInfo.ext,
+    kind: _.startsWith(opts.mimetype, 'image/') ? 'image' : 'binary',
+    mime: opts.mimetype,
+    fileSize: opts.size,
+    folderId: opts.folderId
+  }
+  // ... 已有则更新，没有则插入
+}
+```
+
+`kind` 字段按 MIME 前缀判定：`image/*` → `'image'`，其余 → `'binary'`。这个 `kind` 决定了插入编辑器时走 IMAGE 还是 BINARY 分支。
+
+### 11.4 前端 FilePond 上传组件
+
+`client/components/editor/editor-modal-media.vue:139-150`：
+
+```pug
+file-pond(
+  name='mediaUpload'
+  ref='pond'
+  :server='filePondServerOpts'
+  :instant-upload='false'
+  @processfile='onFileProcessed'
+)
+```
+
+`filePondServerOpts`（`editor-modal-media.vue:317-327`）配置上传目标：
+
+```js
+filePondServerOpts() {
+  const jwtToken = Cookies.get('jwt')
+  return {
+    process: {
+      url: '/u',
+      headers: { 'Authorization': `Bearer ${jwtToken}` }
+    }
+  }
+}
+```
+
+上传流程：
+1. 用户拖拽/浏览文件 → FilePond 缓存到本地
+2. 点击 Upload → `this.$refs.pond.processFiles()` → 逐文件 POST 到 `/u`
+3. 每个文件处理完触发 `onFileProcessed` → 自动 5 秒后从 FilePond 列表移除 → 刷新资产列表
+
+### 11.5 资产选择与插入：editorInsert 事件总线
+
+用户在资产列表选中文件点 Insert 时（`editor-modal-media.vue:371-381`）：
+
+```js
+insert() {
+  const asset = _.find(this.assets, ['id', this.currentFileId])
+  const assetPath = this.folderTree.map(f => f.slug).join('/')
+  this.$root.$emit('editorInsert', {
+    kind: asset.kind,       // 'IMAGE' | 'BINARY'
+    path: this.currentFolderId > 0
+      ? `/${assetPath}/${asset.filename}`
+      : `/${asset.filename}`,
+    text: asset.filename,
+    align: this.imageAlignment   // 对齐方式
+  })
+  this.activeModal = ''
+}
+```
+
+### 11.6 各编辑器对 editorInsert 的处理
+
+`editorInsert` 是一个**全局事件总线**，各编辑器在 `mounted()` 中用 `$root.$on` 监听，`beforeDestroy()` 中 `$root.$off` 取消。
+
+#### Markdown 编辑器（`editor-markdown.vue:825-848`）
+
+```js
+this.$root.$on('editorInsert', opts => {
+  switch (opts.kind) {
+    case 'IMAGE':
+      let img = `![${opts.text}](${opts.path})`
+      if (opts.align && opts.align !== '') {
+        img += `{.align-${opts.align}}`
+      }
+      this.insertAtCursor({ content: img })
+      break
+    case 'BINARY':
+      this.insertAtCursor({ content: `[${opts.text}](${opts.path})` })
+      break
+    case 'DIAGRAM':
+      this.cm.doc.replaceSelection('```diagram\n' + opts.text + '\n```\n', 'start')
+      break
+  }
+})
+```
+
+- IMAGE → `![filename](/path)` + 可选 `.align-xxx` 属性
+- BINARY → `[filename](/path)` 普通链接
+- DIAGRAM → ``` ```diagram\nbase64...\n``` ``` 代码块
+
+#### Code 编辑器（`editor-code.vue:229-247`）
+
+```js
+case 'IMAGE':
+  let img = `<img src="${opts.path}" alt="${opts.text}"`
+  if (opts.align && opts.align !== '') {
+    img += ` class="align-${opts.align}"`
+  }
+  img += ` />`
+  break
+case 'BINARY':
+  `<a href="${opts.path}" title="${opts.text}">${opts.text}</a>`
+```
+
+因为是 HTML 模式，插入的是 `<img>` 和 `<a>` 标签。
+
+#### AsciiDoc 编辑器（`editor-asciidoc.vue:454-474`）
+
+```js
+case 'IMAGE':  `image::${opts.path}[${opts.text}]`
+case 'BINARY': `link:${opts.path}[${opts.text}]`
+case 'DIAGRAM': ```diagram\nbase64...\n```
+```
+
+#### CKEditor（`editor-ckeditor.vue:102-119`）
+
+```js
+case 'IMAGE':  this.editor.execute('imageInsert', { source: opts.path })
+case 'BINARY': this.editor.execute('link', opts.path, { linkIsDownloadable: true })
+case 'DIAGRAM': this.editor.execute('imageInsert', { source: `data:image/svg+xml;base64,${opts.text}` })
+```
+
+CKEditor 通过自己的命令系统 `execute()` 插入，DIAGRAM 被转为 base64 data URI 当图片插入。
+
+### 11.7 Draw.io 图表嵌入
+
+`editor-modal-drawio.vue` 嵌入 diagrams.net iframe，通过 `postMessage` 协议交互：
+
+```
+1. init 事件 → 发送已有 XML 数据加载
+2. save 事件（exit=true） → 请求 export 为 SVG
+3. export 事件 → 取 base64 部分 → $root.$emit('editorInsert', { kind: 'DIAGRAM', text: svgBase64 })
+```
+
+Markdown 代码块内已有 `diagram` 类型的图表，双击会弹出 Draw.io 编辑器（`editor-markdown.vue:697-698`）。
+
+### 11.8 资产权限校验与编辑器的联动
+
+编辑器本身**不直接做资产权限校验**，校验全部在服务端：
+
+| 操作 | 校验点 | 权限要求 |
+|------|--------|---------|
+| 上传文件 | `controllers/upload.js:22` | `write:assets` 或 `manage:system` |
+| 上传到特定路径 | `controllers/upload.js:83` | `write:assets` + 路径匹配 |
+| 浏览文件夹 | `graph/resolvers/asset.js:42` | `read:assets` + 路径匹配 |
+| 列出资产 | `graph/resolvers/asset.js:28` | `read:assets` + 路径匹配 |
+| 重命名 | `graph/resolvers/asset.js:110` | 源路径 `manage:assets` + 目标路径 `write:assets` |
+| 删除 | `graph/resolvers/asset.js:162` | `manage:assets` |
+
+前端只负责展示，如果用户无权限，GraphQL 查询返回空列表或 mutation 返回错误。
+
+---
+
+## 十二、权限校验体系与编辑器联动
+
+### 12.1 checkAccess 核心算法
+
+`server/core/auth.js:221` 的 `checkAccess(user, permissions, page)` 是整个权限系统的核心：
+
+```
+1. manage:system 权限 → 直接放行（超级管理员）
+2. 用户全局权限 ∩ 要求权限 → 交集为空则拒绝
+3. 没有页面级规则（page=false）→ 放行
+4. 遍历用户所属组的 pageRules：
+   - 按 locale 过滤
+   - 按匹配类型（START/END/REGEX/EXACT/TAG）匹配路径
+   - 按优先级（EXACT > TAG > REGEX > END > START）取最高优规则
+   - 规则 DENY → 拒绝；规则 ALLOW → 放行
+```
+
+页面级规则支持五种匹配模式，优先级从高到低：EXACT > TAG > REGEX > END > START。
+
+### 12.2 编辑器场景下的权限注入
+
+用户打开 `/e/...` 编辑页面时，`controllers/common.js:133` 计算出完整的 `effectivePermissions`：
+
+```js
+const effectivePermissions = WIKI.auth.getEffectivePermissions(req, pageArgs)
+```
+
+`getEffectivePermissions()`（`auth.js:496-521`）返回一个对象，包含：
+
+```js
+{
+  comments: { read, write, manage },
+  history:  { read },
+  source:   { read },
+  pages:    { read, write, manage, delete, script, style },
+  system:   { manage }
+}
+```
+
+这个对象被 base64 编码后作为 `effective-permissions` prop 传入 `editor.pug` → 前端 `editor.vue` 的 `effectivePermissions` prop → 解码后存入 Vuex `page/effectivePermissions`。
+
+### 12.3 权限在编辑器中的消费
+
+前端拿到 `effectivePermissions` 后，**主要用于控制 UI 元素的可见性和保存按钮的可用性**，不做细粒度的功能拦截：
+
+- **保存权限**：顶部导航栏的 Save 按钮始终可见，但服务端 `createPage/updatePage` 内部会再次校验 `write:pages` 权限
+- **脚本/样式编辑**：保存时 `createPage/updatePage` 检查 `write:styles` / `write:scripts` 才写入 extra.css/js
+- **资产上传**：上传弹窗始终可打开，但 POST `/u` 时校验 `write:assets`
+
+### 12.4 "没有 @提及与权限联动"的现状
+
+Wiki.js 的代码中**不存在 @mention 功能**。搜索整个代码库，`mention` 关键词只出现在：
+- CKEditor 的一个被注释掉的 TODO 块（`editor-ckeditor.vue:73-80`），提到 `mention` autocomplete 但未实现
+- 第三方 CSS 文件中的无关匹配
+
+因此**没有 @提及与权限校验的联动链路**。当前编辑器不存在 @someone 触发权限检查或通知的逻辑。
+
+如果未来实现 @mention，合理的链路应该是：
+1. 编辑器内输入 `@` → 触发 autocomplete 弹窗
+2. 弹窗调用 GraphQL 查询用户/组列表（需考虑隐私权限）
+3. 选中后插入特殊标记（如 `@[username](userId)`）
+4. 保存时解析标记，对被提及者发通知
+5. 通知目标用户时需 `checkAccess` 确认其有 `read:pages` 权限
