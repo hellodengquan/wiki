@@ -318,3 +318,415 @@ editor: this.$store.get('editor/editorKey')
 | 3 | `client/components/editor.vue` | 在 `components` 中添加 `editorMyeditor: () => import('./editor/editor-myeditor.vue')` |
 | 4 | `client/components/editor/editor-modal-editorselect.vue` | 在弹窗模板中添加对应的卡片 `@click='selectEditor("myeditor")'` |
 | 5 | （可选）`client/components/admin/admin-editor.vue` | 在 editors 列表中添加条目 |
+
+---
+
+## 六、存储格式：editorKey / contentType / content 三字段对齐
+
+### 6.1 pages 表中的核心字段
+
+`pages` 表（`server/models/pages.js:33-54`）保存编辑器相关的三个关键列：
+
+| 列 | 类型 | 含义 |
+|----|------|------|
+| `content` | string | 编辑器原始内容（Markdown/HTML/AsciiDoc 等字符串） |
+| `contentType` | string | 内容格式标识，供渲染器/文件扩展名映射使用 |
+| `editorKey` | string | 编辑器 key，与 `editors.key` 关联，决定下次用哪个编辑器打开 |
+
+三者的关系：**editorKey → (通过 definition.yml) → contentType**，而 content 的实际格式由 contentType 决定。
+
+### 6.2 editorKey 到 contentType 的映射
+
+映射保存在每个编辑器的 `definition.yml` 中：
+
+```yaml
+# markdown:
+key: markdown
+contentType: markdown
+
+# ckeditor / code / wysiwyg:
+key: ckeditor
+contentType: html
+
+# asciidoc:
+key: asciidoc
+contentType: asciidoc
+
+# api:
+key: api
+contentType: yml
+
+# redirect:
+key: redirect
+contentType: redirect
+```
+
+写入数据库时，服务端通过 `WIKI.data.editors`（启动时从磁盘 definition.yml 解析得到的缓存）查找：
+
+```js
+// server/models/pages.js:303 — createPage()
+contentType: _.get(_.find(WIKI.data.editors, ['key', opts.editor]), `contentType`, 'text'),
+editorKey: opts.editor,
+```
+
+即前端 `editor/editorKey` → GraphQL `editor` 参数 → `opts.editor` → 查 `WIKI.data.editors` 得到 `contentType`。
+
+### 6.3 contentType 到文件扩展名的映射
+
+`server/helpers/page.js:11-16` 定义了映射表：
+
+```js
+const contentToExt = {
+  markdown: 'md',
+  asciidoc: 'adoc',
+  html: 'html'
+}
+```
+
+用于 `/d/` 下载端点（`controllers/common.js:89`）时给用户返回正确后缀的文件。
+
+### 6.4 contentType 与元数据注入格式（YAML frontmatter）
+
+当从存储同步/导出页面时，`helpers/page.js:77-99` 根据 contentType 注入不同格式的 frontmatter：
+
+- **markdown**：YAML `---` 块（标准 Jekyll 格式）
+- **html**：HTML 注释 `<!-- -->` 包裹
+- **json**：合并到对象的 `_meta` 字段
+- 其他：直接返回纯 content
+
+解析时（`pages.js:194-233` 的 `parseMetadata()`）同样用正则分别匹配。
+
+### 6.5 页面 content 从 DB 到前端的编码
+
+服务端渲染 editor 页面时（`controllers/common.js:164`），content 会被 **base64 编码**：
+
+```js
+// 编辑模式
+page.content = Buffer.from(page.content).toString('base64')
+// 从模板创建时同理
+page.content = Buffer.from(pageVersion.content).toString('base64')
+```
+
+前端 `editor.vue:241` 再解码：
+
+```js
+this.initContentParsed = this.initContent ? Base64.decode(this.initContent) : ''
+this.$store.set('editor/content', this.initContentParsed)
+```
+
+编码原因是避免原始 HTML/Markdown 里的特殊字符破坏 Pug 模板的属性引号。
+
+### 6.6 编辑器切换时的内容格式转换（convertPage）
+
+如果用户在后台把 Markdown 页面转换成 CKEditor，或反过来，`pages.convertPage()`（`server/models/pages.js:497-657`）负责做 content 格式转换：
+
+```
+Markdown → HTML:  取已渲染好的 page.render（已去掉 toc-anchor、处理 tabset）
+HTML → Markdown:  turndown + turndown-plugin-gfm，自定义 sub/sup/u/checkbox 规则
+不支持的组合:     抛错 "Unsupported source / destination content types combination."
+```
+
+转换时同时更新：
+```js
+await WIKI.models.pages.query().patch({
+  contentType: targetContentType,
+  editorKey: opts.editor,
+  ...(convertedContent ? { content: convertedContent } : {})
+})
+```
+
+---
+
+## 七、协作并发编辑冲突解决（Collab / Conflict Detection）
+
+Wiki.js **没有真正的 OT/CRDT 实时协作合并算法**，而是采用**乐观锁 + 手动两版本对比选择**的方案。
+
+### 7.1 冲突检测机制：checkoutDate 乐观锁
+
+#### 7.1.1 checkoutDate 的来源
+
+- 打开编辑页面时，服务端把 `page.updatedAt` 作为 `checkout-date` prop 传入 `editor.pug:24`
+- 前端 `editor.vue:232` 将其存入 Vuex：`this.checkoutDateActive = this.checkoutDate`
+
+#### 7.1.2 实时轮询检测（Apollo reactive query）
+
+`editor.vue:556-577` 注册了一个 **Apollo smart query**，每 5 秒轮询一次：
+
+```js
+apollo: {
+  isConflict: {
+    query: gql`
+      query ($id: Int!, $checkoutDate: Date!) {
+        pages { checkConflicts(id: $id, checkoutDate: $checkoutDate) }
+      }
+    `,
+    fetchPolicy: 'network-only',
+    pollInterval: 5000,
+    update: (data) => _.cloneDeep(data.pages.checkConflicts),
+    skip () { return this.mode === 'create' || this.isSaving || !this.isDirty }
+  }
+}
+```
+
+跳过条件：创建模式 / 正在保存 / 内容未改动。
+
+#### 7.1.3 服务端 checkConflicts 实现
+
+`server/graph/resolvers/page.js:354-368`：
+
+```js
+async checkConflicts(obj, args, context, info) {
+  let page = await WIKI.models.pages.query()
+    .select('path', 'localeCode', 'updatedAt')
+    .findById(args.id)
+  // ...权限检查...
+  return page.updatedAt > args.checkoutDate
+}
+```
+
+只要 DB 里的 `updatedAt` 比前端持有的 `checkoutDate` **晚**，就判定冲突（返回 true），顶部导航栏出现琥珀色 Conflict 按钮。
+
+#### 7.1.4 保存时二次校验
+
+即使轮询没命中，`editor.vue` 的 `save()` 在真正 UPDATE 之前（`editor.vue:377-394`）也会再调一次 `checkConflicts`：
+
+```js
+const conflictResp = await this.$apollo.query({ query: checkConflicts, ... })
+if (_.get(conflictResp, 'data.pages.checkConflicts', false)) {
+  this.$root.$emit('saveConflict')   // 触发编辑器弹窗
+  throw new Error(this.$t('editor:conflict.warning'))
+}
+```
+
+两道关卡确保不会在别人已更新后还盲目覆盖。
+
+### 7.2 冲突呈现：CodeMirror MergeView 对比
+
+不同编辑器的冲突 UI 分两套：
+
+#### 7.2.1 Markdown / Code / AsciiDoc：三栏差异对比
+
+使用 `client/components/editor/editor-modal-conflict.vue`，核心是 CodeMirror 的 `MergeView` 插件（`addon/merge/merge.js`）：
+
+```js
+// editor-modal-conflict.vue:191-203
+this.cm = CodeMirror.MergeView(this.$refs.cm, {
+  value: this.$store.get('editor/content'),   // 左：本地编辑版本（可编辑）
+  orig: resp.content,                          // 右：远端最新版本（只读）
+  highlightDifferences: true,
+  collapseIdentical: true,
+  connect: null,                               // 不允许在两栏间直接推 chunk
+  // ...
+})
+```
+
+- **左栏**（L）：本地当前正在编辑的 content，可继续编辑 → 按钮"Use Local"
+- **右栏**（R）：通过 `conflictLatest` GraphQL 查询拉到的最新 DB content，只读 → 按钮"Use Remote"
+
+这是**纯 UI 层的 diff 展示**，没有自动合并（没有三路合并，没有 base 版本），全靠用户肉眼判断后整体选一边。
+
+#### 7.2.2 CKEditor：简化弹窗
+
+由于 CKEditor 本身不擅长做 diff，`client/components/editor/ckeditor/conflict.vue` 只显示警告信息和两个按钮，没有可视化 diff。
+
+### 7.3 冲突解决后的 checkoutDate 更新
+
+无论选 L 还是 R，解决后都会执行：
+
+```js
+// editor-modal-conflict.vue:130-135
+overwriteAndClose() {
+  this.checkoutDateActive = this.latest.updatedAt   // 把本地锁时间戳推进到最新
+  this.$root.$emit('overwriteEditorContent')         // 通知编辑器实例同步内容
+  this.$root.$emit('resetEditorConflict')            // 关掉顶部 Conflict 指示灯
+  this.close()
+}
+```
+
+关键是 **`checkoutDateActive = this.latest.updatedAt`**，把乐观锁的基线推进到最新版本时间，避免下一轮轮询立即再次触发冲突。
+
+### 7.4 "没有合并算法"的本质
+
+整个冲突模块里**没有 diff-match-patch 的实际合并调用**。`diff-match-patch.js`（`client/libs/codemirror-merge/diff-match-patch.js`）被 import 了，但只是 CodeMirror MergeView 用来计算差异高亮的依赖，最终决策权完全在用户手中：
+
+- 选 Use Local → 把当前编辑器中的值写回 `editor/content`，推进 checkoutDate，下次保存就是以这个新时间戳为基线
+- 选 Use Remote → 把最新 DB content 覆盖写回 `editor/content`，同时触发 `overwriteEditorContent` 事件让 CodeMirror/CKEditor 实例 `setValue()`
+
+### 7.5 冲突链路全景
+
+```
+用户A 打开页面        用户B 打开页面
+   │                    │
+   ▼                    ▼
+ checkoutDate = T1    checkoutDate = T1
+   │                    │
+   │                    ▼ 编辑并保存
+   │                 DB updatedAt = T2 (T2 > T1)
+   ▼
+ Apollo pollInterval=5s 调用 checkConflicts(T1)
+   │
+   ├─→ page.updatedAt(T2) > T1 → 返回 true
+   │
+   ▼
+ editor.vue isConflict = true
+  → 顶部显示 Conflict 按钮
+  → 用户点击 或 主动保存触发 $root.$emit('saveConflict')
+   │
+   ▼
+ editor-modal-conflict 弹窗
+  ├─ conflictLatest(id) 拉最新 DB content
+  ├─ CodeMirror.MergeView(value=本地, orig=远端)
+  └─ 用户二选一：
+     ├─ Use Local   → content = cm.edit.getValue()，checkoutDate = T2
+     └─ Use Remote  → content = latest.content，checkoutDate = T2
+   │
+   ▼
+ 继续保存（此时 checkConflicts(T2) 与 DB updatedAt 持平，不再冲突）
+```
+
+---
+
+## 八、保存与撤销链路（Save / Undo Stack）
+
+Wiki.js 的撤销分为两个独立层次：**编辑器内部 undo（编辑会话内）** 和 **服务端版本历史（跨会话）**。两者互不相通。
+
+### 8.1 编辑器内部 undo：依赖底层库自身实现
+
+Wiki.js **没有自定义的统一 undo manager**，完全托管给 CodeMirror 或 CKEditor 自带的历史栈：
+
+#### 8.1.1 CodeMirror 系（Markdown / Code / AsciiDoc）
+
+CodeMirror 内置 `Doc` 历史栈，默认监听所有编辑操作自动压栈，快捷键：
+- `Ctrl/Cmd+Z` → undo
+- `Ctrl/Cmd+Shift+Z` / `Ctrl/Cmd+Y` → redo
+
+Wiki.js 的额外 keybindings（`editor-markdown.vue:781-804`）只覆盖了 `Ctrl+S`（保存）、`Ctrl+B`（加粗）、`Ctrl+I`（斜体）、`Ctrl+Alt+Left/Right`（升降标题级），**没有拦截默认的 undo/redo**，所以原生栈直接可用。
+
+但注意一个隐患：当 **冲突解决后调用 `cm.setValue(newContent)`**（`editor-modal-conflict.vue:137` / `$root.$on('overwriteEditorContent', ...)`），CodeMirror 的 `setValue` 会**清空整个 undo history**，用户之前的所有 Ctrl+Z 操作都丢失了。
+
+#### 8.1.2 CKEditor 系
+
+CKEditor 5 的 `DecoupledEditor` 自带 `History` 插件，工具栏有 undo/redo 按钮。Wiki.js 通过 `beautify()` debounce 300ms 把内容同步到 Vuex：
+
+```js
+// editor-ckeditor.vue:98-100
+this.editor.model.document.on('change:data', _.debounce(evt => {
+  this.$store.set('editor/content', beautify(this.editor.getData(), ...))
+}, 300))
+```
+
+debounce 的存在意味着：
+- 连续快速输入不会频繁触发 store 更新
+- undo/redo 完全由 CKEditor 内部模型控制，和 Vuex 的 `editor/content` 没有双向绑定（store 只是单向镜像快照）
+
+### 8.2 服务端版本历史：pageHistory 表
+
+每次 UPDATE/MOVE/DELETE/RESTORE 都会把变更前快照写入 `pageHistory` 表。
+
+#### 8.2.1 触发入口：updatePage() / movePage() / deletePage() / convertPage()
+
+以 `updatePage()` 为例（`server/models/pages.js:390-396`）：
+
+```js
+// -> Create version snapshot
+await WIKI.models.pageHistory.addVersion({
+  ...ogPage,                          // 改前完整页面对象
+  isPublished: ogPage.isPublished === true || ogPage.isPublished === 1,
+  action: opts.action ? opts.action : 'updated',
+  versionDate: ogPage.updatedAt       // 改前的 updatedAt 作为该版本的时间戳
+})
+```
+
+`ogPage` 是刚从 DB 查出来的**原始版本**，patch 还没执行，所以快照内容准确。
+
+#### 8.2.2 pageHistory 表结构（`server/models/pageHistory.js:14-32`）
+
+| 列 | 说明 |
+|----|------|
+| id | 版本号（自增，前端叫 versionId） |
+| pageId | 关联 pages.id |
+| authorId | 造成此版本的用户（即本次编辑的作者） |
+| content / contentType / editorKey | 改前快照 |
+| action | `updated` / `moved` / `deleted` / `restored` |
+| versionDate | 该版本对应的 updatedAt 时间戳 |
+| createdAt | 本条历史记录写入时间 |
+
+注意：历史里**保存了 editorKey**，所以恢复一个老版本时会同时恢复该版本当时使用的编辑器。
+
+#### 8.2.3 历史列表与版本详情
+
+- `getHistory()`（`pageHistory.js:158-231`）分页返回时间线，只取轻量字段（id、作者、action、时间），不返回 content。
+  - 通过比较相邻两条的 `path` 判断是 `edit`、`move` 还是 `initial`。
+- `getVersion()`（`pageHistory.js:115-153`）按 versionId 取单条完整快照（含 content）。
+
+#### 8.2.4 恢复版本：restore GraphQL mutation
+
+`server/graph/resolvers/page.js:576-608`：
+
+```js
+const targetVersion = await WIKI.models.pageHistory.getVersion({ pageId, versionId })
+await WIKI.models.pages.updatePage({
+  ...targetVersion,
+  id: targetVersion.pageId,
+  user: context.req.user,
+  action: 'restored'
+})
+```
+
+本质就是把历史版本当作新内容再调一次 `updatePage()`，而 `updatePage()` 内部又会先把当前状态再拍一张历史快照，所以恢复操作本身也会在历史里留下一条 `restored` 记录，不会丢失中间任何版本。
+
+### 8.3 保存链路完整调用栈
+
+#### 8.3.1 前端 save()
+
+`client/components/editor.vue:279-498`：
+
+```
+editor.vue save()
+  ├─ showProgressDialog()
+  ├─ if mode === 'create':
+  │     pages.create() GraphQL mutation
+  │       └─ 变量 editor = this.$store.get('editor/editorKey')
+  └─ else (mode === 'update'):
+        ├─ checkConflicts(id, checkoutDateActive)    // 冲突预检
+        │    └─ 冲突 → $root.$emit('saveConflict') + throw
+        └─ pages.update() GraphQL mutation
+              └─ 变量 editor = this.$store.get('editor/editorKey')
+```
+
+保存成功后会：
+- 把 `checkoutDateActive` 更新为新的 `page.updatedAt`（推进乐观锁基线）
+- `initContentParsed = 最新 content`，重置 isDirty 判断基线
+- 通知成功
+
+#### 8.3.2 服务端 pages.create / update
+
+```
+graph/resolvers/page.js: PageMutation.create/update
+  └─ models/pages.js: Page.createPage() / updatePage()
+        ├─ 权限校验
+        ├─ 空内容校验
+        ├─ (update) addVersion() 写历史快照
+        ├─ content + editorKey + contentType(查 WIKI.data.editors) 写入 pages 表
+        ├─ tags 关联更新
+        ├─ renderPage()  → 异步渲染 HTML 到 render 列
+        ├─ 清理缓存 + 删除内存缓存
+        ├─ searchEngine.created/updated()  → 重建索引
+        ├─ storage.pageEvent()             → Git/Disk 等存储后端同步
+        └─ reconnectLinks()                → 更新跨页面链接有效性
+```
+
+#### 8.3.3 保存与 undo 的边界
+
+- **编辑器 Ctrl+Z**：只在当前浏览器会话内回退到之前的编辑状态，不涉及网络请求，不写历史。
+- **保存（Ctrl+S / 按钮）**：把当前 `editor/content` 提交服务端，服务端写 `pageHistory` 快照并更新 `pages`。保存**不会**清空编辑器 undo 栈，但 `setValue()` 类的操作（冲突解决、切换编辑器、从模板加载）会清空。
+- **恢复历史版本**：从 `pageHistory` 取老快照 → 走 `updatePage()` 正常流程 → 再写一条新历史。这是服务端层面的"撤销到过去版本"，和编辑器 undo 栈完全无关。
+
+### 8.4 切换编辑器对 undo 的影响
+
+用户在编辑中途切编辑器（例如从 Markdown 改选 CKEditor）：
+1. `editor.vue` 的 `currentEditor` 变化 → Vue 卸载旧组件、挂载新组件
+2. 旧 CodeMirror 实例销毁 → 其 undo 栈丢失
+3. 新 CKEditor 实例从 Vuex 的 `editor/content` 读内容 → 开启自己全新的 undo 栈
+
+切换编辑器是**断点**：之前在另一个编辑器里做的编辑，Ctrl+Z 追不回来。
