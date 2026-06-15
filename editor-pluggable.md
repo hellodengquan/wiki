@@ -1135,3 +1135,328 @@ Wiki.js 的代码中**不存在 @mention 功能**。搜索整个代码库，`men
 3. 选中后插入特殊标记（如 `@[username](userId)`）
 4. 保存时解析标记，对被提及者发通知
 5. 通知目标用户时需 `checkAccess` 确认其有 `read:pages` 权限
+
+---
+
+## 十三、编辑器组件懒加载边界
+
+### 13.1 三层加载架构
+
+编辑器前端的加载分三个层级，每一层都由 webpack 的动态 `import()` 驱动：
+
+```
+client-app.js (全局注册)
+  └─ Editor → import(/* webpackChunkName: "editor", webpackPrefetch: -100 */) editor.vue
+                    │
+                    ├─ 编辑器组件 (lazy) ──────────────────────────────
+                    │   editorMarkdown:  import(/* chunk: "editor-markdown",  lazy */)
+                    │   editorCkeditor:  import(/* chunk: "editor-ckeditor", lazy */)
+                    │   editorCode:      import(/* chunk: "editor-code",     lazy */)
+                    │   editorAsciidoc:  import(/* chunk: "editor-asciidoc", lazy */)
+                    │   editorApi:       import(/* chunk: "editor-api",      lazy */)
+                    │   editorRedirect:  import(/* chunk: "editor-redirect", lazy */)
+                    │
+                    ├─ 弹窗组件 (eager) ────────────────────────────────
+                    │   editorModalEditorselect: import(/* chunk: "editor", eager */)
+                    │   editorModalProperties:   import(/* chunk: "editor", eager */)
+                    │   editorModalUnsaved:      import(/* chunk: "editor", eager */)
+                    │   editorModalMedia:        import(/* chunk: "editor", eager */)
+                    │   editorModalBlocks:       import(/* chunk: "editor", eager */)
+                    │   editorModalDrawio:       import(/* chunk: "editor", eager */)
+                    │
+                    └─ 冲突弹窗 (lazy) ────────────────────────────────
+                        editorModalConflict:     import(/* chunk: "editor-conflict", lazy */)
+```
+
+### 13.2 加载策略对照
+
+| 类别 | webpackMode | webpackChunkName | 含义 |
+|------|------------|-----------------|------|
+| 编辑器主体 | `lazy` | `editor-<key>` | 每个编辑器独立 chunk，按需加载 |
+| 常用弹窗 | `eager` | `editor` | 不额外分 chunk，打包进 editor.vue 的主 chunk |
+| 冲突弹窗 | `lazy` | `editor-conflict` | 独立 chunk，只有冲突时才加载（含 diff-match-patch 等重依赖） |
+
+### 13.3 webpackMode: "lazy" vs "eager" 的实际效果
+
+- **`lazy`**：生成独立 JS 文件，只在组件被 Vue 渲染时才下载。6 个编辑器各自独立 chunk，用户用 Markdown 编辑器时不会加载 CKEditor 的 1MB+ 依赖。
+- **`eager`**：不生成额外 chunk，模块代码合并到父 chunk（即 `editor.vue` 所属的 `editor` chunk）中。这意味着 properties/media/editorselect 等弹窗的代码在编辑器页面加载时就一起下载了，即使还没打开。
+
+### 13.4 Editor 全局组件的预取优先级
+
+```js
+// client-app.js:157
+Vue.component('Editor', () => import(/* webpackPrefetch: -100, webpackChunkName: "editor" */ './components/editor.vue'))
+```
+
+`webpackPrefetch: -100` 是负数优先级，意味着**编辑器主 chunk 在浏览器空闲时会被优先预取**（负数让它在 prefetch 队列中排前），但不阻塞初始页面渲染。用户在浏览页面时，编辑器代码可能已经悄悄下载好了。
+
+### 13.5 懒加载的边界效应
+
+1. **首屏不加载任何编辑器代码**：`editor.vue` 本身通过 `webpackPrefetch` 预取，6 个编辑器组件按 `lazy` 策略延迟加载。用户打开编辑页面后，只有实际使用的编辑器 chunk 被下载。
+
+2. **编辑器切换时的加载空白**：如果用户从 Markdown 切换到 CKEditor，`<component :is="currentEditor">` 触发 Vue 的异步组件解析 → webpack 动态 import CKEditor chunk → 下载 + 解析 → 渲染。这中间有一个短暂空白期，**没有 loading 占位符**（`editor.vue` 的 `<component :is>` 没有配合 `<Suspense>` 或 loading 状态）。
+
+3. **弹窗 eager 的代价**：media 弹窗引入了 FilePond + 所有 GraphQL 查询，properties 弹窗引入了 Vuetify 的 date-picker 等重组件，这些全部合并进 `editor` chunk，即使用户不打开这些弹窗，代码也已经下载了。
+
+4. **外部复用 media 弹窗**：`admin-security.vue:256` 和 `admin-general.vue:279` 也分别 import 了 `editor-modal-media.vue`，但用的是 `lazy` 模式。这意味着同一组件在编辑器上下文中是 eager 打包的，在 admin 上下文中是 lazy 分 chunk 的。
+
+5. **CodeMirror 的共享依赖**：markdown、code、asciidoc 三个编辑器都依赖 CodeMirror 核心和多个 addon。由于 webpack 的 chunk 共享机制，这些公共依赖会被提取到公共 chunk 中，不会重复下载。
+
+---
+
+## 十四、AsciiDoc / API / Redirect 次要编辑器的协议差异
+
+### 14.1 三种次要编辑器总览
+
+| 维度 | AsciiDoc | API | Redirect |
+|------|----------|-----|----------|
+| contentType | `asciidoc` | `yml` | `redirect` |
+| 内容载体 | CodeMirror（纯文本） | Vuetify 表单控件（结构化表单） | Vuetify 表单控件（结构化表单） |
+| 内容同步到 Vuex | `cm.on('change')` → `editor/content` | **不写入** `editor/content` | **不写入** `editor/content` |
+| editorInsert 事件 | ✅ 监听 IMAGE/BINARY/DIAGRAM | ❌ 不监听 | ❌ 不监听 |
+| 冲突检测 | ✅ 监听 `saveConflict` | ❌ 不监听 | ❌ 不监听 |
+| 创建时默认内容 | `'== header\n\ncontent'` | `'<h1>Title</h1>\n\n<p>Some text here</p>'` | `'<h1>Title</h1>\n\n<p>Some text here</p>'` |
+
+### 14.2 AsciiDoc 编辑器：类 Markdown 的完整协议
+
+`editor-asciidoc.vue` 的协议与 Markdown 编辑器几乎一致：
+
+**内容同步**：
+```js
+this.cm.on('change', c => {
+  this.$store.set('editor/content', c.getValue())
+  this.onCmInput(this.$store.get('editor/content'))
+})
+```
+
+**预览渲染**：使用 asciidoctor.js（`require('asciidoctor')()`）在前端实时转换：
+```js
+let html = asciidoctor.convert(newContent, { standalone: false, safe: 'safe', ... })
+const $ = cheerio.load(html, { decodeEntities: true })
+// 处理 diagram 代码块
+this.previewHTML = DOMPurify.sanitize($.html(), { ADD_TAGS: ['foreignObject'] })
+```
+
+预览流程与 Markdown 编辑器的区别：
+- Markdown 用 markdown-it + 服务端渲染管线
+- AsciiDoc 用 asciidoctor.js 完全在前端渲染（客户端渲染），**不经过服务端渲染管线**
+- 但服务端 `render-page.js` 保存时也走渲染管线，此时 AsciiDoc 用 `asciidoc-core` 渲染器（`server/modules/rendering/asciidoc-core/`）
+
+**格式化标记差异**：
+
+| 操作 | Markdown | AsciiDoc |
+|------|----------|----------|
+| 加粗 | `**text**` | `**text**`（同样语法） |
+| 斜体 | `*text*` | `__text__`（双下划线） |
+| 标题 | `# text` | `= text`（等号数量 = 级别） |
+| 上标 | 不支持 | `^text^` |
+| 下标 | 不支持 | `~text~` |
+| 引用 | `> text` | 支持 NOTE/TIP/WARNING/CAUTION/IMPORTANT 前缀 |
+| 图片 | `![alt](path)` | `image::path[alt]` |
+| 链接 | `[text](url)` | `link:url[text]` |
+| 内部链接 | `[/locale/path][text]` | `link:/locale/path[text]` |
+
+**Diagram 支持**：与 Markdown 相同的 ` ```diagram\nbase64\n``` ` 格式，双击打开 Draw.io 编辑器。
+
+### 14.3 API 编辑器：表单驱动的结构化编辑
+
+`editor-api.vue` 是一个**完全不同的编辑模式**——没有 CodeMirror、没有文本编辑、没有预览。
+
+**布局**：左侧 sidebar 导航（Info / Servers / Endpoints / Models / Auth）+ 右侧表单区域。
+
+**数据模型**：所有数据存在组件的 `data()` 中：
+```js
+data() {
+  return {
+    tab: 'endpoints',
+    kind: 'rest',
+    info: { title: '', version: '1.0.0', description: '' },
+    servers: [{ name: 'Production', url: 'https://api.example.com/v1', icon: 'server', id: '123456' }],
+    endpointGroups: [{ id: '345678', name: '', description: '', endpoints: [...] }],
+    endpointMethods: [{ key: 'GET', color: 'blue' }, { key: 'POST', color: 'green' }, ...]
+  }
+}
+```
+
+**关键问题：content 断链**
+
+```js
+mounted() {
+  this.$store.set('editor/editorKey', 'api')
+  if (this.mode === 'create') {
+    this.$store.set('editor/content', '<h1>Title</h1>\n\n<p>Some text here</p>')
+  }
+}
+```
+
+- `editorKey` 设置为 `'api'`，这是唯一与编辑器框架的交互
+- `editor/content` 的默认值是 HTML（`<h1>Title</h1>...`），不是 YAML/JSON——这是个硬编码占位符
+- 表单中 info/servers/endpoints 的变化**完全没有同步到 `editor/content`**
+- 保存时 `editor.vue` 的 `save()` 取的是 `this.$store.get('editor/content')`，但这个值从未被 API 编辑器更新过
+
+这意味着 **API 编辑器当前处于半成品状态**：表单 UI 已搭建但数据流未闭环。编辑器可以展示，但保存不会把表单内容持久化。
+
+**API 编辑器也不监听 `editorInsert` 和 `saveConflict` 事件**——不需要嵌图功能，冲突检测也缺失。
+
+**服务端渲染管线**：API 编辑器的 contentType 是 `yml`，保存时触发 `render-page.js`，走 `getRenderingPipeline('yml')` 查找匹配的渲染器。当前只有 `openapi-core` 渲染器声明 `input: openapi`，不匹配 `yml`，所以**API 页面的渲染管线实际上为空**——内容直接存入 DB 的 `render` 列但不做任何转换。
+
+### 14.4 Redirect 编辑器：条件重定向配置
+
+`editor-redirect.vue` 也是一个表单驱动编辑器，用于配置页面的条件重定向规则。
+
+**布局**：居中表单，包含：
+- 条件规则列表（按用户组匹配 → 跳转到指定页面/URL）
+- 兜底规则（不匹配任何条件时跳转到指定页面/URL）
+
+**数据模型**：
+```js
+data() {
+  return {
+    fallbackMode: 'page',        // 'page' | 'url'
+    fallbackUrl: 'https://'
+  }
+}
+```
+
+**与 API 编辑器同样的问题**：
+- `editor/content` 设置了 HTML 占位符但表单变化不同步
+- 不监听 `editorInsert` 和 `saveConflict`
+- 条件规则部分的 UI 只是骨架（`@click=''` 空处理器），"Add Conditional Rule" 按钮无实际功能
+
+**Apollo 查询**：
+```js
+apollo: {
+  groups: {
+    query: gql`{ groups { list { id name } } }`,
+    fetchPolicy: 'network-only',
+    update: (data) => data.groups.list
+  }
+}
+```
+
+Redirect 编辑器通过 GraphQL 查询用户组列表（用于条件规则的组选择器），这是它唯一的服务端交互。
+
+**contentType 为 `redirect` 的渲染管线**：没有渲染器声明 `input: redirect`，保存时 `render` 列直接存原始 content。用户访问 redirect 页面时由服务端中间件处理跳转逻辑，不需要渲染 HTML。
+
+### 14.5 三种编辑器与编辑器框架的协议完整度对比
+
+| 协议点 | Markdown/Code/CKEditor | AsciiDoc | API | Redirect |
+|--------|----------------------|----------|-----|----------|
+| 设置 editorKey | ✅ | ✅ | ✅ | ✅ |
+| 同步 content 到 Vuex | ✅ 实时 | ✅ 实时 | ❌ | ❌ |
+| 监听 editorInsert | ✅ | ✅ | ❌ | ❌ |
+| 监听 saveConflict | ✅ | ✅ | ❌ | ❌ |
+| overwriteEditorContent | ✅ | ✅ | ❌ | ❌ |
+| 创建时默认 content | 空或模板 | AsciiDoc 模板 | HTML 占位 | HTML 占位 |
+| 保存时 content 有效 | ✅ | ✅ | ❌ | ❌ |
+
+API 和 Redirect 编辑器虽然注册了 `editorKey`，但**没有实现编辑器框架期望的内容同步协议**，保存时实际上保存的是初始占位符内容。
+
+---
+
+## 十五、API 模式下的 Schema 校验链路
+
+### 15.1 现状：没有前端 Schema 校验
+
+API 编辑器（`editor-api.vue`）**不进行任何 OpenAPI/YAML schema 校验**。
+
+前端表单中：
+- `info.title` 和 `info.version` 标注了 "Required" hint，但只是文本提示，没有 `required` 验证规则
+- `servers[].url` 和 `endpoints[].path` 同理
+- Vuetify 的 `v-text-field` 组件的 `rules` 属性均未设置
+
+### 15.2 服务端：没有 API 内容的 Schema 校验
+
+服务端保存页面时（`pages.createPage` / `pages.updatePage`），对 content 字段的处理：
+
+```js
+// pages.js:316
+if (opts.content.length < 1) {
+  throw new WIKI.Error.PageEmptyContent()
+}
+```
+
+唯一校验是**内容非空**，不区分 contentType，不做 OpenAPI schema 校验。API 编辑器的 contentType 是 `yml`，但服务端不会尝试 `yaml.safeLoad()` 解析或校验 YAML 格式。
+
+### 15.3 渲染管线中的 OpenAPI 处理
+
+`server/modules/rendering/openapi-core/` 是唯一与 OpenAPI 相关的服务端模块：
+
+**definition.yml**：
+```yaml
+key: openapiCore
+title: Core
+description: Basic OpenAPI Parser
+input: openapi
+output: html
+```
+
+**renderer.js**：
+```js
+async render() {
+  let output = this.input
+  for (let child of this.children) {
+    const renderer = require(`../${_.kebabCase(child.key)}/renderer.js`)
+    output = await renderer.init(output, child.config)
+  }
+  return output
+}
+```
+
+这个渲染器声明 `input: openapi`，但当前 API 编辑器的 contentType 是 `yml` 而不是 `openapi`。渲染管线选择器（`renderers.js:141`）按 `contentType` 匹配 `input`：
+
+```js
+let activeCoreKeys = _.filter(rawCores, ['input', contentType]).map(core => core.key)
+```
+
+`yml` ≠ `openapi`，所以 openapi-core 渲染器**不会被激活**。
+
+### 15.4 渲染管线的完整工作原理
+
+当页面保存后，`render-page.js` 被触发：
+
+```
+1. 从 DB 读取 page.content + page.contentType
+2. 调用 getRenderingPipeline(contentType) 构建渲染管线
+3. 管线构建逻辑（renderers.js:110-171）：
+   a. 取所有 isEnabled 的渲染器
+   b. 找没有 dependsOn 的核心渲染器（core）
+   c. 给每个 core 挂载有 dependsOn = core.key 的子渲染器
+   d. 用 DepGraph 按 input/output 依赖关系排序
+   e. 过滤出 input === contentType 的起点 + 其所有下游依赖
+   f. 按拓扑排序返回有序渲染器列表
+4. 逐个执行 renderer.render()，上一个的 output 是下一个的 input
+5. 最终 output 存入 pages.render 列
+```
+
+各 contentType 的典型渲染管线：
+
+| contentType | 管线 |
+|-------------|------|
+| `markdown` | markdown-core → html-core → html-security → html-codehighlighter → ... |
+| `asciidoc` | asciidoc-core → html-core → html-security → ... |
+| `html` | html-core → html-security → ... |
+| `yml` | （无匹配渲染器，content 直接存为 render） |
+| `redirect` | （无匹配渲染器，content 直接存为 render） |
+
+### 15.5 API 编辑器"如果完整实现"应有的校验链路
+
+假设 API 编辑器完成闭环，校验应该发生在三个层次：
+
+1. **前端表单层**：Vuetify `rules` 做 required/format 校验，确保 title/version 非空，URL 格式合法
+2. **前端序列化层**：将 info/servers/endpoints 结构序列化为 OpenAPI 3.0 YAML → 写入 `editor/content`
+3. **服务端渲染层**：`openapi-core` 渲染器解析 YAML → 用 swagger-parser 或类似库校验 OpenAPI schema → 生成可交互的 API 文档 HTML → 存入 `render` 列
+
+当前三步均未实现：表单无 rules，序列化未写，渲染器 input 不匹配。
+
+### 15.6 为什么 API/Redirect 编辑器处于半成品状态
+
+代码中的多处信号表明这两个编辑器尚未完成：
+
+1. **创建时默认 content 是 HTML**：`'<h1>Title</h1>\n\n<p>Some text here</p>'` 不符合 API（应为 YAML）和 Redirect（应为 JSON 配置）的 contentType
+2. **GraphQL 类型标记为 disabled**：API 编辑器中 GraphQL 选项 `disabled`，注释 "Coming soon"
+3. **条件规则按钮无处理器**：Redirect 编辑器的 "Add Conditional Rule" 按钮 `@click=''`
+4. **没有 content 同步**：两个编辑器都没有在表单变化时更新 `editor/content`
+5. **没有 media/conflict 弹窗**：不监听 `editorInsert` 和 `saveConflict`
+
+这些编辑器已注册到 `definition.yml` 和 `editor.vue` 的 components 中，但功能仅为 UI 骨架。
