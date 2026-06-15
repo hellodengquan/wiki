@@ -1460,3 +1460,510 @@ let activeCoreKeys = _.filter(rawCores, ['input', contentType]).map(core => core
 5. **没有 media/conflict 弹窗**：不监听 `editorInsert` 和 `saveConflict`
 
 这些编辑器已注册到 `definition.yml` 和 `editor.vue` 的 components 中，但功能仅为 UI 骨架。
+
+---
+
+## 十六、编辑器面板联动（Toolbar / Preview / Status）
+
+Wiki.js 没有独立的 ToolbarSync / PreviewSync 类，各编辑器组件各自维护自己的三套面板，通过组件内部的 watch、computed 和 CodeMirror/CKEditor 事件实现联动。
+
+### 16.1 三层面板结构
+
+每个 CodeMirror 系编辑器（Markdown / Code / AsciiDoc）都有相同的三层垂直布局：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  v-toolbar  (顶部工具栏：格式化按钮、预览开关、帮助等)          │
+├──────────────┬───────────────────────────┬───────────────────┤
+│  左侧侧栏    │   CodeMirror 编辑区        │  右侧预览区        │
+│  (插入链接、  │   (文本输入)               │  (实时渲染 HTML)    │
+│   媒体、图表)  │                           │  (v-if=previewShown)│
+├──────────────┴───────────────────────────┴───────────────────┤
+│  v-system-bar  (底部状态栏：locale、path、Ln/Col、编辑器标识)   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+CKEditor / API / Redirect 编辑器布局简化：
+- CKEditor：toolbar（DecoupledEditor 内置）+ 编辑区 + sysbar，**无预览区**（所见即所得）
+- API / Redirect：表单 + sysbar，**无 toolbar 也无预览**
+
+### 16.2 Toolbar 与编辑区的联动
+
+Toolbar 按钮的点击处理器直接调用 CodeMirror API，没有中间层：
+
+| 工具栏按钮 | 调用的方法 | 底层 CodeMirror API |
+|-----------|-----------|--------------------|
+| Bold (**) | `toggleMarkup({ start: '**' })` | `doc.replaceSelections(selections.map(s => '**' + s + '**'))` |
+| Italic (*) | `toggleMarkup({ start: '*' })` | 同上，换包装符号 |
+| Strikethrough (~~) | `toggleMarkup({ start: '~~' })` | 同上 |
+| Heading 1-6 | `setHeaderLine(lvl)` | `doc.replaceRange('### ' + lineContent, ...)` |
+| Subscript (~) | `toggleMarkup({ start: '~' })` | 同上 |
+| Superscript (^) | `toggleMarkup({ start: '^' })` | 同上 |
+| Blockquote (> ) | `insertBeforeEachLine({ content: '> ' })` | `doc.replaceRange('> ' + lineContent, ...)` |
+| Unordered List (- ) | `insertBeforeEachLine({ content: '- ' })` | 同上 |
+| Ordered List (1. ) | `insertBeforeEachLine({ content: '1. ' })` | 同上 |
+| Inline Code (\`) | `toggleMarkup({ start: '\`' })` | 同上 toggle 逻辑 |
+| Horizontal Rule (---) | `insertAfter({ content: '---', newLine: true })` | `doc.replaceRange('\n---\n', ...)` |
+
+**联动机制**：toolbar 的按钮不读取 CodeMirror 状态做高亮/激活反馈（例如光标在加粗文本内时 Bold 按钮不会变亮）。Toolbar 是**单向触发**的，只有点击 → 编辑区变更，没有编辑区 → toolbar 的反向状态同步。
+
+左侧侧栏按钮触发弹窗或全屏模式：
+- 插入链接 → `insertLink()` → CodeMirror showHint 自动补全
+- 插入媒体 → `toggleModal('editorModalMedia')` → 切换 Vuex `editor/activeModal`
+- 插入图表 → `toggleModal('editorModalDrawio')`
+- 全屏 → `toggleFullscreen()` → `cm.setOption('fullScreen', true)`
+- 帮助 → `toggleHelp()`
+
+### 16.3 Preview 与编辑区的双向联动
+
+#### 16.3.1 内容同步（编辑 → 预览）
+
+通过 CodeMirror 的 `change` 事件 + debounce 驱动：
+
+```js
+// editor-markdown.vue:761
+this.cm.on('change', c => {
+  this.$store.set('editor/content', c.getValue())
+  this.onCmInput(this.$store.get('editor/content'))
+})
+
+// editor-markdown.vue:432
+onCmInput: _.debounce(function (newContent) {
+  this.processContent(newContent)
+}, 600),
+```
+
+**debounce 600ms**：用户停止输入 600ms 后才重新渲染预览，避免连续输入时 markdown-it 频繁重算。
+
+`processContent()` 的完整链路：
+
+```
+processContent(newContent)
+  ├─ processMarkers(firstLine, lastLine)     // 处理代码块的行号标注
+  ├─ md.render(newContent)                   // markdown-it 渲染（含所有 plugin）
+  ├─ DOMPurify.sanitize(renderedHTML, ...)   // XSS 过滤，允许 foreignObject
+  ├─ 赋给 this.previewHTML
+  └─ nextTick:
+      ├─ tabsetHelper.format()                // 处理 <tabset> 自定义元素
+      ├─ renderMermaidDiagrams()              // 扫描 .codeblock-mermaid → mermaid.render()
+      ├─ Prism.highlightAllUnder(preview)     // 代码块语法高亮
+      └─ scrollSync(cm)                       // 滚动位置同步
+```
+
+AsciiDoc 编辑器的 `processContent()`（`editor-asciidoc.vue:211`）流程相似，但渲染引擎换成 asciidoctor.js：
+
+```
+asciidoctor.convert(newContent, { standalone: false, safe: 'safe', ... })
+  → cheerio 处理 diagram 代码块
+  → DOMPurify.sanitize(html, { ADD_TAGS: ['foreignObject'] })
+  → nextTick 同上的 Mermaid + Prism + scrollSync
+```
+
+#### 16.3.2 滚动同步（编辑 → 预览）
+
+`scrollSync()`（`editor-markdown.vue:561`）使用 `linesMap` 做行号映射：
+
+```js
+scrollSync: _.debounce(function (cm) {
+  if (!this.previewShown || cm.somethingSelected()) { return }
+  let currentLine = cm.getCursor().line
+  if (currentLine < 3) {
+    // 顶部 3 行内，滚到预览区顶部
+    Velocity(this.$refs.editorPreview.firstChild, 'scroll', { offset: '-50', ... })
+  } else {
+    // 找到比当前行号小的最大 linesMap 条目
+    let closestLine = _.findLast(linesMap, n => n <= currentLine)
+    let destElm = this.$refs.editorPreview.querySelector(`[data-line='${closestLine}']`)
+    if (destElm) {
+      Velocity(destElm, 'scroll', { offset: '-100', duration: 1000, container: this.$refs.editorPreviewContainer })
+    }
+  }
+}, 500),
+```
+
+**关键机制**：
+- `linesMap` 是一个模块级数组（在组件外定义），由 markdown-it 的自定义 renderer 在渲染每个 block 时 push 行号进去，通过在渲染出的 HTML 元素上附加 `data-line` 属性建立源行号到 DOM 元素的映射
+- 只做**单向滚动同步**（编辑 → 预览），没有反向同步（预览滚动不会带动编辑区）
+- 用户选中文字时跳过同步（避免选择过程中滚动干扰）
+- debounce 500ms，避免频繁滚动动画
+
+#### 16.3.3 Preview 切换触发的回调
+
+`previewShown` 的 watcher（`editor-markdown.vue:406`）在预览区从隐藏变为显示时，补做一次渲染：
+
+```js
+watch: {
+  previewShown (newValue, oldValue) {
+    if (newValue && !oldValue) {
+      this.$nextTick(() => {
+        this.renderMermaidDiagrams()
+        Prism.highlightAllUnder(this.$refs.editorPreview)
+        // 给 line-numbers 代码块加 prismjs class
+        Array.from(this.$refs.editorPreview.querySelectorAll('pre.line-numbers')).forEach(pre => pre.classList.add('prismjs'))
+      })
+    }
+  }
+}
+```
+
+因为 previewShown=false 时预览区是 `v-if` 销毁的，重新挂载后 Mermaid 和 Prism 需要重新初始化。
+
+### 16.4 Status Bar（底部 sysbar）联动
+
+底部 `v-system-bar` 显示的信息全部来自 Vuex computed 或 CodeMirror 事件：
+
+| 显示项 | 数据源 | 更新机制 |
+|--------|--------|---------|
+| `locale.toUpperCase()` | `get('page/locale')` | Vuex 响应式 |
+| `/path` | `get('page/path')` | Vuex 响应式 |
+| `Ln {{cursorPos.line + 1}}, Col {{cursorPos.ch + 1}}` | `cursorPos`（组件 data） | CodeMirror `cursorActivity` 事件 → `positionSync()` 更新 |
+| 编辑器标识（"Markdown"/"AsciiDoc"） | 硬编码字符串 | 固定 |
+
+`positionSync()`（`editor-markdown.vue:471`）：
+
+```js
+positionSync(cm) {
+  this.cursorPos = cm.getCursor('head')
+}
+// 注册：
+this.cm.on('cursorActivity', c => { this.positionSync(c) })
+```
+
+**只有 Markdown 编辑器显示 Ln/Col**，Code / AsciiDoc 的 sysbar 只显示 locale + path，没有光标位置。
+
+### 16.5 Spell Mode（拼写检查）的特殊联动
+
+Markdown 编辑器的拼写检查是在**预览区**做的，不是编辑区：
+
+```pug
+.editor-markdown-preview-content
+  div(
+    ref='editorPreview'
+    v-html='previewHTML'
+    :spellcheck='spellModeActive'
+    :contenteditable='spellModeActive'
+    @blur='spellModeActive = false'
+    )
+```
+
+切换拼写检查时，预览区变成 `contenteditable` + `spellcheck=true`，用户可以在渲染出的 HTML 上用浏览器内置拼写检查。但修改预览区的内容**不会同步回 CodeMirror 编辑区**，拼写修正只是视觉修正，点击 blur 后 spellModeActive 关闭，修改丢失。
+
+这是一个功能不完整的半联动：拼写检查能标记错误，但无法持久化修正结果。
+
+### 16.6 CKEditor 的面板联动
+
+CKEditor 与上述完全不同：
+- Toolbar 是 DecoupledEditor 内置的，通过 `this.editor.ui.view.toolbar` 渲染到 Vuetify 的 `v-toolbar` 容器（`editor-ckeditor.vue:64`）
+- 没有独立的预览区（所见即所得）
+- Sysbar 只显示 locale + path，无光标位置
+- 内容同步：`this.editor.model.document.on('change:data', _.debounce(..., 300))` → `$store.set('editor/content', beautify(this.editor.getData()))`
+
+CKEditor 把所有 toolbar/编辑/预览逻辑封装在内部，Wiki.js 只做容器对接。
+
+---
+
+## 十七、跨编辑器迁移与 page_data 格式兼容（convertPage）
+
+### 17.1 触发入口
+
+**服务端**：GraphQL `pages.convert` mutation → `resolvers/page.js:432` → `WIKI.models.pages.convertPage({ id, editor, user })`
+
+**前端**：浏览页面时点击 Page Actions → Convert to another Editor → 选择目标编辑器 → 发送 convert mutation
+
+注意：**必须先从编辑器退出到浏览页面**才能转换，不能在编辑中中途切换（编辑中切换只是临时换编辑器 UI，不改 DB 的 editorKey/contentType）。
+
+### 17.2 convertPage() 完整流程
+
+`server/models/pages.js:497-657`：
+
+```
+1. 校验：
+   ├─ 页面存在
+   ├─ 当前 editorKey ≠ 目标 editor（否则报错 "Nothing to convert"）
+   └─ checkAccess(user, ['write:pages'], { locale, path })
+
+2. 判定是否需要内容转换：
+   sourceContentType = ogPage.contentType
+   targetContentType = editors[targetEditor].contentType
+   shouldConvert = sourceContentType !== targetContentType
+
+3. 内容转换（仅当 shouldConvert 时）：
+   ├─ markdown → html（见 17.3）
+   ├─ html → markdown（见 17.4）
+   └─ 其他组合 → 抛错 "Unsupported source / destination content types combination."
+
+4. 写历史快照（仅当 shouldConvert 时）：
+   pageHistory.addVersion({ ...ogPage, action: 'updated', versionDate: ogPage.updatedAt })
+
+5. 更新 pages 表：
+   { contentType: targetContentType, editorKey: opts.editor, content: convertedContent }
+   （如果 shouldConvert=false，content 不变）
+
+6. 清缓存 + 存储后端同步：
+   ├─ deletePageFromCache(page.hash)
+   └─ storage.pageEvent({ event: 'updated', page })
+```
+
+### 17.3 Markdown → HTML 转换算法
+
+**不走 markdown-it 重新渲染**，直接复用 DB 中已经渲染好的 `page.render` 列：
+
+```js
+// pages.js:526
+if (!ogPage.render) {
+  throw new Error('Aborted conversion because rendered page content is empty!')
+}
+convertedContent = ogPage.render
+```
+
+然后用 cheerio 做 HTML 清洗和 Wiki.js 自定义元素转换：
+
+```
+cheerio.load(renderedHTML)
+  ├─ 移除 .toc-anchor（跳转到标题的锚点链接，Markdown 渲染时自动生成的辅助元素）
+  └─ 转换 <tabset> 自定义元素：
+      ├─ 从 template[v-slot:tabs] 提取 tab 标题
+      ├─ 从 template 的默认 slot 提取 tab 内容
+      ├─ 组装为 <h1>Tabset</h1> + 每个 tab 一个 <h2>标题</h2> + 内容的扁平 HTML
+      └─ 移除原 <tabset> 元素
+```
+
+最后 `$.html('body')` 取出清洗后的 HTML，并把非 ASCII 的 `&#xXXXX;` 实体还原为 Unicode 字符。
+
+### 17.4 HTML → Markdown 转换算法
+
+使用 **Turndown + turndown-plugin-gfm**：
+
+```js
+// pages.js:577
+const td = new TurndownService({
+  bulletListMarker: '-',
+  codeBlockStyle: 'fenced',
+  emDelimiter: '*',
+  fence: '```',
+  headingStyle: 'atx',
+  hr: '---',
+  linkStyle: 'inlined',
+  preformattedCode: true,
+  strongDelimiter: '**'
+})
+td.use(turndownPluginGfm)   // GitHub Flavored Markdown：表格、task-list、strikethrough
+```
+
+在 Turndown 默认规则上添加了 5 条自定义规则：
+
+| 规则名 | filter | replacement |
+|--------|--------|-------------|
+| subscript | `<sub>` 标签 | `~content~` |
+| superscript | `<sup>` 标签 | `^content^` |
+| underline | `<u>` 标签 | `_content_` |
+| taskList | `<input type="checkbox">` | `[x] ` / `[ ] `（根据 checked 属性） |
+| removeTocAnchors | `<a class="toc-anchor">` | `''`（完全移除） |
+
+最后 `convertedContent = td.turndown(ogPage.content)`。
+
+### 17.5 不支持的转换组合
+
+只有 **markdown ↔ html** 双向支持转换。以下组合直接报错：
+
+- markdown → asciidoc / yml / redirect
+- asciidoc → markdown / html / yml / redirect
+- html → asciidoc / yml / redirect
+- yml / redirect → 任何其他
+
+即 AsciiDoc、API、Redirect 编辑器**没有迁移路径**，一旦使用就无法切换到其他编辑器。
+
+### 17.6 contentType / editorKey / content 的兼容策略
+
+| 字段 | 兼容策略 |
+|------|---------|
+| `editorKey` | 存业务 key（markdown/ckeditor/code/...），作为编辑器选择的 source of truth |
+| `contentType` | 由 editorKey 从 definition.yml 映射得到，不直接暴露给前端 UI |
+| `content` | 纯字符串，格式由 contentType 决定；渲染管线按 contentType 选择渲染器 |
+
+**向后兼容**：DB 中如果有老数据（没有 editorKey 字段或 editorKey 为空），前端 `editor.vue` 的 `initEditor` 逻辑为：
+
+```js
+// editor.vue:304-313
+if (!_.isEmpty(this.initEditor)) {
+  currentEditor = _.startCase(this.initEditor)  // 有 editorKey 就用它
+} else {
+  switch (this.initContentType) {               // 否则按 contentType 回退
+    case 'markdown': currentEditor = 'editorMarkdown'; break
+    case 'html':     currentEditor = 'editorCkeditor'; break
+    case 'asciidoc': currentEditor = 'editorAsciidoc'; break
+    // 没有 yml/redirect 的回退分支！
+  }
+}
+```
+
+contentType 为 `yml` 或 `redirect` 的老页面如果 editorKey 丢失，**会落到默认编辑器 editorMarkdown**，页面展示会出错。
+
+### 17.7 pageHistory 历史的兼容性
+
+历史版本保存了 `editorKey` 和 `contentType`（`pageHistory.js:22-23`），所以从历史恢复时会同时恢复当时的编辑器。但恢复一个 AsciiDoc 历史版本到当前 Markdown 编辑器打开的页面时，不会自动做内容转换——恢复的是原始 AsciiDoc 字符串，直接显示在 Markdown 编辑器里会出现语法错乱。
+
+---
+
+## 十八、Plugin Hook 扩展点注册链路
+
+Wiki.js **没有传统意义上的 Plugin Hook 注册机制**（如 `registerHook('beforeSave', callback)`），但有多层隐式扩展点，分布在服务端模块系统、事件总线、渲染管线、前端事件总线和 webpack 分包策略五个层面。
+
+### 18.1 服务端模块系统：基于文件约定的扩展
+
+**扩展目录**：`server/modules/<module-type>/<module-key>/`
+
+**模块类型**：
+- `editor/`（编辑器）
+- `rendering/`（渲染器）
+- `storage/`（存储后端）
+- `search/`（搜索引擎）
+- `authentication/`（认证策略）
+- `analytics/`（统计）
+- `commentProviders/`（评论）
+- `loggers/`（日志）
+
+**启动时注册**（`kernel.js:72-79` 的 `postBootMaster()`）：
+
+```js
+await WIKI.models.analytics.refreshProvidersFromDisk()
+await WIKI.models.authentication.refreshStrategiesFromDisk()
+await WIKI.models.editors.refreshEditorsFromDisk()
+// ... 以此类推
+```
+
+每个 `refreshXxxFromDisk()` 做同一件事（以 editors 为例）：
+
+```
+1. readdir(server/modules/editor/) 得到所有目录
+2. 对每个目录：
+   ├─ require(definition.yml) 读取元数据
+   ├─ 查 DB 中是否存在该 key
+   │   ├─ 不存在：INSERT 一行（isEnabled 由 definition.yml 决定）
+   │   └─ 已存在：比较版本号，有更新则 UPDATE
+   └─ 合并 DB 配置和 definition.yml 默认 props，存入 WIKI.data.editors
+3. 完成后 WIKI.data.editors 是所有编辑器的运行时注册表
+```
+
+**模块间扩展**：`rendering/` 类型的模块通过 `dependsOn` 字段建立父子关系。例如：
+
+```yaml
+# markdown-core/definition.yml
+key: markdownCore
+input: markdown
+output: html
+
+# markdown-emoji/definition.yml
+key: markdownEmoji
+dependsOn: markdownCore
+input: markdown
+output: markdown
+```
+
+渲染管线构建时（`renderers.js:110-171`），会把 markdownEmoji 挂载到 markdownCore 前面（因为 input/output 都是 markdown，属于预处理阶段），形成有序链。
+
+### 18.2 服务端事件总线：WIKI.events.inbound / outbound
+
+`kernel.js:39-42` 初始化两个 EventEmitter2：
+
+```js
+WIKI.events = {
+  inbound: new EventEmitter(),
+  outbound: new EventEmitter()
+}
+```
+
+两者通过 **DB notify/listen** 机制跨进程同步（`core/db.js:250-256`）：
+
+```
+outbound.emit('deletePageFromCache', hash)
+  → onAny(notifyViaDB)
+     → pg_notify('wikipage', JSON.stringify({ event, value }))
+         ↓（所有 worker 进程监听）
+inbound.on('deletePageFromCache', handler)
+  → 本地处理
+```
+
+**编辑器/页面相关的事件**：
+
+| 事件名 | 方向 | 触发点 | 监听器 |
+|--------|------|--------|--------|
+| `deletePageFromCache` | out | updatePage/movePage/deletePage/convertPage | pages.js:1167 清内存缓存 |
+| `flushCache` | out | 后台 rebuild tree | pages.js:1170 清全部缓存 |
+| `reloadAuthStrategies` | out | 认证策略变更 | auth.js:485 重新激活策略 |
+| `reloadGroups` | out | 组变更 | auth.js:479 重载组缓存 |
+| `addAuthRevoke` | out | 用户/组被删或改权限 | auth.js:488 加 JWT 黑名单 |
+
+事件总线是**广播式**的，没有注册/发现机制，事件名全靠字符串约定，没有 TypeScript/GraphQL 类型校验。
+
+### 18.3 渲染管线扩展点
+
+渲染管线是目前最接近"hook 系统"的扩展机制：
+
+1. **input/output 类型匹配**：每个渲染器声明 `input: <type>` 和 `output: <type>`，管线按 contentType 从匹配 input 的起点开始
+2. **dependsOn 依赖注入**：子渲染器挂载到父渲染器的输入侧
+3. **DepGraph 拓扑排序**：自动按 input/output 依赖关系排列顺序
+4. **顺序执行**：每个 renderer.render(this.input) → 输出作为下一个的输入
+
+新增一个 Markdown 预处理插件只需：
+- 创建 `server/modules/rendering/markdown-myplugin/definition.yml`（`dependsOn: markdownCore`，`input: markdown`，`output: markdown`）
+- 创建 `renderer.js` 导出 `init(input, config)` 和 `render()` 方法
+- 在后台管理启用
+
+不需要改任何现有代码——`refreshRenderersFromDisk()` 启动时会自动发现并注册。
+
+### 18.4 前端事件总线：Vue $root.\$emit / \$on
+
+编辑器生态的前端扩展点完全靠 `$root` 事件总线，是一种**约定式 hook**：
+
+| 事件名 | 触发者 | 监听者 | 载荷 |
+|--------|--------|--------|------|
+| `editorInsert` | editor-modal-media, editor-modal-drawio | 各编辑器 .vue 的 `$root.$on` | `{ kind, path, text, align }` |
+| `saveConflict` | editor.vue save() | 各编辑器 → 打开冲突弹窗 | 无 |
+| `overwriteEditorContent` | editor-modal-conflict, editor-modal-drawio, ckeditor/conflict | 各编辑器 → `cm.setValue()` / `editor.setData()` | 无 |
+| `resetEditorConflict` | editor-modal-conflict, ckeditor/conflict, editor-modal-drawio | editor.vue → 重置 conflict 状态 | 无 |
+| `editorLinkToPage` | editor-modal-link | editor-ckeditor → CKEditor link 命令 | `{ href, label }` |
+| `pageEdit / pageHistory / pageMove / pageConvert / ...` | page.vue (浏览页) | nav-header.vue → 执行对应操作 | 无 |
+
+**扩展方式**：新增编辑器只需在 `mounted()` 中 `this.$root.$on('editorInsert', handler)`，插入图片/图表的模块就自动能把内容注入到新编辑器中。
+
+这是一种**隐式的 Plugin Hook**——没有注册中心，但事件名和载荷结构构成了一套协议。
+
+### 18.5 前端组件懒加载扩展点
+
+`editor.vue` 的 `components` 字段是编辑器接入前端的唯一入口：
+
+```js
+components: {
+  editorMarkdown: () => import(/* webpackMode: "lazy", webpackChunkName: "editor-markdown" */ './editor/editor-markdown.vue'),
+  editorCkeditor: () => import(/* webpackMode: "lazy", webpackChunkName: "editor-ckeditor" */ './editor/editor-ckeditor.vue'),
+  // ...
+}
+```
+
+新增编辑器前端需要：
+1. 创建 `client/components/editor/editor-<key>.vue`
+2. 在 `components` 中加一行 lazy import
+3. 遵循协议：`mounted()` 中设置 `editorKey`、同步 `editor/content`、监听 `editorInsert/saveConflict/overwriteEditorContent`
+
+### 18.6 编辑器模块的 definition.yml props 扩展点
+
+每个编辑器的 `definition.yml` 可以声明 `props` 字段，这些 props 会：
+1. 出现在后台管理的编辑器配置页面
+2. 保存到 DB 中
+3. 在编辑器渲染时通过 `WIKI.data.editors[editorKey].config` 传递
+
+目前所有编辑器的 `props` 都是空对象 `{}`，这个扩展点**实际未被使用**。
+
+### 18.7 扩展点总结
+
+| 扩展点 | 位置 | 机制 | 是否有类型约束 |
+|--------|------|------|---------------|
+| 服务端模块注册 | `server/modules/<type>/<key>/definition.yml` | 启动时扫描磁盘目录 | 按 definition.yml schema 约定 |
+| 服务端事件 | `WIKI.events.inbound/outbound` | EventEmitter2 + DB 跨进程广播 | 无（纯字符串） |
+| 渲染管线 | `server/modules/rendering/` | dependsOn + input/output + DepGraph | 有（input/output 类型检查） |
+| 前端编辑器接入 | `client/components/editor.vue components` | webpack lazy import + Vue 动态组件 | 无（需手动遵循事件协议） |
+| 前端编辑器事件 | `$root.$emit / $on` | Vue 全局事件总线 | 无（载荷约定在各编辑器代码中） |
+| 编辑器 props | `definition.yml props` | 后台配置 → DB → `WIKI.data.editors` | 有（props.type 字段），但实际未用 |
+
+Wiki.js 没有统一的 Hook Manager，扩展能力分散在多个约定式机制中，新增编辑器需要同时在服务端 definition.yml 和前端 editor.vue components 两处手动注册。
