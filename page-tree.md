@@ -542,3 +542,693 @@ Wiki.js 的页面树系统采用 **「物化路径 + 预计算树表」** 的设
 5. **链接追踪**：通过 `pageLinks` 表维护反向链接，支持移动时批量更新
 
 这种设计适合中小规模的 Wiki 站点，实现简单且查询性能良好。对于超大规模站点，可能需要考虑增量更新树结构或使用嵌套集（Nested Set）模型。
+
+---
+
+## 九、rebuild-tree 锁与一致性
+
+### 9.1 进程隔离：独立 worker 进程
+
+**文件**：`server/core/scheduler.js:53-79`、`server/core/worker.js`
+
+rebuild-tree 被注册为 `worker: true` 的 job，这意味着它**不在主进程中执行**，而是通过 `childProcess.fork` 启动一个全新的 Node.js 子进程：
+
+```javascript
+// scheduler.js:55-79
+if (this.worker) {
+  const proc = childProcess.fork(`server/core/worker.js`, [
+    `--job=${this.name}`,
+    `--data=${data}`
+  ], { cwd: WIKI.ROOTPATH, stdio: ['inherit', 'inherit', 'pipe', 'ipc'] })
+  this.finished = new Promise((resolve, reject) => {
+    proc.on('exit', (code, signal) => {
+      if (code === 0) { resolve(data) }
+      else { reject(new Error(`Error when running job ${this.name}`)) }
+    })
+  })
+}
+```
+
+子进程 `worker.js` 会独立初始化 DB 连接：
+
+```javascript
+// worker.js
+WIKI.models = require('../core/db').init()
+await WIKI.configSvc.loadFromDb()
+await require(`../jobs/${args.job}`)(args.data)
+process.exit(0)
+```
+
+### 9.2 无显式锁机制
+
+**关键发现**：rebuild-tree **没有使用任何数据库锁或分布式锁**。它采用的是「truncate + insert」的原子替换策略：
+
+```javascript
+// rebuild-tree.js:57-68
+await WIKI.models.knex.table('pageTree').truncate()
+if (tree.length > 0) {
+  for (const chunk of _.chunk(tree, 100)) {
+    await WIKI.models.knex.table('pageTree').insert(chunk)
+  }
+}
+```
+
+**一致性风险**：
+
+1. **truncate 和 insert 之间存在时间窗口**：在 `truncate()` 完成后、`insert()` 完成前，所有树查询会返回空结果。但由于 rebuild-tree 在独立 worker 进程中运行，主进程的请求仍会读到旧数据（不同 DB 连接），实际影响有限。
+
+2. **并发重建**：如果两个页面几乎同时被创建/移动/删除，`rebuildTree()` 会被调用两次。但由于 `scheduler.registerJob` 会将两个 job 都推入队列，而它们各自 fork 的子进程**互相不感知**，可能出现以下竞态：
+
+   ```
+   Job A: truncate → insert(tree_A)     // tree_A 不包含页面 B
+   Job B:              truncate → insert(tree_B)  // tree_B 不包含页面 A
+   ```
+
+   后完成的 job 会覆盖前者的结果。但由于每次 rebuild-tree 都从 pages 表全量重建，最终结果是正确的——只是中间状态可能短暂不一致。
+
+3. **无事务包裹**：truncate + 多次 insert 不在同一个事务中。如果中途失败（如 OOM），pageTree 表会被清空但不完整，需要等下一次重建任务来修复。
+
+### 9.3 启动时自动重建
+
+```yaml
+# server/app/data.yml:136-141
+rebuildTree:
+  onInit: true
+  offlineSkip: false
+  repeat: false
+  immediate: true
+  worker: true
+```
+
+系统启动时会自动触发一次 rebuild-tree，确保 pageTree 表与 pages 表一致，弥补了无事务保护的风险。
+
+---
+
+## 十、GraphQL 树查询的权限继承
+
+### 10.1 两层权限模型
+
+Wiki.js 的权限检查分为两层：
+
+**第一层：GraphQL 指令级权限**（`server/graph/directives/auth.js`）
+
+```javascript
+// auth.js:33-48 — @auth 指令包装 resolver
+field.resolve = async function (...args) {
+  const requiredScopes = field._requiredAuthScopes || objectType._requiredAuthScopes
+  if (!requiredScopes) { return resolve.apply(this, args) }
+  const context = args[2]
+  if (!_.some(context.req.user.permissions, pm => _.includes(requiredScopes, pm))) {
+    throw new Error('Forbidden')
+  }
+  return resolve.apply(this, args)
+}
+```
+
+tree 查询声明了 `@auth(requires: ["manage:system", "read:pages"])`，只要用户拥有其中任一全局权限，即可调用该接口。
+
+**第二层：页面级 Page Rules**（`server/core/auth.js:221-295`）
+
+```javascript
+// auth.js:221 — checkAccess
+checkAccess(user, permissions = [], page = false) {
+  // 1. manage:system 系统管理员直接通过
+  if (_.includes(userPermissions, 'manage:system')) { return true }
+  // 2. 全局权限检查
+  if (_.intersection(userPermissions, permissions).length < 1) { return false }
+  // 3. 如果没有 page 上下文，直接返回 true
+  if (!page) { return true }
+  // 4. 检查 Page Rules（按组遍历）
+  user.groups.forEach(grp => {
+    _.get(WIKI.auth.groups, `${grpId}.pageRules`, []).forEach(rule => {
+      // 匹配规则：START/END/REGEX/TAG/EXACT
+    })
+  })
+  return (checkState.match && !checkState.deny)
+}
+```
+
+### 10.2 树查询中的权限过滤
+
+**文件**：`server/graph/resolvers/page.js:285-294`
+
+```javascript
+return results.filter(r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path,
+    locale: r.localeCode
+  })
+})
+```
+
+**重要特性**：
+
+1. **每个节点独立检查**：tree 查询返回的每个节点都独立进行 `checkAccess` 过滤，而非继承父节点的权限。
+
+2. **文件夹节点无独立权限**：文件夹节点的 `isPrivate` 始终为 `false`，`pageId` 为 `null`。权限检查时传入的是 `{ path, locale }`，Page Rules 的匹配依据是路径前缀。
+
+3. **路径前缀继承效果**：Page Rules 支持 `START` 匹配模式（`server/core/auth.js:255-257`），例如规则 `deny: true, match: START, path: secret` 会拒绝所有以 `secret` 开头的路径。这在效果上实现了「父目录拒绝 → 子页面全部拒绝」的继承语义。
+
+4. **无显式继承逻辑**：代码中没有「如果父文件夹被拒绝则子节点也被拒绝」的逻辑。继承完全依赖 Page Rules 的 `START` 匹配模式。如果管理员配置了 `EXACT` 规则只拒绝父文件夹，子页面仍可见。
+
+### 10.3 特异性（Specificity）算法
+
+当多条 Page Rules 匹配同一个页面时，通过特异性决定最终结果：
+
+```javascript
+// auth.js:368-388
+_applyPageRuleSpecificity ({ rule, checkState, higherPriority = [] }) {
+  if (rule.path.length === checkState.specificity.length) {
+    // 同长度：不覆盖更高优先级的匹配类型，不覆盖已有的 DENY
+    if (_.includes(higherPriority, checkState.match)) { return checkState }
+    if (rule.match === checkState.match && checkState.deny && !rule.deny) { return checkState }
+  } else if (rule.path.length < checkState.specificity.length) {
+    // 更短路径：不覆盖更长（更具体）的规则
+    return checkState
+  }
+  return { deny: rule.deny, match: rule.match, specificity: rule.path }
+}
+```
+
+优先级排序：`EXACT > TAG > REGEX > END > START`。路径越长（越具体）优先级越高。DENY 规则一旦匹配，不会被同级别的 ALLOW 规则覆盖。
+
+---
+
+## 十一、treeview 大目录性能
+
+### 11.1 后端查询无分页
+
+**文件**：`server/graph/resolvers/page.js:266-284`
+
+tree 查询**没有分页参数**，每次请求返回指定 parent 下的**全部子节点**：
+
+```javascript
+const results = await WIKI.models.knex('pageTree').where(builder => {
+  builder.where('localeCode', args.locale)
+  // ... mode 过滤
+  builder.where('parent', args.parent)
+}).orderBy([{ column: 'isFolder', order: 'desc' }, 'title'])
+```
+
+**风险**：如果一个目录下有数千个页面/文件夹，一次查询会返回全部数据。
+
+### 11.2 前端内存限制
+
+**侧边栏（nav-sidebar.vue）**：
+
+```javascript
+data() {
+  return {
+    currentItems: [],   // 当前目录的所有子项
+    loadedCache: [],    // 已加载过的目录 ID
+  }
+}
+```
+
+侧边栏每次只展示一个目录的内容（`currentItems`），每次点击文件夹时重新查询。虽然每个目录无分页，但懒加载机制确保只加载用户实际展开的层级。
+
+**页面选择器（page-selector.vue）**：
+
+```javascript
+async fetchFolders (item) {
+  const items = _.get(resp, 'data.pages.tree', [])
+  const itemFolders = _.filter(items, ['isFolder', true]).map(f => ({...f, children: []}))
+  const itemPages = _.filter(items, i => i.pageId > 0)
+  item.children = itemFolders.length > 0 ? itemFolders : undefined
+  this.pages = _.unionBy(this.pages, itemPages, 'id')
+  this.all = _.unionBy(this.all, items, 'id')
+}
+```
+
+页面选择器将所有已访问过的页面累积在 `this.pages` 和 `this.all` 中，**不会释放**。如果用户在大目录中来回浏览，内存占用会持续增长。
+
+### 11.3 v-treeview 的渲染性能
+
+Vuetify 的 `v-treeview` 会对每个节点创建 Vue 组件实例。当目录中包含数千个文件夹节点时，每个节点都有展开箭头和 `children: []` 占位，会导致：
+
+- 大量 Vue 组件实例化开销
+- DOM 节点过多
+- 无虚拟滚动支持
+
+**实际缓解**：`fetchFolders` 中只有文件夹节点才设置 `children: []`（触发懒加载），页面节点不设置 `children`，因此只有文件夹节点是可展开的。
+
+### 11.4 Apollo 缓存策略差异
+
+| 组件 | fetchPolicy | 说明 |
+|------|------------|------|
+| nav-sidebar | `cache-first` | 优先读缓存，减少重复请求 |
+| page-selector | `network-only` | 每次都发请求，确保数据最新 |
+
+nav-sidebar 使用 `cache-first`，但在 locale 切换时会强制重置树（`treeViewCacheId += 1`），通过 `:key` 强制重建组件。
+
+---
+
+## 十二、movePage 并发冲突解决
+
+### 12.1 目标路径冲突检测
+
+**文件**：`server/models/pages.js:709-716`
+
+```javascript
+const destPage = await WIKI.models.pages.query().findOne({
+  path: opts.destinationPath,
+  localeCode: opts.destinationLocale
+})
+if (destPage) {
+  throw new WIKI.Error.PagePathCollision()
+}
+```
+
+如果目标路径已被占用，抛出 `PagePathCollision`（错误码 6006），拒绝移动。
+
+### 12.2 创建时的重复检测
+
+**文件**：`server/models/pages.js:266-269`
+
+```javascript
+const dupCheck = await WIKI.models.pages.query()
+  .select('id')
+  .where('localeCode', opts.locale)
+  .where('path', opts.path).first()
+if (dupCheck) {
+  throw new WIKI.Error.PageDuplicateCreate()
+}
+```
+
+### 12.3 竞态条件分析
+
+**检查-执行间隙（TOCTOU）**：冲突检测和实际写入之间没有事务或行锁保护。两个并发请求可能同时通过冲突检测，然后都尝试写入：
+
+```
+请求 A: findOne(空) → 通过检查 → patch(path=A)
+请求 B: findOne(空) → 通过检查 → patch(path=A) → 数据覆盖
+```
+
+**实际影响**：
+- `createPage` 使用 `insert`，如果 `(localeCode, path)` 有唯一约束，第二次 insert 会抛出数据库唯一约束错误
+- `movePage` 使用 `patch`，后执行的 patch 会覆盖先执行的结果
+
+**没有乐观锁**：`updatePage` 和 `movePage` 都没有使用版本号或 `updatedAt` 做乐观并发控制。`checkConflicts` 查询（`server/graph/resolvers/page.js:354-368`）只在前端编辑器中使用，对比 `updatedAt` 与 `checkoutDate`，但这个检查**不在后端修改流程中强制执行**。
+
+### 12.4 路径合法性校验
+
+**文件**：`server/models/pages.js:242-249`、`680-692`
+
+```javascript
+// 创建和移动都执行相同的校验
+if (opts.path.includes('.') || opts.path.includes(' ') ||
+    opts.path.includes('\\') || opts.path.includes('//')) {
+  throw new WIKI.Error.PageIllegalPath()
+}
+if (opts.path.endsWith('/')) { opts.path = opts.path.slice(0, -1) }
+if (opts.path.startsWith('/')) { opts.path = opts.path.slice(1) }
+```
+
+这防止了路径中的 `.`（可导致扩展名混淆）、空格、反斜杠和双斜杠。
+
+---
+
+## 十三、reconnectLinks 与外部链接降级
+
+### 13.1 内部链接的渲染时标注
+
+**文件**：`server/modules/rendering/html-core/renderer.js:43-126`
+
+页面渲染时，渲染器会为每个 `<a>` 标签添加 CSS 类：
+
+| 类名 | 含义 | 条件 |
+|------|------|------|
+| `is-internal-link` | 内部链接 | href 不含 `://`，不含 `.`，非系统路径 |
+| `is-external-link` | 外部链接 | href 含 `://` |
+| `is-system-link` | 系统路径 | 匹配 `/x/` 前缀（如 `/a/`, `/e/`） |
+| `is-asset-link` | 资源链接 | href 含 `.`（文件扩展名） |
+| `is-valid-page` | 内部链接-页面存在 | pages 表中找到对应记录 |
+| `is-invalid-page` | 内部链接-页面不存在 | pages 表中未找到对应记录 |
+
+### 13.2 pageLinks 反向索引
+
+渲染器在标注链接状态的同时，维护 `pageLinks` 反向索引：
+
+```javascript
+// renderer.js:132-196
+const pastLinks = await this.page.$relatedQuery('links')
+
+// 添加新链接
+const missingLinks = _.differenceWith(internalRefs, pastLinks, ...)
+await WIKI.models.pageLinks.query().insert(missingLinks.map(...))
+
+// 删除过期链接
+const outdatedLinks = _.differenceWith(pastLinks, internalRefs, ...)
+await WIKI.models.pageLinks.query().delete().whereIn('id', _.map(outdatedLinks, 'id'))
+```
+
+`pageLinks` 表结构（`server/models/pageLinks.js`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | integer | 主键 |
+| pageId | integer | 源页面 ID（外键 → pages.id，CASCADE 删除） |
+| path | string | 链接目标路径 |
+| localeCode | string | 链接目标语言 |
+
+### 13.3 reconnectLinks 的操作范围
+
+**文件**：`server/models/pages.js:850-915`
+
+reconnectLinks **只处理内部链接**（`is-internal-link` 类），不处理外部链接。具体来说，它通过字符串替换 `render` 字段中的 HTML 来更新链接状态：
+
+```javascript
+case 'move':
+  replaceArgs.from = `<a href="${prevPageHref}" class="is-internal-link is-valid-page">`
+  replaceArgs.to = `<a href="${pageHref}" class="is-internal-link is-valid-page">`
+  break
+```
+
+### 13.4 外部链接降级场景
+
+**场景一：页面移动后，外部站点的链接失效**
+
+reconnectLinks 只更新 Wiki 内部页面的 render 字段，不会通知外部站点。外部站点指向旧路径的链接会收到 404。
+
+Wiki.js **没有**实现旧路径到新路径的 301 重定向。移动后旧路径直接失效。
+
+**场景二：页面删除后，内部链接变为无效**
+
+```javascript
+case 'delete':
+  replaceArgs.from = `<a href="${pageHref}" class="is-internal-link is-valid-page">`
+  replaceArgs.to = `<a href="${pageHref}" class="is-internal-link is-invalid-page">`
+```
+
+删除后，所有引用该页面的内部链接的 CSS 类从 `is-valid-page` 变为 `is-invalid-page`，前端会通过样式（通常是红色或删除线）提示用户链接已失效。链接本身**不会被删除**，仍可点击，只是目标页面不存在。
+
+**场景三：REPLACE 字符串匹配失败**
+
+reconnectLinks 使用精确的 HTML 字符串做 REPLACE，如果渲染管线在未来版本修改了 HTML 结构（如属性顺序变化、class 名修改），REPLACE 将匹配不到任何内容，**静默失败**而不报错。这是一个脆弱的设计。
+
+**场景四：pageLinks 表不同步**
+
+reconnectLinks 通过 `pageLinks` 表查找受影响的页面。如果 `pageLinks` 表数据不完整（如渲染失败未写入），部分引用页面不会被更新，导致链接状态不一致。
+
+---
+
+## 十四、分块批量插入与数据库行锁
+
+### 14.1 分块策略
+
+**文件**：`server/jobs/rebuild-tree.js:57-68`
+
+```javascript
+await WIKI.models.knex.table('pageTree').truncate()
+if (tree.length > 0) {
+  if ((WIKI.config.db.type !== 'sqlite')) {
+    for (const chunk of _.chunk(tree, 100)) {
+      await WIKI.models.knex.table('pageTree').insert(chunk)
+    }
+  } else {
+    for (const chunk of _.chunk(tree, 60)) {
+      await WIKI.models.knex.table('pageTree').insert(chunk)
+    }
+  }
+}
+```
+
+**为什么分块**：
+
+- **Postgres**：单查询最多约 35,000 个参数（65535 限制），每条 tree 记录约 10 个字段，100 条 = 1000 参数，安全
+- **MSSQL**：单查询最多约 2,000 个参数，100 条 = 1000 参数，安全
+- **SQLite**：单查询最多约 999 个参数，60 条 × 10 字段 = 600 参数，安全
+
+### 14.2 无事务包裹的风险
+
+truncate 和后续的多次 insert **不在同一个事务中**。如果 insert 过程中失败（如进程被 kill）：
+
+1. `truncate()` 已完成 → pageTree 表为空
+2. 部分 `insert()` 完成 → pageTree 表只有部分数据
+3. 树查询会返回不完整的结果
+
+**补救措施**：系统启动时的 `onInit: true` 会自动触发一次完整的 rebuild-tree。
+
+### 14.3 行锁与并发查询
+
+rebuild-tree 在独立 worker 进程中运行，使用独立的 DB 连接。主进程的查询和 worker 进程的写入通过数据库自身的 MVCC/锁机制协调：
+
+- **Postgres**：truncate 需要 ACCESS EXCLUSIVE 锁，会阻塞所有并发查询，但持锁时间很短（只删数据不加条件）
+- **MySQL/InnoDB**：truncate 等价于 DROP + CREATE，会短暂阻塞
+- **SQLite**：使用文件级锁，truncate 和 insert 期间整个数据库不可写
+
+**实际影响**：由于 truncate 执行很快（毫秒级），而 insert 是分批执行，每批之间有间隙，并发查询可以在批次间隙中执行，不会长时间阻塞。
+
+### 14.4 pageTree 表的外键约束
+
+```javascript
+// migrations/2.0.0.js:304-311
+table.integer('parent').unsigned().references('id').inTable('pageTree').onDelete('CASCADE')
+table.integer('pageId').unsigned().references('id').inTable('pages').onDelete('CASCADE')
+table.string('localeCode', 5).references('code').inTable('locales')
+```
+
+- `parent → pageTree.id`：自引用外键，CASCADE 删除（但 rebuild-tree 先 truncate 整表，不会触发）
+- `pageId → pages.id`：CASCADE 删除，删除页面时自动清理 pageTree 中对应行（但 rebuild-tree 也会重建，所以这里的外键更像是安全网）
+- MSSQL 不支持 self-cascade-delete（`dbCompat.selfCascadeDelete`），对 parent 字段只建普通整数列
+
+---
+
+## 十五、虚拟文件夹命名冲突
+
+### 15.1 冲突产生场景
+
+Wiki.js 的文件夹是**虚拟的**——由页面路径隐式生成。当两个不同 locale 的页面共享同一路径前缀，或一个页面路径恰好是另一个页面的前缀时，就会产生命名冲突。
+
+**场景一：页面与文件夹同名**
+
+```
+页面 A: path = "guide"       → 生成节点: guide (isFolder=false, pageId=A.id)
+页面 B: path = "guide/intro" → 需要节点: guide (isFolder=true)
+```
+
+rebuild-tree 的处理：
+
+```javascript
+// rebuild-tree.js:47-49
+} else if (isFolder && !found.isFolder) {
+  found.isFolder = true
+  parentId = found.id
+}
+```
+
+节点 `guide` 先作为页面节点创建（isFolder=false），当处理 `guide/intro` 时发现该路径已存在但不是文件夹，于是**升级为文件夹**。此时 `found.isFolder = true`，但 `found.pageId` 仍保留为页面 A 的 ID。
+
+**结果**：节点同时是文件夹和页面——侧边栏中它既可展开又可点击浏览。
+
+**场景二：不同页面共享中间路径**
+
+```
+页面 A: path = "docs/guide"
+页面 B: path = "docs/api"
+```
+
+两个页面共享 `docs` 前缀，rebuild-tree 只创建一个 `docs` 文件夹节点（isFolder=true, pageId=null）。
+
+**场景三：标题冲突**
+
+文件夹的 title 直接取路径最后一段的原始文本（`part` 变量），不保证唯一：
+
+```javascript
+title: isFolder ? part : page.title
+```
+
+如果路径是 `API/reference`，文件夹 `API` 的标题就是 `API`。如果后来有路径 `api/usage`（小写），会生成另一个 `api` 文件夹节点，与 `API` 是**不同的节点**（path 不同）。
+
+### 15.2 同路径不同 locale
+
+不同 locale 的树完全隔离（通过 `localeCode` 区分），不会产生跨 locale 的命名冲突：
+
+```javascript
+const found = _.find(tree, { localeCode: page.localeCode, path: currentPath })
+```
+
+### 15.3 潜在的数据丢失
+
+如果先有页面 `guide`（isFolder=false, pageId=A.id），后有页面 `guide/intro`，`guide` 节点被升级为文件夹。但如果是反向操作——删除 `guide/intro` 后重建树，`guide` 节点**不会再被升级为文件夹**（因为已无子页面），而是恢复为普通页面节点。这个过程是幂等的，不会丢失数据。
+
+---
+
+## 十六、history 快照与回滚
+
+### 16.1 快照创建时机
+
+**文件**：`server/models/pageHistory.js:91-109`
+
+| 操作 | action 标记 | 触发位置 |
+|------|------------|----------|
+| 创建页面 | `updated` | pages.js:319（隐含在 insert 中，无显式快照） |
+| 更新页面 | `updated` | pages.js:391-396 |
+| 移动页面 | `moved` | pages.js:719-723 |
+| 删除页面 | `deleted` | pages.js:806-810 |
+| 转换页面 | `updated` | pages.js:633-639（仅当 shouldConvert=true） |
+
+**注意**：创建页面时**不会**创建 history 快照，第一条快照产生于第一次更新。
+
+### 16.2 快照数据结构
+
+```javascript
+static async addVersion(opts) {
+  await WIKI.models.pageHistory.query().insert({
+    pageId: opts.id,
+    authorId: opts.authorId,
+    content: opts.content,
+    contentType: opts.contentType,
+    description: opts.description,
+    editorKey: opts.editorKey,
+    hash: opts.hash,
+    isPrivate: opts.isPrivate,
+    isPublished: opts.isPublished,
+    localeCode: opts.localeCode,
+    path: opts.path,
+    publishEndDate: opts.publishEndDate || '',
+    publishStartDate: opts.publishStartDate || '',
+    title: opts.title,
+    action: opts.action || 'updated',
+    versionDate: opts.versionDate
+  })
+}
+```
+
+快照保存的是**操作前的状态**（即 `...page` 展开的是修改前的数据），`versionDate` 是页面的 `updatedAt` 时间戳。
+
+### 16.3 历史轨迹的 action 推断
+
+**文件**：`server/models/pageHistory.js:158-231`
+
+history 表的 `action` 字段只存储 `updated`/`moved`/`deleted`，但前端展示时需要区分 `initial`/`edit`/`move`。`getHistory` 方法通过比较相邻版本的 `path` 来推断操作类型：
+
+```javascript
+static async getHistory({ pageId, offsetPage = 0, offsetSize = 100 }) {
+  // ...
+  let prevPh = null
+  _.reduce(_.reverse(history.results), (res, ph) => {
+    let actionType = 'edit'
+    if (!prevPh && history.total < upperLimit) {
+      actionType = 'initial'           // 最早的记录 = 初始版本
+    } else if (_.get(prevPh, 'path', '') !== ph.path) {
+      actionType = 'move'              // 路径变了 = 移动
+      valueBefore = _.get(prevPh, 'path', '')
+      valueAfter = ph.path
+    }
+    prevPh = ph
+    // ...
+  })
+}
+```
+
+### 16.4 版本回滚机制
+
+**文件**：`server/graph/resolvers/page.js:576-608`
+
+```javascript
+async restore (obj, args, context) {
+  const page = await WIKI.models.pages.query().select('path', 'localeCode').findById(args.pageId)
+  // 权限检查
+  if (!WIKI.auth.checkAccess(context.req.user, ['write:pages'], { path: page.path, locale: page.localeCode })) {
+    throw new WIKI.Error.PageRestoreForbidden()
+  }
+  const targetVersion = await WIKI.models.pageHistory.getVersion({ pageId: args.pageId, versionId: args.versionId })
+  // 用历史版本的数据调用 updatePage
+  await WIKI.models.pages.updatePage({
+    ...targetVersion,
+    id: targetVersion.pageId,
+    user: context.req.user,
+    action: 'restored'
+  })
+}
+```
+
+**回滚的本质是「用旧数据创建新版本」**：
+
+1. 获取指定版本的完整数据（content, title, description, path, locale 等）
+2. 调用 `updatePage()` 将当前页面更新为旧版本的内容
+3. `updatePage()` 内部会先创建当前状态的快照（`action: 'updated'`），然后应用旧版本内容
+4. 回滚操作本身也会产生一条 history 记录
+
+**重要限制**：
+
+- 回滚**不会恢复页面路径**：即使旧版本的 `path` 不同，`updatePage` 中路径变化会触发 `movePage`，但 `getVersion` 返回的 `path` 是**快照时的路径**。如果此时路径已被其他页面占用，move 会因 `PagePathCollision` 失败
+- 回滚**不恢复 tags**：`getVersion` 返回 `tags: []`（`pageHistory.js:148`），所以回滚后页面的标签会被清空
+- 回滚**不恢复 isPrivate/isPublished**：`updatePage` 中这两个字段由前端传入，`targetVersion` 中有值但可能不是用户期望的
+
+### 16.5 历史清理
+
+```javascript
+// pageHistory.js:238-242
+static async purge (olderThan) {
+  const dur = Duration.fromISO(olderThan)
+  const olderThanISO = DateTime.utc().minus(dur)
+  await WIKI.models.pageHistory.query().where('versionDate', '<', olderThanISO.toISO()).del()
+}
+```
+
+通过 GraphQL mutation `purgeHistory(olderThan: "P90D")` 可以删除 90 天前的所有历史版本。此操作不可逆，且**不受外键保护**——pageHistory 表没有 CASCADE 关联到其他表。
+
+---
+
+## 十七、综合架构图
+
+```
+用户请求 URL
+  │
+  ▼
+Express Router (common.js)
+  │
+  ├─ pageHelper.parsePath() ──→ 提取 locale + path
+  │
+  ├─ pages.getPage() ──→ 缓存(hash.bin) ──→ DB(pages 表)
+  │
+  └─ 渲染 HTML 响应
+
+GraphQL Tree 查询
+  │
+  ▼
+page.js resolver
+  │
+  ├─ pageTree 表查询 (parent/ancestors)
+  │
+  └─ auth.checkAccess() 逐节点过滤 ──→ Page Rules (START/END/REGEX/EXACT/TAG)
+
+页面创建/更新/删除/移动
+  │
+  ▼
+pages.js 模型方法
+  │
+  ├─ pageHistory.addVersion()    ← 快照
+  ├─ pages.query().patch()       ← 写入
+  ├─ pages.rebuildTree()         ← 注册 worker job
+  │     │
+  │     ▼
+  │   scheduler.js ──→ fork worker.js ──→ rebuild-tree.js
+  │     │                                    │
+  │     │                                    ├─ DB: truncate pageTree
+  │     │                                    └─ DB: chunk insert pageTree
+  │     │
+  │     └─ rebuildJob.finished (Promise)
+  │
+  ├─ searchEngine.renamed/deleted/created  ← 搜索索引
+  ├─ storage.pageEvent()                   ← 外部存储
+  └─ pages.reconnectLinks()                ← 链接重连
+        │
+        ├─ pageLinks 表查受影响页面
+        ├─ REPLACE(render, 旧href, 新href)
+        └─ 清除受影响页面缓存
+
+页面渲染管线
+  │
+  ▼
+render-page.js (worker job)
+  │
+  └─ html-core/renderer.js
+       │
+       ├─ 标注链接类型 (is-internal/external/system/asset-link)
+       ├─ 查询 pages 表验证链接有效性 (is-valid/invalid-page)
+       ├─ 更新 pageLinks 反向索引
+       └─ 生成 TOC
+```
