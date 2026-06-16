@@ -2564,3 +2564,805 @@ async tree (obj, args, context, info) {
 | CASCADE 锁升级（MySQL） | 中 | deletePage 执行时长 | 手动分表删除替代 CASCADE；显式事务 |
 | 渲染管线修改 HTML 结构 | 高 | reconnectLinks 匹配率 | 抽象层解耦：data-* 属性或 linkMap JSON |
 | 自引用 CASCADE 未来触发 | 低 | pageTree 最大深度 | 保持全量重建策略；或限制 depth ≤ 10 |
+
+---
+
+## 三十六、limit offset 参数的前端兼容
+
+### 36.1 当前 GraphQL schema
+
+**文件**：`server/graph/schemas/page.graphql:60-66`
+
+```graphql
+tree(
+  path: String
+  parent: Int
+  mode: PageTreeMode!
+  locale: String!
+  includeAncestors: Boolean
+): [PageTreeItem]
+```
+
+tree 查询返回 `[PageTreeItem]`，即一个扁平数组。没有 `limit`、`offset` 或 `search` 参数。
+
+### 36.2 前端调用方分析
+
+**调用方一：page-selector.vue（页面选择器）**
+
+```javascript
+// page-selector.vue:279-300
+const resp = await this.$apollo.query({
+  query: gql`
+    query ($parent: Int!, $mode: PageTreeMode!, $locale: String!) {
+      pages {
+        tree(parent: $parent, mode: $mode, locale: $locale) {
+          id path title isFolder pageId parent
+        }
+      }
+    }
+  `,
+  fetchPolicy: 'network-only',
+  variables: { parent: item.id, mode: 'ALL', locale: this.currentLocale }
+})
+```
+
+- 按 `parent` 查询，返回该文件夹的直接子节点
+- `fetchPolicy: 'network-only'`，每次都发请求
+- 不需要分页——每个文件夹的子节点通常不多
+
+**调用方二：nav-sidebar.vue（侧边栏）**
+
+```javascript
+// nav-sidebar.vue:145-168
+const resp = await this.$apollo.query({
+  query: gql`
+    query ($parent: Int, $locale: String!) {
+      pages {
+        tree(parent: $parent, mode: ALL, locale: $locale) {
+          id path title isFolder pageId parent locale
+        }
+      }
+    }
+  `,
+  fetchPolicy: 'cache-first',
+  variables: { parent: item.id, locale: this.locale }
+})
+```
+
+- 同样按 `parent` 查询
+- `fetchPolicy: 'cache-first'`，优先读 Apollo 缓存
+- 初始化时用 `path` + `includeAncestors` 查询
+
+### 36.3 增加 limit/offset 的兼容方案
+
+**后端 schema 改动**：
+
+```graphql
+tree(
+  path: String
+  parent: Int
+  mode: PageTreeMode!
+  locale: String!
+  includeAncestors: Boolean
+  limit: Int            # 新增，默认 null（不限制）
+  offset: Int           # 新增，默认 0
+  search: String        # 新增，标题模糊搜索
+): PageTreeResponse     # 返回类型从 [PageTreeItem] 改为带分页信息的对象
+
+type PageTreeResponse {
+  items: [PageTreeItem]!
+  total: Int!
+  hasMore: Boolean!
+}
+```
+
+**前端兼容性影响**：
+
+| 组件 | 需要改动 | 说明 |
+|------|----------|------|
+| page-selector.vue | 改动大 | `_.get(resp, 'data.pages.tree')` → `_.get(resp, 'data.pages.tree.items')` |
+| nav-sidebar.vue | 改动大 | 同上 |
+| GraphQL fragment | 需更新 | `common-pages-query-tree.gql` 返回类型变化 |
+
+**向后兼容策略**：
+
+返回类型从 `[PageTreeItem]` 变为 `PageTreeResponse` 是**破坏性变更**。为避免前端一次性大改，可以：
+
+1. **新增 `treePaged` 查询**：保留原 `tree` 不变，新增带分页的 `treePaged`
+2. **渐进迁移**：先让 `tree` 内部支持 `limit`/`offset`（返回仍为数组），只截断结果，不暴露 `total`/`hasMore`
+3. **最终统一**：所有调用方迁移到 `treePaged` 后，弃用 `tree`
+
+**方案二的实现**（最小改动）：
+
+```javascript
+// page.js resolver:tree 内部改动
+const limit = args.limit || 0
+const offset = args.offset || 0
+
+let results = await WIKI.models.knex('pageTree').where(/* ... */)
+  .orderBy([{ column: 'isFolder', order: 'desc' }, 'title'])
+
+if (limit > 0) {
+  results = results.slice(offset, offset + limit)
+} else {
+  results = results.slice(offset)
+}
+```
+
+返回类型不变（仍是数组），前端无需改动。大目录场景下前端传 `limit: 100` 即可截断结果。
+
+---
+
+## 三十七、11 风险点的 SLA
+
+### 37.1 SLA 定义
+
+为每个风险点定义可度量的服务水平目标（SLO），作为生产运维的基线：
+
+| 风险点 | SLO | SLI（度量指标） | 违约阈值 |
+|--------|-----|----------------|----------|
+| rebuild-tree 失败无重试 | 99.9% 成功率 | exit code = 0 的比例 | 连续 2 次失败 |
+| movePage 无乐观锁 | <1% 冲突率 | checkConflicts=true / 总编辑次数 | >5% |
+| reconnectLinks 匹配失败 | 0% 匹配失败 | REPLACE affectedRows=0 的比例 | >0% |
+| 大目录 treeview 性能 | <2s 加载时间 | tree 查询 + 前端渲染总时长 | >5s |
+| purgeHistory 无审计 | 100% 操作留痕 | purge 调用被记录的比例 | 任何未记录的调用 |
+| 回滚不恢复 tags | 已知限制 | 文档化并通知用户 | N/A（文档缺陷） |
+| MSSQL 无自引用外键 | 0 孤儿节点 | 定期巡检孤儿节点数 | >0 |
+| 级联深度超限 | 不可能触发 | max(depth) < 15 | max(depth) > 10 |
+| CASCADE 锁升级 | <5s 删除耗时 | deletePage 总耗时 | >10s |
+| 渲染管线结构变化 | 0% 匹配失败 | reconnectLinks 成功率 | >0% 失败 |
+| 自引用 CASCADE 触发 | 不触发 | pageTree 单行 DELETE 调用次数 | >0 |
+
+### 37.2 SLA 分级
+
+| 等级 | 含义 | 适用风险点 | 响应时间 |
+|------|------|-----------|----------|
+| P0 | 数据丢失/损坏 | 渲染管线结构变化、reconnectLinks 匹配失败 | <15 分钟 |
+| P1 | 功能不可用 | rebuild-tree 连续失败 | <1 小时 |
+| P2 | 性能退化 | 大目录加载慢、CASCADE 锁升级 | <4 小时 |
+| P3 | 已知限制 | 回滚不恢复 tags、MSSQL 无自引用外键 | 下一版本 |
+
+### 37.3 SLI 采集矩阵
+
+```
+┌─────────────────────────┬──────────┬──────────┬──────────┬──────────┐
+│ SLI                     │ WIKI.log │ DB 慢查询 │ Apollo   │ 自定义   │
+│                         │          │ 日志     │ 追踪     │ 端点     │
+├─────────────────────────┼──────────┼──────────┼──────────┼──────────┤
+│ rebuild-tree 成功率     │ ✅       │ -        │ -        │ -        │
+│ checkConflicts 冲突率   │ -        │ -        │ ✅       │ -        │
+│ REPLACE 匹配率          │ -        │ -        │ -        │ ✅       │
+│ tree 查询节点数         │ -        │ ✅       │ -        │ -        │
+│ purge 调用记录          │ ✅       │ -        │ ✅       │ -        │
+│ pageTree 孤儿节点       │ -        │ ✅       │ -        │ ✅       │
+│ deletePage 耗时         │ -        │ ✅       │ -        │ ✅       │
+│ max(depth)              │ ✅       │ -        │ -        │ -        │
+└─────────────────────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+---
+
+## 三十八、高危 reconnectLinks 迁移
+
+### 38.1 当前实现的问题总结
+
+reconnectLinks 使用精确 HTML 字符串做 `REPLACE(render, from, to)`，假设 `<a>` 标签的属性顺序固定。这是全系统最高危的设计缺陷。
+
+**具体假设链**：
+
+```
+html-core 输出: <a href="/en/docs" class="is-internal-link is-valid-page">
+                ^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                href 在 class 前   固定的 class 组合
+                
+reconnectLinks 匹配: <a href="/en/old-path" class="is-internal-link is-valid-page">
+```
+
+任何一环变化都会导致静默失败。
+
+### 38.2 迁移方案：data-* 属性（推荐）
+
+**阶段一：渲染侧增加 data-* 属性**（向后兼容）
+
+修改 `html-core/renderer.js`，为内部链接添加 `data-*` 属性：
+
+```javascript
+// html-core/renderer.js 修改
+$('a.is-internal-link').each((i, elm) => {
+  const href = $(elm).attr('href')
+  let hrefObj = {}
+  try {
+    const parsedUrl = new URL(`http://x${href}`)
+    hrefObj = pageHelper.parsePath(parsedUrl.pathname)
+  } catch (err) { return }
+
+  $(elm).attr('data-locale', hrefObj.locale)
+  $(elm).attr('data-path', hrefObj.path)
+
+  if (_.some(results, r => r.localeCode === hrefObj.locale && r.path === hrefObj.path)) {
+    $(elm).addClass('is-valid-page')
+    $(elm).attr('data-page-valid', 'true')
+  } else {
+    $(elm).addClass('is-invalid-page')
+    $(elm).attr('data-page-valid', 'false')
+  }
+})
+```
+
+这一步**不改变现有行为**，只增加属性。DOMPurify 需要将 `data-locale`、`data-path`、`data-page-valid` 加入白名单：
+
+```javascript
+// html-security/renderer.js 修改
+DOMPurify.addHook('beforeSanitizeAttributes', node => {
+  // data-* 属性默认被 DOMPurify 保留（REFUSE_ATTR 规则排除 data- 开头）
+})
+```
+
+DOMPurify **默认保留** `data-*` 属性，无需额外配置。
+
+**阶段二：reconnectLinks 改用 data-* 匹配**
+
+修改 `pages.js` 中的 `reconnectLinks`，从字符串匹配改为数据属性匹配：
+
+```javascript
+// pages.js reconnectLinks 修改
+case 'move':
+  const prevPageHref = `/${opts.sourceLocale}/${opts.sourcePath}`
+  const newPageHref = `/${opts.locale}/${opts.path}`
+
+  // 旧方式（保留作为 fallback）
+  // replaceArgs.from = `<a href="${prevPageHref}" class="is-internal-link is-valid-page">`
+  // replaceArgs.to = `<a href="${newPageHref}" class="is-internal-link is-valid-page">`
+
+  // 新方式：基于 data-path 匹配
+  replaceArgs.from = `data-path="${opts.sourcePath}" data-page-valid="true"`
+  replaceArgs.to = `data-path="${opts.path}" data-page-valid="true"`
+  replaceArgs.hrefFrom = `href="${prevPageHref}"`
+  replaceArgs.hrefTo = `href="${newPageHref}"`
+  break
+```
+
+需要两次 REPLACE：一次更新 `data-path`，一次更新 `href`。
+
+**阶段三：全量重渲染**
+
+阶段二只更新了 `data-path` 和 `href`，但 `class` 中的 `is-valid-page`/`is-invalid-page` 状态可能不一致。需要触发一次全量重渲染（`render` mutation）。
+
+### 38.3 迁移时间线
+
+| 阶段 | 版本 | 风险 | 回滚策略 |
+|------|------|------|----------|
+| 增加data-*属性 | v2.6.0 | 无——仅添加属性 | 移除属性代码 |
+| 双写匹配（旧+新） | v2.7.0 | 低——两种匹配同时生效 | 禁用新匹配 |
+| 仅新匹配 | v2.8.0 | 中——旧渲染页面仍需旧匹配 | 回退到双写 |
+| 全量重渲染 | v2.8.1 | 中——所有页面重新渲染 | 保留旧渲染缓存 |
+
+### 38.4 迁移验证脚本
+
+```sql
+-- 检查 data-* 属性覆盖率
+SELECT
+  COUNT(*) AS total_internal_links,
+  SUM(CASE WHEN render LIKE '%data-path=%' THEN 1 ELSE 0 END) AS with_data_path,
+  SUM(CASE WHEN render LIKE '%is-valid-page%' AND render NOT LIKE '%data-path=%' THEN 1 ELSE 0 END) AS legacy_only
+FROM pages
+WHERE render LIKE '%is-internal-link%';
+```
+
+---
+
+## 三十九、purgeHistory 权限分级落实
+
+### 39.1 当前错误码体系
+
+**文件**：`server/helpers/error.js`
+
+Wiki.js 使用 `CustomError` 工厂定义所有业务错误，每个错误有唯一 `code`：
+
+| 错误 | code | 消息 |
+|------|------|------|
+| PagePathCollision | 6006 | Destination page path already exists |
+| PageDuplicateCreate | 6002 | Cannot create this page because an entry already exists at the same path |
+| PageIllegalPath | 6005 | Page path cannot contains illegal characters |
+| PageUpdateForbidden | 6009 | You are not authorized to update this page |
+| PageDeleteForbidden | 6010 | You are not authorized to delete this page |
+| PageRestoreForbidden | 6011 | You are not authorized to restore this page version |
+| PageMoveForbidden | 6007 | You are not authorized to move this page |
+
+**注意**：没有 `PagePurgeForbidden` 错误。purgeHistory 的权限完全由 `@auth` 指令处理，权限不足时返回通用 `Forbidden` 错误。
+
+### 39.2 落实方案：按页面级别 + 时间窗口
+
+**步骤一：新增错误码**
+
+```javascript
+// error.js 新增
+PagePurgeForbidden: CustomError('PagePurgeForbidden', {
+  message: 'You are not authorized to purge page history.',
+  code: 6014
+}),
+PagePurgeWindowTooShort: CustomError('PagePurgeWindowTooShort', {
+  message: 'You can only purge history older than 90 days. Contact a system administrator for shorter windows.',
+  code: 6015
+}),
+```
+
+**步骤二：修改 GraphQL schema**
+
+```graphql
+purgeHistory (
+  olderThan: String!
+  pageId: Int              # 新增：可选，指定页面
+  locale: String           # 新增：可选，指定语言
+): DefaultResponse @auth(requires: ["manage:pages", "manage:system"])
+```
+
+**步骤三：修改 resolver 逻辑**
+
+```javascript
+async purgeHistory (obj, args, context) {
+  const isSystemAdmin = _.includes(context.req.user.permissions, 'manage:system')
+
+  // 权限分级：非系统管理员只能 purge 90 天以上
+  const dur = Duration.fromISO(args.olderThan)
+  const durDays = dur.as('days')
+  if (!isSystemAdmin && durDays < 90) {
+    throw new WIKI.Error.PagePurgeWindowTooShort()
+  }
+
+  // 权限分级：非系统管理员只能 purge 指定页面
+  if (!isSystemAdmin && !args.pageId) {
+    throw new WIKI.Error.PagePurgeForbidden()
+  }
+
+  // 指定页面时检查页面级权限
+  if (args.pageId) {
+    const page = await WIKI.models.pages.query()
+      .select('path', 'localeCode')
+      .findById(args.pageId)
+    if (!WIKI.auth.checkAccess(context.req.user, ['manage:pages'], {
+      path: page.path, locale: page.localeCode
+    })) {
+      throw new WIKI.Error.PagePurgeForbidden()
+    }
+  }
+
+  // 审计日志
+  WIKI.logger.warn(`purgeHistory: user=${context.req.user.id}, olderThan=${args.olderThan}, pageId=${args.pageId || 'ALL'}`)
+
+  await WIKI.models.pageHistory.purge(args.olderThan, args.pageId)
+  return { responseResult: graphHelper.generateSuccess('Page history purged successfully.') }
+}
+```
+
+**步骤四：修改 purge 模型方法**
+
+```javascript
+static async purge (olderThan, pageId = null) {
+  const dur = Duration.fromISO(olderThan)
+  const olderThanISO = DateTime.utc().minus(dur)
+  const query = WIKI.models.pageHistory.query()
+    .where('versionDate', '<', olderThanISO.toISO())
+  if (pageId) {
+    query.andWhere('pageId', pageId)
+  }
+  await query.del()
+}
+```
+
+### 39.3 审计日志落实
+
+```javascript
+// 审计日志存储方案一：WIKI.logger（最小改动）
+WIKI.logger.warn(`[AUDIT] purgeHistory: userId=${context.req.user.id}, olderThan=${args.olderThan}, pageId=${args.pageId || 'ALL'}, timestamp=${new Date().toISOString()}`)
+
+// 审计日志存储方案二：新增 auditLog 表（持久化）
+await WIKI.models.auditLog.query().insert({
+  action: 'purgeHistory',
+  userId: context.req.user.id,
+  metadata: JSON.stringify({ olderThan: args.olderThan, pageId: args.pageId }),
+  createdAt: new Date().toISOString()
+})
+```
+
+---
+
+## 四十、乐观锁补偿成本
+
+### 40.1 CAS 模式的性能成本
+
+**方案对比**：
+
+| 方案 | 额外 DB 查询 | 额外索引 | 写放大 | 代码改动量 |
+|------|-------------|---------|--------|-----------|
+| 无锁（当前） | 0 | 0 | 0 | 0 |
+| 乐观锁（CAS） | +1（SELECT updatedAt） | 0（updatedAt 已有索引） | 0 | 小 |
+| 悲观锁（SELECT FOR UPDATE） | +1 | 0 | 0 | 中 |
+| 分布式锁（Redis） | +1（Redis SETNX） | 0 | 0 | 大 |
+
+### 40.2 CAS 模式成本详细分析
+
+**查询开销**：
+
+```javascript
+// CAS 模式
+const page = await WIKI.models.pages.query()
+  .select('updatedAt')
+  .findById(opts.id)                     // +1 次主键查询，~0.1ms
+
+const updatedCount = await WIKI.models.pages.query()
+  .patch({ ... })
+  .findById(opts.id)
+  .where('updatedAt', opts.expectedUpdatedAt)  // CAS 条件，索引扫描 ~0.2ms
+
+if (updatedCount === 0) {
+  throw new WIKI.Error.PageConflictDetected()
+}
+```
+
+**额外成本**：
+- 1 次额外 SELECT（~0.1ms）
+- CAS 条件使 UPDATE 多一个 WHERE 条件（索引扫描 ~0.1ms）
+- 总计：每次写入多 ~0.2ms
+
+**失败成本**（冲突时）：
+- 1 次无效 UPDATE（rows affected = 0）
+- 前端需要重新获取最新数据、用户手动合并
+- 预估冲突率 < 1%（协作编辑场景下），失败成本可忽略
+
+### 40.3 重试退避成本
+
+movePage 的唯一约束重试策略：
+
+```javascript
+const maxRetries = 3
+for (let attempt = 0; attempt < maxRetries; attempt++) {
+  try {
+    await WIKI.models.pages.query().patch({...}).findById(page.id)
+    return
+  } catch (err) {
+    if (isUniqueViolation(err) && attempt < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, 100 * (attempt + 1)))  // 100ms, 200ms
+      continue
+    }
+    throw err
+  }
+}
+```
+
+**最坏情况**：3 次尝试 + 300ms 等待。正常情况下第一次就成功，无额外成本。
+
+### 40.4 成本/收益矩阵
+
+| 方案 | 每次写入额外延迟 | 冲突检测率 | 数据一致性保证 | 实现复杂度 |
+|------|----------------|-----------|---------------|-----------|
+| 无锁（当前） | 0ms | 0% | 无保证 | 低 |
+| 乐观锁 CAS | ~0.2ms | 99%+ | 最终一致 | 低 |
+| 悲观锁 | ~1ms | 100% | 强一致 | 中 |
+| 分布式锁 | ~2ms | 100% | 强一致（跨实例） | 高 |
+
+**结论**：CAS 模式的成本极低（~0.2ms），但提供 99%+ 的冲突检测率，是性价比最高的方案。
+
+---
+
+## 四十一、CASCADE 锁升级在线迁移
+
+### 41.1 问题描述
+
+在 MySQL 上，删除热门页面时 CASCADE DELETE 可能锁数千行。如果希望从 CASCADE 切换到应用层手动删除（减少锁范围），需要在线迁移——不能停机。
+
+### 41.2 迁移策略
+
+**阶段一：添加 beforeDelete 钩子（不删除 CASCADE）**
+
+```javascript
+// pages.js beforeDelete 修改
+static async beforeDelete({ asFindQuery }) {
+  const page = await asFindQuery().select('id')
+  // 已有：comments 手动删除
+  await WIKI.models.comments.query().delete().where('pageId', page[0].id)
+  // 新增：手动删除其他关联表
+  await WIKI.models.pageLinks.query().delete().where('pageId', page[0].id)
+  await WIKI.models.pageTags.query().delete().where('pageId', page[0].id)
+  await WIKI.models.pageTree.query().delete().where('pageId', page[0].id)
+  await WIKI.models.pageHistory.query().delete().where('pageId', page[0].id)
+  // pageHistory 删除会触发 pageHistoryTags 的 CASCADE
+}
+```
+
+此阶段 CASCADE 仍然存在，但数据已在 beforeDelete 中手动删除。CASCADE 触发时无数据可删，相当于空操作。
+
+**阶段二：数据库迁移移除 CASCADE**
+
+```javascript
+// migration
+exports.up = async knex => {
+  // MySQL: 删除外键约束再重建为 RESTRICT
+  await knex.raw(`
+    ALTER TABLE pageLinks DROP FOREIGN KEY pageLinks_pageId_foreign;
+    ALTER TABLE pageLinks ADD CONSTRAINT pageLinks_pageId_foreign
+      FOREIGN KEY (pageId) REFERENCES pages(id) ON DELETE RESTRICT;
+  `)
+  // ... 其他表同理 ...
+}
+```
+
+**阶段三：验证**
+
+```sql
+-- 确认 CASCADE 已移除
+SELECT CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
+FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS
+WHERE TABLE_NAME IN ('pageLinks', 'pageTags', 'pageTree', 'pageHistory')
+AND REFERENCED_TABLE_NAME = 'pages';
+```
+
+### 41.3 在线迁移风险
+
+| 风险 | 概率 | 影响 | 缓解 |
+|------|------|------|------|
+| beforeDelete 遗漏某个关联表 | 低 | DELETE 被 RESTRICT 阻止，报错 | 阶段一充分测试 |
+| 迁移期间有删除操作 | 低 | CASCADE 仍生效，不会丢失数据 | 阶段一先加钩子，阶段二在低峰期执行 |
+| 迁移失败回滚 | 中 | ALTER TABLE 需要表锁 | 使用 pt-online-schema-change 或 gh-ost |
+| pageHistory 不应手动删除 | 中 | 删除历史违反设计意图 | pageHistory 保留 CASCADE 或改为 SET NULL |
+
+### 41.4 pageHistory 的特殊处理
+
+当前 `pageHistory.pageId` **没有** CASCADE DELETE。但如果阶段一在 beforeDelete 中手动删除 pageHistory，会违反"历史永久保留"的设计意图。
+
+建议：pageHistory 不做手动删除，保留其无 CASCADE 的设计。删除页面后 pageHistory 中的记录保留，但 `pageId` 指向已不存在的页面。这是当前设计已有的行为，无需改变。
+
+---
+
+## 四十二、MSSQL 升级路径
+
+### 42.1 当前兼容层
+
+**文件**：`server/db/migrations/2.0.0.js:4-7`
+
+```javascript
+const dbCompat = {
+  selfCascadeDelete: WIKI.config.db.type !== 'mssql',
+  blobLength: (WIKI.config.db.type === `mysql` || WIKI.config.db.type === `mariadb`),
+  charset: (WIKI.config.db.type === `mysql` || WIKI.config.db.type === `mariadb`)
+}
+```
+
+MSSQL 的特殊处理仅限于：
+1. `pageTree.parent` 不建立自引用外键
+2. 不使用 `charset('utf8mb4')`
+3. 不使用 `specificType('data', 'LONGBLOB')`
+
+### 42.2 如果未来 MSSQL 支持自引用 CASCADE
+
+SQL Server 2019+ 仍然不支持自引用 CASCADE DELETE。这不是版本问题，而是 SQL Server 的设计限制——它拒绝任何可能形成循环的 CASCADE 路径。
+
+**替代方案**：
+
+**方案一：INSTEAD OF DELETE 触发器**
+
+```sql
+CREATE TRIGGER trg_pageTree_cascade_delete
+ON pageTree INSTEAD OF DELETE AS
+BEGIN
+  -- 递归 CTE 删除所有子节点
+  WITH descendants AS (
+    SELECT id FROM deleted
+    UNION ALL
+    SELECT pt.id FROM pageTree pt
+    INNER JOIN descendants d ON pt.parent = d.id
+  )
+  DELETE FROM pageTree WHERE id IN (SELECT id FROM descendants)
+END
+```
+
+但 Wiki.js 使用 `truncate` 而非 `DELETE`，触发器不会被 `truncate` 触发。此方案仅适用于增量更新场景。
+
+**方案二：应用层递归删除**
+
+```javascript
+static async deleteTreeNode(nodeId) {
+  const children = await WIKI.models.knex('pageTree')
+    .select('id').where('parent', nodeId)
+  for (const child of children) {
+    await this.deleteTreeNode(child.id)  // 递归
+  }
+  await WIKI.models.knex('pageTree').where('id', nodeId).del()
+}
+```
+
+**方案三：WITH RECURSIVE 查询（SQL Server 2008+ 不支持，2017+ 支持）**
+
+```sql
+-- SQL Server 2017+ 支持
+WITH descendants AS (
+  SELECT id FROM pageTree WHERE id = @nodeId
+  UNION ALL
+  SELECT pt.id FROM pageTree pt
+  INNER JOIN descendants d ON pt.parent = d.id
+)
+DELETE FROM pageTree WHERE id IN (SELECT id FROM descendants)
+```
+
+### 42.3 MSSQL 兼容性检查清单
+
+| 特性 | SQL Server 2008 | 2016 | 2017+ | Wiki.js 要求 |
+|------|----------------|------|-------|-------------|
+| 自引用 CASCADE | ❌ | ❌ | ❌ | 不需要 |
+| WITH RECURSIVE CTE | ❌ | ❌ | ✅ | 不使用 |
+| INSTEAD OF DELETE 触发器 | ✅ | ✅ | ✅ | 不使用 |
+| JSON 支持 | ❌ | ✅ | ✅ | **需要**（ancestors, extra 字段） |
+| 递归 CTE 深度限制 | N/A | N/A | 100（默认） | 不涉及 |
+| truncate 权限 | ALTER TABLE | ALTER TABLE | ALTER TABLE | **需要** |
+
+**关键约束**：Wiki.js 的 `ancestors` 字段使用 `JSON` 类型（2.3.23 迁移），`extra` 字段使用 `JSON` 类型（2.4.13 迁移）。SQL Server 2016+ 才支持 `JSON`（实际是 `NVARCHAR` + `ISJSON` 约束），因此 **Wiki.js 2.4+ 需要 SQL Server 2016+**。
+
+---
+
+## 四十三、自引用 CASCADE 未来触发测试样例
+
+### 43.1 当前不会触发的证明
+
+Wiki.js 代码中对 `pageTree` 表的所有操作：
+
+```javascript
+// 1. truncate（DDL，不触发 CASCADE）
+await WIKI.models.knex.table('pageTree').truncate()   // rebuild-tree.js:57
+
+// 2. insert（DML INSERT，不触发 CASCADE）
+await WIKI.models.knex.table('pageTree').insert(chunk) // rebuild-tree.js:62,66
+
+// 3. select（只读，不触发 CASCADE）
+await WIKI.models.knex('pageTree').where(...)           // page.js:266
+```
+
+没有任何 `DELETE FROM pageTree WHERE ...` 语句，因此自引用 CASCADE **在当前代码中不可能触发**。
+
+### 43.2 未来增量更新场景的测试样例
+
+如果未来需要增量更新 pageTree（如删除单个节点而非全量重建），以下测试样例验证自引用 CASCADE 的行为：
+
+**测试一：单节点删除级联验证（Postgres）**
+
+```sql
+-- 准备数据
+INSERT INTO "pageTree" (id, path, depth, title, "isFolder", parent, "pageId", "localeCode", ancestors)
+VALUES
+  (1, 'docs', 1, 'docs', true, NULL, NULL, 'en', '[]'),
+  (2, 'docs/guide', 2, 'guide', true, 1, NULL, 'en', '[1]'),
+  (3, 'docs/guide/intro', 3, 'intro', false, 2, 100, 'en', '[1,2]');
+
+-- 删除根节点
+DELETE FROM "pageTree" WHERE id = 1;
+
+-- 验证：id=2 和 id=3 应被 CASCADE 删除
+SELECT COUNT(*) FROM "pageTree" WHERE id IN (1,2,3);
+-- 预期结果：0
+```
+
+**测试二：MSSQL 上的预期失败**
+
+```sql
+-- 同样操作在 MSSQL 上
+-- parent 列无外键约束，删除 id=1 后 id=2,3 成为孤儿节点
+DELETE FROM "pageTree" WHERE id = 1;
+
+SELECT COUNT(*) FROM "pageTree" WHERE parent = 1;
+-- 预期结果：1（id=2 仍存在，成为孤儿）
+```
+
+**测试三：深层级联（15 层以上，MySQL）**
+
+```sql
+-- 构建 16 层深度的树
+-- level_1 → level_2 → ... → level_16
+-- 删除 level_1 应级联删除所有子节点
+-- MySQL 预期：报错 "Too many levels of cascading delete"
+
+-- 准备数据（伪代码）
+INSERT INTO pageTree (id, path, depth, title, isFolder, parent, pageId, localeCode, ancestors)
+VALUES
+  (1, 'a', 1, 'a', true, NULL, NULL, 'en', '[]'),
+  (2, 'a/b', 2, 'b', true, 1, NULL, 'en', '[1]'),
+  ... -- 继续到 16 层
+  (16, 'a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p', 16, 'p', false, 15, 100, 'en', '[1,2,...,15]');
+
+-- MySQL: 删除根节点
+DELETE FROM pageTree WHERE id = 1;
+-- 预期结果：ERROR 1451 (23000) 或 ERROR 1205 (HY000)
+```
+
+**测试四：循环引用防护**
+
+```sql
+-- 尝试创建循环引用（不应发生，但需验证数据库阻止）
+INSERT INTO "pageTree" (id, path, depth, title, "isFolder", parent, "pageId", "localeCode", ancestors)
+VALUES (1, 'a', 1, 'a', true, 1, NULL, 'en', '[]');
+-- parent = id = 1，自引用
+
+-- Postgres: 允许插入（不检查循环），但 CASCADE DELETE 会无限递归
+-- MSSQL: 不允许（因为无自引用外键）
+```
+
+### 43.3 测试自动化脚本
+
+```javascript
+// test/cascade/pageTree-cascade.spec.js
+const assert = require('assert')
+
+describe('pageTree self-referential CASCADE', () => {
+  before(async () => {
+    // 准备测试数据
+    await WIKI.models.knex('pageTree').insert([
+      { id: 9001, path: 'test-root', depth: 1, title: 'Test Root', isFolder: true, parent: null, pageId: null, localeCode: 'en', ancestors: '[]' },
+      { id: 9002, path: 'test-root/child', depth: 2, title: 'Child', isFolder: false, parent: 9001, pageId: null, localeCode: 'en', ancestors: '[9001]' }
+    ])
+  })
+
+  after(async () => {
+    await WIKI.models.knex('pageTree').where('id', '>=', 9001).del()
+  })
+
+  it('should cascade delete children when parent is deleted (Postgres/MySQL only)', async () => {
+    if (WIKI.config.db.type === 'mssql') {
+      // MSSQL 无自引用 CASCADE，手动删除
+      await WIKI.models.knex('pageTree').where('parent', 9001).del()
+      await WIKI.models.knex('pageTree').where('id', 9001).del()
+    } else {
+      await WIKI.models.knex('pageTree').where('id', 9001).del()
+    }
+
+    const remaining = await WIKI.models.knex('pageTree').where('id', 9002)
+    assert.strictEqual(remaining.length, 0, 'Child should be deleted after parent')
+  })
+
+  it('should not trigger CASCADE via truncate', async () => {
+    await WIKI.models.knex('pageTree').insert([
+      { id: 9003, path: 'truncate-test', depth: 1, title: 'Truncate Test', isFolder: true, parent: null, pageId: null, localeCode: 'en', ancestors: '[]' },
+      { id: 9004, path: 'truncate-test/child', depth: 2, title: 'Child', isFolder: false, parent: 9003, pageId: null, localeCode: 'en', ancestors: '[9003]' }
+    ])
+
+    // truncate 不触发 CASCADE，但直接清空整表
+    await WIKI.models.knex('pageTree').truncate()
+    const count = await WIKI.models.knex('pageTree').count('* as cnt').first()
+    assert.strictEqual(Number(count.cnt), 0, 'Table should be empty after truncate')
+  })
+})
+```
+
+### 43.4 rebuild-tree 幂等性验证
+
+```javascript
+describe('rebuild-tree idempotency', () => {
+  it('should produce identical tree after double rebuild', async () => {
+    await WIKI.models.pages.rebuildTree()
+    const tree1 = await WIKI.models.knex('pageTree').orderBy('id')
+
+    await WIKI.models.pages.rebuildTree()
+    const tree2 = await WIKI.models.knex('pageTree').orderBy('id')
+
+    assert.deepStrictEqual(
+      tree1.map(r => ({ path: r.path, parent: r.parent, depth: r.depth, isFolder: r.isFolder })),
+      tree2.map(r => ({ path: r.path, parent: r.parent, depth: r.depth, isFolder: r.isFolder }))
+    )
+  })
+})
+```
+
+---
+
+## 四十四、最终风险-监控-补偿-成本全景表
+
+| # | 风险点 | 严重度 | SLI/SLO | 补偿策略 | 补偿成本 | SLA 等级 |
+|---|--------|--------|---------|----------|----------|----------|
+| 1 | rebuild-tree 失败无重试 | 中 | 成功率 ≥99.9%，耗时 <30s | onInit 自动重建 + 手动 mutation | 0 | P1 |
+| 2 | movePage 无乐观锁 | 中 | 冲突率 <1% | CAS where('updatedAt') + 唯一约束重试 | ~0.2ms/写 | P2 |
+| 3 | reconnectLinks 匹配失败 | 高 | 匹配失败率 =0% | data-* 属性迁移（3 阶段） | 中（3 版本周期） | P0 |
+| 4 | 大目录 treeview 性能 | 中 | 加载 <2s | 后端 limit/offset（兼容方案） | 小 | P2 |
+| 5 | purgeHistory 无审计 | 高 | 100% 操作留痕 | 权限分级 + 审计日志 + 新错误码 | 小 | P0 |
+| 6 | 回滚不恢复 tags | 中 | 已知限制，文档化 | getVersion join pageHistoryTags | 小 | P3 |
+| 7 | MSSQL 无自引用外键 | 低 | 孤儿节点 =0 | 应用层保证（全量重建） | 0 | P3 |
+| 8 | 级联深度超限 | 无 | max(depth) <15 | 当前最长 2 层 | 0 | - |
+| 9 | CASCADE 锁升级（MySQL） | 中 | 删除耗时 <5s | beforeDelete 手动删 + 移除 CASCADE（在线迁移 3 阶段） | 中（低峰期执行） | P2 |
+| 10 | 渲染管线修改 HTML 结构 | 高 | 匹配成功率 100% | data-* 迁移与 #3 合并 | 见 #3 | P0 |
+| 11 | 自引用 CASCADE 未来触发 | 低 | 单行 DELETE 次数 =0 | 保持全量重建 + 测试样例覆盖 | 0 | P3 |
