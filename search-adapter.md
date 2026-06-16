@@ -1564,17 +1564,491 @@ pages.js:447  WIKI.events.outbound.emit('deletePageFromCache', page.hash)
 
 ---
 
-## 35. 演进观察（最终完整汇总）
+## 35. 复杂 boolean 表达式的解析栈深度上限
+
+### 35.1 当前查询解析：无自定义解析器，完全依赖各引擎原生能力
+
+搜索链路中**没有独立的 Boolean 表达式解析器**。用户输入的 `q` 直接透传给各引擎，由引擎自行解析：
+
+| Provider | 内部 boolean 解析机制 | 深度控制 |
+|----------|----------------------|---------|
+| **elasticsearch** | `simple_query_string` 查询（`engine.js:154`），支持 `+`/`-`/`"`/`*`/`()`/`|`/`~` 操作符 | es 原生 `indices.query.bool.max_clause_count` 默认 1024，应用层未配置 |
+| **postgres** | `pg-tsquery` 库（`postgres/engine.js:1,70`），将用户输入转义为合法 tsquery | pg-tsquery 内部无栈深限制，postgres 原生 `max_stack_depth`（默认 2MB，约递归 2000 层） |
+| **db (basic)** | 纯 Knex builder 嵌套 `.andWhere/.orWhere`（`db/engine.js:29-47`），仅一层 OR（title ILIKE OR description ILIKE OR path ILIKE） | 固定深度 2，无动态嵌套 |
+| **algolia** | 原生 query 解析，引擎侧限制 | SaaS 平台侧控制 |
+| **azure** | `simple` query type（`azure/engine.js:98`），SDK 转义后传给 Azure | Azure Search `maxClauseCount` 默认 1024 |
+| **aws** | `partial:true` 文本查询，无复杂 boolean | CloudSearch 默认限制 |
+
+### 35.2 实际存在的栈深度风险
+
+**elasticsearch `simple_query_string` 的括号嵌套风险**：
+- es 的 query parser 是递归下降实现，括号嵌套过深会触发 `StackOverflowError`
+- 虽然 es 默认 `indices.query.bool.max_clause_count=1024`，但这是子句数限制而非括号深度
+- 恶意输入 `((((((...query...))))))`（500+ 层括号）可能打爆 es 节点 JVM 栈
+- **当前代码未对用户输入做括号深度检查或扁平化预处理**
+
+**postgres `pg-tsquery` 的特殊字符注入风险**：
+- `pg-tsquery` 主要做转义（`!` `&` `|` `:` `*` 等），而非解析嵌套结构
+- 但 postgres 执行 `to_tsquery` 时，如果输入被构造出极深的 `&`/`|` 嵌套树，同样可能栈溢出
+- 当前代码只调用了 `tsquery(q)` 做转义，**未做 AST 深度检查**
+
+### 35.3 演进建议
+
+1. 抽出 `QuerySanitizer` 中间件，在用户 `q` 到达各 provider 之前：
+   - 括号深度计数，超过阈值（如 32 层）截断或报错
+   - boolean 子句数计数，超过 `maxClauseCount`（如 256）报错
+   - 对 `simple_query_string` 的特殊操作符（`+ - " * | ~`）做白名单过滤
+2. elasticsearch provider 的 `init()` 中调用 `indices.putSettings({ 'indices.query.bool.max_clause_count': 256 })` 收紧默认值
+3. postgres provider 在 `query()` 中对 `tsquery(q)` 结果额外做长度校验，超长拒绝
+
+---
+
+## 36. Unicode collation 在 lexicographic 兜底的选型
+
+### 36.1 当前 lexicographic 排序实现
+
+如第 20/29 章所述，当前 tie-breaker 的最终兜底需要 lexicographic（字典序）排序对 `path` / `title` 字段做稳定排序。但**当前代码完全未涉及 Unicode collation**，不同 provider 的默认排序规则差异极大：
+
+| Provider | 默认字符串排序规则 | 对 Unicode 的处理 |
+|----------|------------------|----------------|
+| **elasticsearch** | 字段 keyword 类型使用 Unicode 代码点排序（UCA 默认），取决于底层 ICU 默认值 | 依赖 es 的 `icu_collation` 插件（未配置），否则为简单 UTF-16 code unit 比较 |
+| **postgres** | 数据库 `LC_COLLATE` 决定（安装时指定，通常 `en_US.UTF-8` 或 `C`） | `C` 排序 = 字节序；`en_US.UTF-8` = glibc locale 排序 |
+| **db (MySQL/SQLite)** | 数据库 collation 决定（通常 `utf8mb4_general_ci` 或 `BINARY`） | MySQL `_ci` 不区分大小写，`_bin` 区分大小写 |
+| **algolia** | `sortFacetValuesBy: ['count', 'alpha']`，alpha 按引擎内部 Unicode 规则 | SaaS 固定规则，不可定制 |
+| **azure/aws** | 各自平台默认 collation | 不可定制 |
+
+### 36.2 实际问题场景
+
+以中文、德文、法文混合标题为例：
+- `café` vs `cafe`：glibc `en_US.UTF-8` 视为相同，es 无 ICU plugin 视为不同
+- `ä` vs `a`：德文 collation ä 在 a 之后，字节序排序 ä 在 z 之后
+- `中文标题` vs `English Title`：代码点排序中文（U+4E00+）永远在英文（U+0041+）之后
+
+如果用户 A 在 postgres（`de_DE.UTF-8`）搜到的排序与用户 B 在 es（无 ICU）搜到的排序完全不同，前端分页会产生错乱。
+
+### 36.3 Collation 选型建议
+
+| 方案 | 适用场景 | 实现方式 |
+|------|---------|---------|
+| **DUCET（默认 Unicode 排序）** | 多语言混合 Wiki，无特殊需求 | es 安装 `analysis-icu` 插件，定义 `icu_collation` keyword 字段；postgres 用 `collate "en_US.UTF-8"`；应用层 `Intl.Collator` 兜底 |
+| **CLDR 根排序器** | 需要跨平台完全一致 | es: `"type": "icu_collation", "language": "", "country": ""`；pg: `CREATE COLLATION ... (provider = icu, locale = '')` |
+| **特定语言排序** | 单语言站点（如德文 Wiki） | es/az/pg 全部指定 `de-DE@collation=phonebook` 等对应 locale |
+| **不区分重音/大小写** | 搜索友好，用户不关心大小写 | 所有引擎 collation 设置 `strength=primary`（仅比较基础字母） |
+
+**关键原则**：所有 provider + 应用层 JS 兜底必须使用**同一份 collation 规则**，否则 cross-engine 结果合并时排序错乱无解。
+
+---
+
+## 37. max_nesting_depth 热更新路径
+
+### 37.1 当前状态：无嵌套、无配置、无热更新
+
+第 19/28 章已确认：当前无 nested 字段，无 `maxNestedDepth` 配置项暴露，更无热更新机制。所有配置变更需走 `updateSearchEngines` resolver → DB 写入 → 重新 `initEngine()` 流程，涉及：
+- `deactivate()` 旧引擎
+- `require()` 新实例
+- `activate()` + `init()`
+
+这是**冷重启**而非热更新。
+
+### 37.2 嵌套上限热更新的约束条件
+
+不同引擎的 nested 限制参数热更新能力不同：
+
+| 参数 | es 是否支持热更新 | pg 是否支持热更新 | 其他引擎 |
+|------|-----------------|-----------------|---------|
+| `index.mapping.nested_fields.limit` | ✅ `indices.putSettings` 动态更新（无需重建索引） | N/A | algolia/azure/aws 不支持 nested |
+| `index.mapping.nested_objects.limit` | ✅ 同上动态更新 | N/A | N/A |
+| `index.mapping.depth.limit` | ✅ 同上动态更新 | N/A | N/A |
+| 自定义应用层 `maxNestedDepth`（前端传入校验） | ✅ 应用层内存变量即时生效 | ✅ 同左 | ✅ 同左 |
+| nested 字段 mapping 本身（新增/删除字段） | ❌ 需 `_reindex` 重建 | ⚠️ jsonb 索引需 REINDEX | N/A |
+
+### 37.3 热更新路径设计
+
+```
+管理员更新 maxNestedDepth
+        │
+        ▼
+[1] GraphQL Mutation.updateSearchEngines
+        │  └─ 更新 DB config JSON
+        ▼
+[2] ProviderRegistry.setConfig(key, newConfig)
+        │  └─ 内存中的 provider.config 即时更新
+        ▼
+[3] provider.onConfigChange(diff) 钩子
+        │
+        ├─ 对 es：调用 client.indices.putSettings({
+        │      index: config.indexName,
+        │      body: { 'index.mapping.nested_fields.limit': newVal }
+        │    })
+        │
+        ├─ 对 pg：无需操作（无硬限制）
+        │
+        └─ 对不支持的 provider：打 warn 日志（配置变更下次 init 生效）
+        ▼
+[4] emit('search:config-updated', { key, diff }) 通知集群其他节点
+```
+
+关键注意：
+- **区分「可动态参数」vs「需重建索引参数」**：`maxNestedDepth`（应用层校验）可即时生效，`nested_fields.limit`（引擎级）可热更新，新增 nested 字段 mapping 需重建索引
+- 当前 `initEngine()` 每次 `require` 新实例，不保留状态；热更新要求 provider 实例是**常驻单例**，这与现有架构冲突
+- 热更新后需要对**进行中的查询**做版本标记（`queryId -> configVersion`），防止半途中配置变更导致结果不一致
+
+---
+
+## 38. SortAxis 同名字段冲突解决
+
+### 38.1 SortAxis 的定义与冲突场景
+
+SortAxis = 排序字段的完整表示（如 `updatedAt DESC, title ASC`）。当用户自定义排序与全局默认 tie-breaker 或 provider 内部强制排序存在**同名字段但方向不同**时，产生冲突。
+
+示例冲突场景：
+```
+全局默认 tie-breaker: ['_score DESC', 'updatedAt DESC', 'path ASC']
+用户自定义 orderBy:  [{ field: 'updatedAt', direction: 'ASC' }, { field: 'title', direction: 'DESC' }]
+合并后：updatedAt 出现两次，一次 DESC 一次 ASC → 歧义
+```
+
+### 38.2 当前状态：无 SortAxis 抽象，无冲突解决
+
+第 29 章已确认当前甚至没有 tie-breaker，更谈不上冲突解决。所有排序在各 provider 中硬编码且互不相同：
+- postgres：`ORDER BY ts_rank(...) DESC`（`postgres/engine.js:69`）
+- db：**完全无 ORDER BY**（`db/engine.js:40`）
+- es：未指定 `sort` 参数，默认 `_score DESC`（`elasticsearch/engine.js:150-175`）
+- algolia：索引 `ranking` 配置
+- azure/aws：默认打分排序
+
+没有统一的 SortAxis → DSL 翻译层，也没有冲突检测。
+
+### 38.3 冲突解决策略（优先级从高到低）
+
+```
+策略 1: 用户显式排序覆盖全局默认（User-Defined > Default）
+   用户指定了 updatedAt ASC → 删除默认中的 updatedAt DESC，保留用户版本
+
+策略 2: 同名字段取首次出现（First-Wins）
+   如果同一字段在同一优先级层出现两次 → 取第一次，忽略后续，打 warn 日志
+
+策略 3: 不可冲突字段强制追加（Force-Append）
+   如 `hash ASC` 是最终确定性兜底，永远追加在最后，与用户排序不冲突（用户不能指定 hash 排序）
+
+策略 4: 提供名空间消除同名字段歧义（Namespace）
+   逻辑字段名 vs 物理字段名区分：user:title（用户指定 title） vs sys:_score（系统内部打分）
+```
+
+### 38.4 合并算法伪代码
+
+```js
+function mergeSortAxis(userOrderBy, defaultOrderBy, forcedOrderBy) {
+  const seen = new Set()
+  const result = []
+
+  // Layer 1: 用户自定义（最高优先级）
+  for (const axis of userOrderBy) {
+    const key = axis.field.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      result.push(axis)
+    } else {
+      WIKI.logger.warn(`Duplicate sort field ${axis.field} in user orderBy, ignoring duplicate`)
+    }
+  }
+
+  // Layer 2: 全局默认（用户未指定的才追加）
+  for (const axis of defaultOrderBy) {
+    const key = axis.field.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      result.push(axis)
+    }
+  }
+
+  // Layer 3: 强制兜底（永远追加，不检查冲突——因为命名空间隔离）
+  for (const axis of forcedOrderBy) {
+    result.push(axis)
+  }
+
+  return result
+}
+```
+
+---
+
+## 39. mergeResolver 自定义合并函数注入接口
+
+### 39.1 mergeResolver 的定义
+
+多 provider 并发查询时（第 21/30 章），需要将多个引擎返回的结果合并为单个 `PageSearchResponse`。默认合并策略（第 30 章）是：按 `(path, locale)` 去重、真实引擎排占位前面、真实引擎按 `_score` 排序。
+
+mergeResolver = 可替换的合并策略函数，允许管理员/插件自定义合并逻辑。
+
+### 39.2 当前状态：无合并，无注入点
+
+单 active 引擎模型，完全不需要 merge。代码中**没有任何合并逻辑**、没有 resolver 注入框架、没有插件系统钩子。
+
+### 39.3 注入接口设计
+
+```js
+// mergeResolver 契约
+type MergeResult = {
+  results: PageSearchResult[]
+  suggestions: string[]
+  totalHits: number
+  partial: boolean
+  failedProviders: string[]
+}
+
+interface MergeContext {
+  query: string
+  opts: Object
+  user: User
+  providerResults: Array<{
+    providerKey: string
+    providerWeight: number
+    ok: boolean
+    data?: PageSearchResponse   // ok=true
+    error?: Error               // ok=false
+    latencyMs: number
+  }>
+}
+
+type MergeResolver = (ctx: MergeContext) => MergeResult | Promise<MergeResult>
+```
+
+**内置 mergeResolver 列表**：
+| 名称 | 策略 | 适用场景 |
+|------|------|---------|
+| `weighted-rrf` | Reciprocal Rank Fusion，按各引擎排名倒数加权求和融合 | 多引擎质量相近 |
+| `primary-fallback` | 主引擎结果优先，主引擎失败/不足时才用备引擎填充 | 主搜 + 保底 |
+| `intersection` | 只返回所有成功引擎都出现的结果 | 高精度要求 |
+| `union-by-score` | 按真实 score 归一化后合并（第 30 章默认策略） | 简单场景 |
+
+**注入路径**：
+```yaml
+# definition.yml 配置项
+props:
+  mergeStrategy:
+    type: String
+    enum: ['weighted-rrf', 'primary-fallback', 'intersection', 'union-by-score', 'custom']
+    default: 'union-by-score'
+    order: 20
+  customMergeResolverPath:
+    type: String
+    hint: 'Absolute path to a JS module exporting a MergeResolver function (mergeStrategy=custom时生效)'
+    default: ''
+    order: 21
+```
+
+Registry 加载时：
+```js
+if (config.mergeStrategy === 'custom' && config.customMergeResolverPath) {
+  const fn = require(config.customMergeResolverPath)
+  if (typeof fn !== 'function') throw new SearchActivationFailed('Custom merge resolver must export a function')
+  ProviderRegistry.setMergeResolver(key, fn)
+}
+```
+
+**安全边界**：`customMergeResolverPath` 必须限制在 `WIKI.ROOTPATH/data/search-resolvers/` 目录内，防止任意文件读取/代码执行；加载时需沙箱化（`vm` 模块或 isolated-vm）。
+
+---
+
+## 40. decay-coefficient 自适应学习率
+
+### 40.1 decay-coefficient 的定义与当前状态
+
+第 31 章 LFU-Aging 策略中的 `decay_factor ∈ (0, 1)` 就是 decay-coefficient，控制历史频率随时间衰减的速度。
+
+当前：**无缓存 eviction → 无 decay-coefficient 概念**。
+
+### 40.2 固定 decay 的问题
+
+固定 decay（如 0.95/天）在不同业务模式下表现差异大：
+- **活跃 Wiki**（日均编辑 1000+ 页）：衰减太慢，旧热点占位；decay 应调高（如 0.9/天，衰减更快）
+- **静态 Wiki**（文档库，月更 < 10 页）：衰减太快，有效内容被淘汰；decay 应调低（如 0.99/天，衰减更慢）
+- **突发热点**（如发布新版本时访问量激增）：固定 decay 无法快速响应新热点
+
+### 40.3 自适应学习率算法
+
+```
+初始 decay = 0.95
+观察窗口 = 7 天
+评估指标 = cache_hit_ratio（7 日滑动平均）
+
+每 24 小时调整一次：
+  if hit_ratio < target_low (e.g. 0.5):
+      decay = clamp(decay * 0.98, 0.80, 0.995)   // 降低衰减（乘更小系数 → 更慢衰减）
+  elif hit_ratio > target_high (e.g. 0.8):
+      decay = clamp(decay * 1.01, 0.80, 0.995)   // 提高衰减
+  else:
+      keep
+```
+
+其中：
+- `hit_ratio = cache_hits / (cache_hits + cache_misses)`，由 `getPageFromCache()` 返回 false 时计数
+- `clamp` 保证 decay 永远在合理范围（不低于 0.80，不高于 0.995）
+- 调整幅度小（±1~2%），防止震荡
+
+### 40.4 代码落地位置与边界
+
+| 组件 | 职责 | 建议位置 |
+|------|------|---------|
+| **Hit/Miss 计数器** | 每次 `getPageFromCache()` 命中 +1 hit，未命中 +1 miss | `pages.js:1086 getPageFromCache()` 内 |
+| **滑动窗口存储** | 最近 N 天每小时 hit/miss 数（Redis ZSET 或 SQLite 表） | 新模块 `server/core/cache-metrics.js` |
+| **自适应调节器** | 每日 cron 计算 hit_ratio，调整 decay 并存入 DB config | `server/jobs/cache-decay-adjust.js`（新 job） |
+| **eviction 执行器** | 读取当前 decay 计算 score，淘汰低分文件 | `server/jobs/cache-evict.js`（新 job） |
+
+**防止自适应调整失效的边界**：
+- 新站点前 7 天 hit_ratio 无意义，使用初始 decay 0.95
+- 流量突降（节假日）时暂停调整（当 PV < baseline 的 30%）
+- decay 变更后 `emit('cache:decay-updated', newDecay)` 广播到 HA 节点
+
+---
+
+## 41. cycleFeedbackHook 异步反馈延迟容忍
+
+### 41.1 cycleFeedbackHook 的定义
+
+第 32 章同义词环自动拆分需要业务反馈（搜索曝光量、点击率）来决定主词。cycleFeedbackHook = 将前端/业务层的搜索行为数据异步回传给同义词引擎的钩子。
+
+**当前状态**：无搜索行为日志 → 无反馈 → 无 hook。
+
+### 41.2 反馈延迟容忍度分析
+
+反馈数据从产生到生效的延迟对拆环质量的影响：
+
+| 延迟区间 | 影响 | 容忍度 |
+|---------|------|--------|
+| **< 1 秒**（实时） | 几乎无影响，用户点击后立即影响同义词权重 | ✅ 理想，但成本高 |
+| **1 秒 ~ 1 分钟**（准实时） | 轻微影响，突发热点同义词识别稍慢 | ✅ 可接受 |
+| **1 分钟 ~ 1 小时**（近线） | 新热点词可能延迟识别为环的主词 | ⚠️ 可接受 |
+| **1 小时 ~ 24 小时**（离线批量） | 环拆分决策严重滞后，可能持续数小时错误排序 | ❌ 不可接受（用户体验差） |
+| **> 24 小时** | 完全失效，不如不用业务反馈 | ❌ 不可用 |
+
+### 41.3 容忍延迟的实现策略
+
+采用**分层缓冲 + 批量异步写入**架构：
+
+```
+前端点击事件（page.js 埋点）
+        │ POST /api/search/feedback
+        ▼
+[1] API Layer（server/routes/search.js）
+     ├─ 校验 user/query/page 非空
+     ├─ 写入内存环形缓冲区（ring buffer，容量 10000）
+     └─ 立即返回 202 Accepted（不等待下游）
+        │
+        ▼  每 10 秒或缓冲区满 1000 条触发
+[2] Flush Worker
+     ├─ 批量写入 ClickHouse/PostgreSQL search_feedback 表
+     ├─ 去重（同一 user + query + page 在 5 分钟窗口内只记 1 次）
+     └─ 更新内存中的热词计数器（增量曝光/点击）
+        │
+        ▼  每 15 分钟触发
+[3] CycleFeedbackHook
+     ├─ 读取最近 N 小时反馈数据
+     ├─ 运行 SCC 检测 + 主词重算
+     ├─ 如果主词变化 > 阈值（如 20% 的环主词变更）
+     │    └─ 更新同义词配置 → reloadSynonyms() → 广播集群
+     └─ 否则保持不变
+```
+
+### 41.4 延迟异常处理
+
+| 异常场景 | 降级策略 |
+|---------|---------|
+| **缓冲区满（突发热点）** | 丢弃最旧数据，保留高 10% 点击率数据；打 warn 日志 |
+| **DB 写入失败** | 数据暂存本地磁盘 spill 文件，后台重试指数退避（1s/2s/4s/.../60s） |
+| **Hook 执行超时** | 跳过本轮，使用上一版同义词配置；连续 3 轮超时告警 |
+| **节点重启丢失内存数据** | 缓冲区持久化到 WAL（write-ahead log），启动时重放 |
+
+关键原则：**反馈链路永远不能阻塞搜索主链路**。所有 hook 必须异步执行，失败不影响用户搜索体验。
+
+---
+
+## 42. Mutex 大量并发吞吐降级
+
+### 42.1 当前并发控制：完全无 Mutex
+
+代码中搜索链路相关操作**完全没有锁**：
+- `rebuildIndex()` 无互斥，管理员连点两次会启动两个并行流式重建，互相覆盖
+- `searchEngine.updated()` 无互斥，同一页面被快速编辑两次可能后发起的请求先完成（网络/引擎抖动），导致索引中版本落后于 DB
+- `reloadGroups()` / `refreshSearchEnginesFromDisk()` 无互斥，并发 reload 可能写坏内存状态
+- 缓存 `savePageToCache()` / `deletePageFromCache()` 无互斥，并发读写同一 hash.bin 文件可能读到半写文件
+
+### 42.2 Mutex 引入对吞吐的影响
+
+引入锁必然降低吞吐。不同锁策略的吞吐降级：
+
+| 锁策略 | 典型场景 | 吞吐降级幅度 | 实现复杂度 |
+|--------|---------|------------|----------|
+| **全局单写互斥**（1 把大锁） | rebuildIndex 全局排它锁 | 严重：rebuild 期间所有 created/updated 阻塞 | 低 |
+| **Key 级分片锁**（按 page.hash 分片） | 单文档更新互斥 | 轻微：不同页面完全并发，同页面连续编辑串行化 | 中 |
+| **读写锁（RWLock）** | rebuild=写锁，查询=读锁 | 中等：rebuild 阻塞所有写但不阻塞读 | 中高 |
+| **乐观锁（版本号）** | 索引更新冲突检测 | 极微：无锁，仅冲突时重试 | 高 |
+| **无锁队列 + 单消费者** | 所有索引变更入有序队列，单 worker 串行消费 | 轻微：写入吞吐 = worker 消费能力，不阻塞用户请求 | 中 |
+
+### 42.3 Wiki.js 搜索场景的推荐策略
+
+按操作粒度分层设计：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ rebuildIndex → 全局 RWLock.writeLock（重建期间拒绝新的 rebuild │
+│                但 created/updated 不阻塞，入增量队列待重放）      │
+├──────────────────────────────────────────────────────────────┤
+│ created/updated/deleted → Key 级乐观锁 + 幂等 upsert           │
+│   冲突条件：ES _version < DB page.updatedAt → 重试 2 次         │
+│   最终兜底：冲突 → 放弃写入，10 秒后由补偿任务重新同步            │
+├──────────────────────────────────────────────────────────────┤
+│ savePageToCache → 文件原子写（先写 tmpfile + fs.rename）         │
+│   不需要 Mutex，rename 在 POSIX 上是原子操作                     │
+├──────────────────────────────────────────────────────────────┤
+│ reloadGroups/refreshSearchEngines → 内存对象读写用单例 Promise   │
+│   维护 loadingPromise，并发调用时复用同一个 Promise              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 42.4 高并发下的吞吐降级保护
+
+当持锁请求排队长度超过阈值（如队列长度 > 1000）时，触发**降级策略**：
+
+1. **快速失败**：对非关键路径（如 suggestions 查询）直接返回空，避免阻塞主链路
+2. **批量合并**：对同一 page 的多个 updated 请求合并为最后一次写入（去抖 = debounce 500ms）
+3. **写入节流**：用户态搜索索引写入 QPS 限制（如 ≤ 100/s），超额请求排队或返回 `Retry-After`
+4. **优先级剥离**：管理员触发的 rebuild 优先级低于用户创建/更新页面操作；用户页面操作永远不被 rebuild 阻塞
+
+---
+
+## 43. 最终补充关键代码坐标
+
+| 关注点 | 文件 : 行号 |
+|--------|-------------|
+| es simple_query_string 查询（无栈深检查） | `server/modules/search/elasticsearch/engine.js:154-159` |
+| postgres pg-tsquery 转义（无 AST 深度检查） | `server/modules/search/postgres/engine.js:1,70` |
+| db 引擎 Knex builder 嵌套 where（固定深度 2） | `server/modules/search/db/engine.js:29-47` |
+| postgres ts_rank ORDER BY（无 Unicode collation 配置） | `server/modules/search/postgres/engine.js:69` |
+| db 引擎完全无 ORDER BY（排序完全随机） | `server/modules/search/db/engine.js:40-64` |
+| es 查询未指定 sort（默认 _score DESC） | `server/modules/search/elasticsearch/engine.js:150-175` |
+| es 8.x _source 字段列表（title/description/path/locale） | `server/modules/search/elasticsearch/engine.js:163` |
+| 页面更新 → 缓存失效 → 索引更新顺序（无互斥） | `server/models/pages.js:447-452` |
+| 缓存 savePageToCache（fs.outputFile 非原子写） | `server/models/pages.js:1052-1077` |
+| 缓存 getPageFromCache（无 hit/miss 计数） | `server/models/pages.js:1086-1106` |
+| initEngine 冷重启（require 新实例，无热更新） | `server/models/searchEngines.js:98-124` |
+| updateSearchEngines 配置更新入口 | `server/graph/resolvers/search.js:41-70` |
+| _applyPageRuleSpecificity 规则冲突算法（可参考作 SortAxis 冲突算法） | `server/core/auth.js:368-388` |
+
+---
+
+## 44. 演进观察（最终完整汇总）
 
 1. **安全审计薄弱**：引擎切换、配置修改无审计日志；`query()` 错误仅打 warn 不抛异常，静默失败可能掩盖攻击。`level` 字段预留但未使用，缺少 provider 可信分级。
 2. **无超时控制**：所有搜索引擎调用均未设置超时，网络故障会长时间阻塞请求；搜索查询接口无 rate limit，可被滥用。
-3. **单引擎模型限制**：架构上不支持多引擎组合（如主搜+备搜、混合召回），查询失败时只能返回空结果，无占位回填；占位与真实结果合并的歧义未定义。
-4. **排序/分页能力原始**：无自定义排序、无 user-defined tie-breaker、db 引擎完全无 ORDER BY、es 未设置 `preference`、无深度分页、totalHits 语义不统一。
-5. **同义词/查询重写缺失**：除 postgres 基础转义外，无查询理解层（QUL）；未考虑同义词环检测、SCC 自动拆环、业务反馈驱动主词选择。
+3. **单引擎模型限制**：架构上不支持多引擎组合（如主搜+备搜、混合召回），查询失败时只能返回空结果，无占位回填；占位与真实结果合并的歧义未定义；无 mergeResolver 自定义注入接口。
+4. **排序/分页能力原始**：无自定义排序、无 SortAxis 同名字段冲突解决、无 user-defined tie-breaker、db 引擎完全无 ORDER BY、es 未设置 `preference`、无 Unicode collation 统一规则、无深度分页、totalHits 语义不统一。
+5. **同义词/查询重写缺失**：除 postgres 基础转义外，无查询理解层（QUL）；未考虑 boolean 表达式栈深上限、同义词环检测、SCC 自动拆环、cycleFeedbackHook 异步反馈延迟容忍。
 6. **权限过滤重复代码**：6 处 resolver 重复相同的 `_.filter + checkAccess` 模式，未抽出统一拦截器；provider 内部无 RLS 下推，召回集浪费严重；权限字符串全库硬编码无常量定义。
-7. **缓存与索引不一致风险**：页面渲染缓存与搜索引擎索引是两套独立失效机制，无分布式事务保证；页面缓存无 eviction（无限增长）、无 TTL、无 LRU/LFU/LFU-Aging 策略。
+7. **缓存与索引不一致风险**：页面渲染缓存与搜索引擎索引是两套独立失效机制，无分布式事务保证；页面缓存无 eviction（无限增长）、无 TTL、无 LRU/LFU/LFU-Aging 策略、无 decay-coefficient 自适应学习率、无 hit/miss 指标。
 8. **字段映射无集中抽象**：各 provider 字段定义、权重声明、优先级策略硬编码且分散维护；es 6/7.x mapping boost 与 8.x query boost 存在双重乘冲突；跨 provider 同权重语义不对等导致换引擎排序剧变。
-9. **结构化查询为零**：无 nested/has_child/聚合/范围查询能力；tags 字段仅 es 索引但未提供查询入口；嵌套上限未暴露配置项。
-10. **Provider 注册非 Registry 模式**：扫描/加载/激活散落在单个 Model 文件中，无注册钩子、无生命周期管理、无版本控制。
+9. **结构化查询为零**：无 nested/has_child/聚合/范围查询能力；tags 字段仅 es 索引但未提供查询入口；嵌套上限未暴露配置项；无 max_nesting_depth 热更新路径。
+10. **Provider 注册非 Registry 模式**：扫描/加载/激活散落在单个 Model 文件中，无注册钩子、无生命周期管理、无版本控制、无配置热更新。
 11. **RBAC 扩展点未利用**：pageRules 的 `_applyPageRuleSpecificity` 优先级算法可直接翻译为搜索引擎 filter，但目前仅用于后置过滤；无 `search:advanced` 等细粒度搜索权限。
-12. **异步竞态未防护**：DB ↔ 搜索引擎更新窗口、rebuild + 增量更新冲突、多节点权限 reload 不一致、HA 缓存失效事件丢失均存在 race condition；异步操作幂等性未显式保证。
+12. **异步竞态未防护**：DB ↔ 搜索引擎更新窗口、rebuild + 增量更新冲突、多节点权限 reload 不一致、HA 缓存失效事件丢失均存在 race condition；无 Mutex/乐观锁/队列串行化控制；异步操作幂等性未显式保证；高并发吞吐无降级策略。
