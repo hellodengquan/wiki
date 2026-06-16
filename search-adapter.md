@@ -1067,15 +1067,514 @@ RLS 指在搜索引擎/数据库**查询层**就把用户不可见的文档过�
 
 ---
 
-## 26. 演进观察（最终汇总）
+## 26. RBAC 自定义权限组合的扩展点
+
+### 26.1 当前 RBAC 架构三层模型
+
+Wiki.js 的权限系统是 **三层 RBAC 叠加**，每层都有可扩展点：
+
+```
+┌─────────────────────────────────────────────────┐
+│ Layer 1: 全局权限 (Global Permissions)           │
+│   perms: ['read:pages', 'write:pages', ...]      │
+│   存储: groups.permissions (JSON 数组)           │
+├─────────────────────────────────────────────────┤
+│ Layer 2: 页面规则 (Page Rules)                   │
+│   rules: [{match, path, deny, roles, locales}]  │
+│   存储: groups.pageRules (JSON 数组)             │
+├─────────────────────────────────────────────────┤
+│ Layer 3: 系统管理员豁免                           │
+│   perms.includes('manage:system') → 直接放行      │
+└─────────────────────────────────────────────────┘
+```
+
+### 26.2 权限字符串硬编码，无集中定义
+
+权限字符串（`manage:system`、`read:pages`、`write:pages` 等）在代码中**完全硬编码**，没有集中定义文件或枚举：
+
+| 出现位置 | 权限使用方式 |
+|----------|-------------|
+| `auth.js:225,335,347` | `if (_.includes(userPermissions, 'manage:system'))` 直接字符串比较 |
+| `auth.js:230` | `_.intersection(userPermissions, permissions).length < 1` 数组交集 |
+| `search.graphql:21,31,33` | `@auth(requires: ["manage:system"])` GraphQL 指令 |
+| `group.graphql:43` | `permissions: [String]!` 直接字符串数组输入 |
+| `data.yml:143` | `defaultPermissions: ['read:pages', 'read:assets', ...]` |
+
+没有类似 `Permissions.READ_PAGES = 'read:pages'` 的常量定义，新增权限需全局 grep 修改。
+
+### 26.3 Page Rules 的匹配优先级算法（可扩展点）
+
+`_applyPageRuleSpecificity()`（`auth.js:368-388`）是 page rules 的核心冲突解决算法，按以下优先级决定哪条规则生效：
+
+```
+1. 规则路径长度优先（长路径覆盖短路径）：
+   rule.path.length > checkState.specificity.length → 覆盖
+
+2. 同长度时，按匹配类型优先级（高→低）：
+   EXACT > TAG > REGEX > END > START
+   由 each case 的 higherPriority 参数决定：
+   - START:  higherPriority=['END','REGEX','EXACT','TAG']
+   - END:    higherPriority=['REGEX','EXACT','TAG']
+   - REGEX:  higherPriority=['EXACT','TAG']
+   - TAG:    higherPriority=['EXACT']
+   - EXACT:  higherPriority=[]
+
+3. 同长度同类型时：
+   - DENY 规则不被 ALLOW 规则覆盖（拒绝优先）
+   - 后遍历到的规则覆盖前面的（取决于 groups 遍历顺序）
+```
+
+groups 遍历顺序是 `user.groups.forEach`，即用户加入组的顺序，**非确定性**。如果用户在两个组里有同优先级冲突的规则，结果取决于组 ID 顺序。
+
+### 26.4 搜索场景的自定义权限组合扩展点
+
+将 RBAC 权限与搜索结合，存在以下可扩展但未实现的点：
+
+1. **自定义搜索权限**：目前只有 `manage:system`（管搜索引擎）和 `read:pages`（搜结果可见），没有细粒度的「允许搜索特定路径」「允许搜索草稿」等权限
+2. **权限组合作为 search filter**：`checkAccess` 的 pageRules 逻辑（START/END/REGEX/EXACT/TAG）可以直接翻译为搜索引擎的 filter DSL，但目前只在后置过滤用
+3. **自定义 roles 扩展**：pageRules 的 `roles` 字段是字符串数组，目前硬编码为 `['read:pages', 'write:pages']` 等，可扩展为自定义角色（如 `search:advanced` 允许使用范围/标签查询）
+4. **`defaultPermissions` / `defaultPageRules`**（`data.yml:143-158`）：已有默认权限模板，但搜索模块没有专属默认规则
+
+### 26.5 演进建议
+
+1. 抽出 `Permissions` 常量模块，所有权限字符串从硬编码改为引用常量
+2. 在 pageRules schema 中增加 `priority: Number` 字段，用于同长度同类型时的确定性冲突解决，替代当前的「后遍历覆盖」
+3. 搜索 PermissionInterceptor 的 `preQuery()` 直接调用 `_applyPageRuleSpecificity` 提取用户可见的路径集合，下推为搜索引擎 filter
+4. 新增 `search:query-advanced` 权限（范围查询、标签过滤、聚合统计）和 `search:rebuild` 权限（单独的索引重建权限，从 manage:system 中拆分）
+
+---
+
+## 27. 同 weight 字段冲突的稳定性兜底
+
+### 27.1 当前 weight 声明的冲突状态
+
+各 provider 中 title/description/content 的权重是**分散声明且无冲突检测**的：
+
+| Provider | title 权重 | description 权重 | content 权重 | 声明方式 |
+|----------|-----------|-----------------|-------------|---------|
+| es 6/7.x mapping | 10.0 | 3.0 | 1.0 | `properties.title.boost`（静态） |
+| es 8.x query 层 | 20 | 3 | 1 | `fields: ['title^20', ...]`（动态） |
+| postgres | A（最高） | B | C | `setweight(..., 'A'/'B'/'C')` |
+| algolia | 第 1 位 | 第 2 位 | 第 3 位 | `searchableAttributes` 顺序 |
+| azure | 4 | 3 | 1 | `scoringProfiles.fieldWeights` |
+| db | 无权重 | 无权重 | 无权重 | OR 平等 |
+
+**同 weight 冲突的定义**：不同来源（mapping vs query、不同 provider、同一 provider 不同版本）对同一逻辑字段声明了不同权重值，导致搜索结果不可预测。
+
+### 27.2 已存在的实际冲突案例
+
+**elasticsearch 内部冲突（mapping boost vs query boost）**：
+- es 6.x/7.x 在 mapping 中声明了 `title.boost: 10.0`（`engine.js:73`）
+- 同时 query 时又声明了 `fields: ['title^20']`（`engine.js:158`）
+- es 实际生效是**两者相乘**（10 × 20 = 200），但代码作者可能以为是覆盖关系
+- es 8.x 去掉了 mapping boost，同样的 query 在 8.x 只有 20 倍权重，导致**跨版本排序不一致**
+
+**跨 provider 同权重语义不一致**：
+- postgres 的 A/B/C/D 是 4 档离散值，实际数值由 `ts_rank` 的 `weights` 参数决定（默认 {0.1, 0.2, 0.4, 1.0}）
+- azure 的 fieldWeights 是线性整数（1~4）
+- es 的 boost 是浮点数乘数（1~20）
+- 三者的「title 权重最高」在数值上完全不对等，换引擎后 title 命中的文档排序位置会跳变
+
+### 27.3 稳定性兜底策略建议
+
+1. **单一真相来源**：在 FieldMapper 集中声明逻辑权重（如 `title: 100, description: 30, content: 10`），各 provider 按比例映射到自己的权重系统
+2. **冲突检测**：`refreshSearchEnginesFromDisk()` 时校验各 provider 的权重声明与 FieldMapper 偏差，超过阈值（如 1.5x）告警
+3. **es boost 归一化**：删除 mapping 层 boost（es 8.x 已不支持），统一在 query 层声明，避免双重乘
+4. **同分数 tie-breaker**：见第 28 章，权重相同时由二级排序字段兜底，保证结果稳定
+
+---
+
+## 28. 嵌套上限暴露配置项
+
+### 28.1 当前状态：无配置、无嵌套
+
+如第 11 章和第 19 章所述，当前所有 provider：
+- 无 nested / parent-child / join 类型字段
+- 所有 definition.yml 中无 `maxNestedDepth`、`maxNestedObjects` 等配置项
+- GraphQL schema 无嵌套查询参数
+
+即使未来引入嵌套字段，用户也无法在 UI 上调整上限。
+
+### 28.2 各引擎原生嵌套上限参考（应映射为配置项）
+
+| 引擎 | 原生限制 | 默认值 | 应暴露的配置项 |
+|------|---------|-------|--------------|
+| **elasticsearch** | `index.mapping.nested_fields.limit` | 50 | `maxNestedFields`（全局索引级） |
+| **elasticsearch** | `index.mapping.nested_objects.limit` | 10000 | `maxNestedObjectsPerDoc`（单文档级） |
+| **elasticsearch** | `index.mapping.depth.limit` | 20 | `maxNestedDepth`（字段路径深度） |
+| **postgres jsonb** | 无硬限制，但深度 >5 性能恶化 | — | `maxJsonbDepth`（建议 ≤ 3） |
+| **postgres tsvector** | 不支持嵌套 | — | N/A |
+| **algolia/azure/aws** | 不支持 nested | — | N/A |
+
+### 28.3 配置项设计建议
+
+在 `FieldMapper` 的 nested 字段声明中增加：
+```yaml
+# definition.yml 示例（嵌套场景）
+props:
+  nestedSearchEnabled:
+    type: Boolean
+    default: false
+    order: 10
+  maxNestedDepth:
+    type: Number
+    default: 2
+    min: 1
+    max: 5
+    order: 11
+  maxNestedObjectsPerDoc:
+    type: Number
+    default: 100
+    min: 1
+    max: 1000
+    order: 12
+```
+同时 provider 的 `init()` 中根据配置设置引擎参数（如 es 的 `indices.putSettings`），`activate()` 中校验用户配置不超过引擎硬限制。
+
+---
+
+## 29. score 相同 tie-breaker 的 user-defined 字段优先级
+
+### 29.1 当前状态：无 tie-breaker
+
+第 20 章已确认，所有 provider 都**没有配置二级排序键**。BM25/ts_rank 打分相同的文档，返回顺序依赖：
+- es：文档内部 `_doc`（插入顺序），多分片时不确定
+- postgres：SQL 无 ORDER BY 时是物理存储顺序
+- db：完全随机
+- algolia/azure/aws：引擎内部默认顺序（通常是 `objectID` / 文档 ID 字典序）
+
+### 29.2 tie-breaker 设计层级
+
+合理的 tie-breaker 应分三层，优先级从高到低：
+
+| 层级 | 来源 | 字段示例 | 可配置性 |
+|------|------|---------|---------|
+| Layer 1: 用户自定义 | `PageQuery.search(orderBy: [...])` | `updatedAt DESC`, `viewCount DESC`, `path ASC` | ✅ 每个查询可选 |
+| Layer 2: 全局默认 | admin 配置（definition.yml） | `_score DESC, updatedAt DESC, path ASC` | ✅ 站点级配置 |
+| Layer 3: 最终兜底 | 代码硬编码保证确定性 | `id ASC` / `hash ASC` | ❌ 不可配置，保证永远有确定性排序 |
+
+### 29.3 各 provider 的 tie-breaker 实现差异
+
+| Provider | 如何添加二级排序 |
+|----------|----------------|
+| **elasticsearch** | `sort: [{ _score: 'desc' }, { updatedAt: 'desc' }, { path: 'asc' }, { _id: 'asc' }]` |
+| **postgres** | `ORDER BY ts_rank(...) DESC, "updatedAt" DESC, path ASC, id ASC` |
+| **algolia** | `index.search(q, { sortFacetValuesBy: ['count', 'alpha'] })` （algolia 排序在索引配置中，查询级 tie-breaker 支持有限） |
+| **azure** | `$orderby=search.score() desc, updatedAt desc, path asc, id asc` |
+| **aws** | `sort: '_score desc, updatedAt desc, path asc'` |
+| **db** | `orderByRaw('CASE WHEN title ILIKE ? THEN 1 ELSE 0 END DESC, "updatedAt" DESC, path ASC, id ASC')` |
+
+### 29.4 GraphQL schema 扩展点
+
+当前 `PageQuery.search`（`page.graphql:29-33`）只有 `query/path/locale`，可扩展：
+```graphql
+type PageQuery {
+  search(
+    query: String!
+    path: String
+    locale: String
+    orderBy: [PageSearchOrderByInput]   # 新增：user-defined 排序
+    first: Int = 50                      # 新增：分页
+    after: String                         # 新增：游标
+  ): PageSearchResponse
+}
+
+input PageSearchOrderByInput {
+  field: PageSearchOrderField!   # SCORE / UPDATED_AT / CREATED_AT / PATH / TITLE
+  direction: OrderDirection!     # ASC / DESC
+}
+```
+PermissionInterceptor 需要校验：用户是否有 `search:advanced` 权限才能使用自定义排序。
+
+---
+
+## 30. PlaceholderResult 与真实结果合并时歧义
+
+### 30.1 歧义场景定义
+
+多 provider 并发查询时（第 21 章），PlaceholderResult 与真实结果合并会产生以下歧义：
+
+| 歧义场景 | 问题描述 |
+|---------|---------|
+| **去重歧义** | es 返回了页面 A，db 占位结果也返回了页面 A，合并时按什么字段去重？（id/hash/path+locale?） |
+| **排序歧义** | es 页面 A score=5.2，db 页面 A score=0.8（占位无真实分），合并后 A 的最终排序位置？ |
+| **来源歧义** | 用户看到页面 A，不知道是真实搜索结果还是占位，反馈问题时无法定位 |
+| **总数歧义** | es totalHits=1000，db 占位 totalHits=50，合并后 totalHits 应该是多少？ |
+| **建议歧义** | es suggestions=['javascript']，db 占位 suggestions=[]，合并后取并集还是只取真实引擎？ |
+| **分页歧义** | es 返回前 50 条（过滤剩 5 条可见），db 占位返回 50 条，合并后下一页从哪里开始？ |
+
+### 30.2 去重主键选择
+
+当前 provider 的结果 id 策略不统一（第 8 章第 6 点）：
+- es/algolia/azure/aws：`id = page.hash`
+- postgres：无明确 id，返回的是 `id`（自增主键）+ `path` + `locale`
+
+合并去重的**唯一可靠主键是 `(path, locale)` 二元组**，因为：
+- `hash` 在 rename 时会变，且 postgres 没返回
+- `id`（自增）在不同环境可能不一致
+- `(path, locale)` 是业务上真正唯一的页面标识
+
+### 30.3 合并策略建议
+
+```
+1. 分类标记
+   - 真实结果每条标记 source: 'elastic'/'algolia'
+   - 占位结果每条标记 source: 'placeholder'，score=null
+
+2. 去重
+   - key = (path, locale)
+   - 如果同 key 既有真实结果又有占位，丢弃占位，保留真实结果
+   - 如果同 key 多个真实引擎返回，按引擎权重取最高分
+
+3. 排序
+   - 真实结果按 _score DESC，占位结果追加在最后（按 updatedAt DESC）
+   - 保证占位结果永远不会排在真实结果前面
+
+4. 统计
+   - totalHits = 真实结果的 totalHits（忽略占位的 totalHits）
+   - partial = 有任何 provider 失败
+   - failedProviders = 失败的引擎 key 列表
+
+5. suggestions
+   - 取所有成功引擎 suggestions 的去重并集
+   - 占位引擎的 suggestions（通常为空）忽略
+
+6. 前端可见性
+   - 占位结果在 UI 上用灰色 / 「兜底结果」标签标记
+```
+
+---
+
+## 31. LFU-Aging 混合策略实现
+
+### 31.1 纯 LFU 的问题
+
+纯 LFU（Least Frequently Used）有两个已知问题：
+1. **冷启动问题**：新页面频率为 0，即使是热点内容也会被立即淘汰
+2. **历史污染问题**：曾经热门但现在没人看的页面（如「2020 年度报告」）历史频率很高，长期占据缓存
+
+### 31.2 LFU-Aging 混合策略
+
+LFU-Aging 是对纯 LFU 的改进：每个缓存项维护 `(frequency, last_access_time)`，eviction 时按以下公式计算得分：
+
+```
+score = frequency * decay_factor^(current_time - last_access_time)
+```
+
+其中 `decay_factor ∈ (0, 1)`（通常 0.9 ~ 0.99），时间窗口单位 = 1 天。
+
+效果：
+- 30 天前访问 100 次的页面 = 100 × 0.95^30 ≈ 21 分
+- 昨天访问 10 次的新页面 = 10 × 0.95^1 ≈ 9.5 分
+- 1 年前访问 1000 次的页面 = 1000 × 0.95^365 ≈ 0.05 分（几乎为 0）
+
+既保留了频率偏好，又让历史热点自然「冷却」。
+
+### 31.3 落地到 Wiki.js 页面缓存
+
+当前页面缓存是磁盘文件 `cache/${hash}.bin`，可以**利用文件系统元信息**低成本实现 Aging：
+
+| 缓存属性 | 文件系统对应字段 | 用法 |
+|---------|----------------|------|
+| frequency | 自定义扩展属性 `user.freq`（`fs.setxattr`）或独立 SQLite/JSON 索引 | 每次 `getPageFromCache()` 命中时 +1 |
+| last_access_time | `atime`（文件访问时间）或 `mtime`（修改时间，若 mount noatime） | 每次命中时 `fs.utimes()` 更新 |
+| size | 文件 `stat().size` | 容量统计 |
+
+eviction 触发时机（cron job 或写入时超过阈值）：
+```
+1. 扫描 cache/ 目录所有 .bin 文件
+2. 对每个文件读取 atime + xattr.freq
+3. 计算 score = freq * decay^(days_since_atime)
+4. 按 score 升序排序
+5. 删除得分最低的 N 个文件，直到总大小 < 容量阈值
+```
+
+### 31.4 与 W-TinyLFU 的对比与选型
+
+| 策略 | Wiki.js 适配度 | 实现成本 | 命中率预期 |
+|------|--------------|---------|----------|
+| **纯 LRU** | ⭐⭐（批量扫描污染严重） | 低 | 中 |
+| **纯 LFU** | ⭐⭐⭐（历史污染） | 中 | 中高 |
+| **LFU-Aging** | ⭐⭐⭐⭐（利用文件系统元信息即可实现） | 中 | 高 |
+| **W-TinyLFU** | ⭐⭐⭐⭐⭐（Caffeine 同款最优） | 高（需引入计数草图） | 最高 |
+
+**推荐分阶段演进**：
+- 短期：LFU-Aging（文件 xattr + atime），50 行代码即可
+- 长期：如需迁移到 Redis/内存缓存，切换到 W-TinyLFU（引入 `tiny-lfu` npm 包）
+
+---
+
+## 32. 同义词环 cluster 拆分与业务反馈
+
+### 32.1 同义词环检测后的处理：不仅仅是报错
+
+第 23 章的 DFS 环检测发现环后，应**自动拆分 cluster** 而非直接拒绝加载。
+
+同义词词典的图结构中，一个环是一个 **Strongly Connected Component（SCC，强连通分量）**。对每个 SCC：
+
+```
+1. 用 Tarjan / Kosaraju 算法找出所有 SCC
+2. 对每个 SCC：
+   a. 如果大小 = 1（单个节点无自环）→ 正常
+   b. 如果大小 > 1（真实环）：
+      i. 收集业务反馈（各词在搜索日志中的点击量、曝光量）
+      ii. 选点击量最高的词作为「主词」
+      iii. 切断环内其他词指向主词的反向边（只保留主词 → 其他词）
+      iv. 打 warn 日志记录自动拆分决策
+```
+
+### 32.2 业务反馈数据源
+
+Wiki.js 目前**没有搜索行为日志**，但可以定义以下反馈信号：
+
+| 反馈信号 | 获取方式 | 用途 |
+|---------|---------|------|
+| 搜索曝光量 | 记录 `PageQuery.search` 调用参数 | 哪些词被搜得多 |
+| 搜索点击率 | 前端埋点：搜索结果点击事件 | 哪些词的结果被用户实际点开 |
+| 页面浏览量 | `pageViews` 表（如果存在）或 access log | 同义词目标页面的热度 |
+| 管理员标注 | 后台 UI 手工指定某词为主词 | 最高优先级，覆盖算法决策 |
+
+### 32.3 拆环示例
+
+同义词规则：
+```
+CPU, 中央处理器, 处理器    # 等价组（双向边，形成 SCC 大小=3）
+GPU → 图形处理器          # 单向替换
+```
+
+DFS 检测到 `CPU ↔ 中央处理器 ↔ 处理器 ↔ CPU` 是环。
+
+假设业务反馈：
+- 「CPU」搜索日志曝光量 10000 次，点击率 12%
+- 「中央处理器」曝光量 500 次，点击率 3%
+- 「处理器」曝光量 2000 次，点击率 5%
+
+算法选择「CPU」为主词，自动拆环为：
+```
+CPU → 中央处理器
+CPU → 处理器
+GPU → 图形处理器
+```
+环被打开为树结构，查询「中央处理器」展开为「CPU 中央处理器」，不会循环。
+
+### 32.4 演进建议
+
+1. 短期：先实现 DFS 环检测 + 报错 + 管理员手动修复
+2. 中期：增加搜索行为日志（曝光/点击），实现 SCC 检测 + 基于曝光量的自动拆环
+3. 长期：管理员 UI 可视化同义词图，标红 SCC 环，支持手动选主词/切边
+
+---
+
+## 33. 异步拦截 race condition
+
+### 33.1 当前搜索相关的异步 race condition 场景
+
+搜索链路中有多处异步操作存在竞态风险：
+
+#### 场景 1：页面更新 vs 索引更新（最严重）
+
+```
+pages.js:447                WIKI.events.outbound.emit('deletePageFromCache', page.hash)
+pages.js:452                await WIKI.data.searchEngine.updated(page)
+
+时间线：
+  T0: 用户 A 提交更新，开始事务
+  T1: DB UPDATE pages SET ...（事务提交）
+  T2: emit('deletePageFromCache')  ← 缓存失效事件
+  T3: await searchEngine.updated(page)  ← 开始调用 es
+  T4: 用户 B 搜索，es 仍返回旧版本（T3 还在传输中）
+  T5: es 写入完成
+  T6: 用户 C 搜索，返回新版本
+```
+
+**问题**：T4 时刻存在 **DB 已更新但搜索引擎未更新** 的不一致窗口。窗口大小 = 搜索引擎 RTT + 写入延迟（通常几十到几百毫秒，高负载时可达秒级）。
+
+#### 场景 2：rebuild 期间的增量更新冲突
+
+```
+管理员 T0: 触发 rebuildIndex() → 删除索引 → 流式重建（预计 10 分钟）
+用户 T1: 创建新页面 → searchEngine.created(page) → 写入新索引
+          ↑ 新文档可能在流式重建的不同阶段被覆盖或重复
+```
+
+**问题**：`rebuild()` 和 `created()/updated()` 同时写入同一索引，可能：
+- 流式重建先写 v1，增量更新写 v2，然后流式重建又覆盖回 v1
+- 同文档被写入两次
+
+#### 场景 3：权限组变更 vs 权限过滤
+
+```
+管理员 T0: 修改用户组的 pageRules
+管理员 T1: WIKI.events.outbound.emit('reloadGroups')
+          → 各节点 WIKI.auth.reloadGroups()（异步，无同步等待）
+用户 T2: 搜索 → PermissionInterceptor 仍用旧规则
+节点 A T3: reloadGroups 完成
+节点 B T4: reloadGroups 完成
+```
+
+**问题**：T2~T4 窗口不同节点权限规则不一致，同一用户在 A 节点可见的内容在 B 节点可能不可见。
+
+#### 场景 4：多节点 HA 的缓存失效广播
+
+```
+pages.js:447  WIKI.events.outbound.emit('deletePageFromCache', page.hash)
+              ↓ 事件总线广播到所有节点
+              ↓ 每个节点 subscribeToEvents() 接收
+              ↓ 各节点独立 deletePageFromCache(hash)
+```
+
+**问题**：节点网络抖动导致事件丢失时，该节点的缓存永远不失效，持续返回旧版本。当前无重试/确认机制。
+
+### 33.2 Race Condition 防护建议
+
+| 场景 | 防护策略 |
+|------|---------|
+| **DB ↔ 索引不一致** | ① 搜索结果中增加 `_version`（page.updatedAt），前端检测版本过旧时自动重试查询；② PermissionInterceptor 过滤后从 DB 二次校验关键页面 |
+| **rebuild + 增量更新冲突** | rebuild 期间 `created/updated/deleted` 写入临时队列，rebuild 完成后重放队列；或 rebuild 使用临时索引 + alias 原子切换 |
+| **权限组 reload 竞态** | 权限结果加 `groupsVersion` 号，reload 完成后原子自增，Interceptor 比较版本号决定是否等待 reload |
+| **缓存失效丢失** | 失效事件加递增 id，每个节点记录已处理到的最大 id，定期对账补齐 |
+| **通用防护** | 所有异步拦截（PermissionInterceptor.postQuery、缓存失效、索引更新）都应是**幂等**的，重复执行不产生错误结果 |
+
+### 33.3 幂等性实现要点
+
+- `searchEngine.updated(page)` 应使用 upsert（覆盖写）而非 append，重复调用 N 次结果一致
+- `deletePageFromCache(hash)` 重复删除同一路径无副作用
+- PermissionInterceptor 对同 results 数组过滤多次，结果相同（纯函数 filter）
+- 同义词展开对同 query 展开 N 次结果相同
+
+---
+
+## 34. 最终补充关键代码坐标
+
+| 关注点 | 文件 : 行号 |
+|--------|-------------|
+| checkAccess 三层 RBAC 主逻辑 | `server/core/auth.js:221-295` |
+| _applyPageRuleSpecificity 规则优先级算法 | `server/core/auth.js:368-388` |
+| getEffectivePermissions 页面权限聚合 | `server/core/auth.js:496-521` |
+| 默认权限 defaultPermissions/defaultPageRules | `server/app/data.yml:143-158` |
+| 全局权限字符串硬编码示例 | `server/core/auth.js:225,335,510-518` |
+| 页面更新 → 缓存失效 → 索引更新顺序 | `server/models/pages.js:447-452` |
+| es 6/7.x mapping boost 声明 | `server/modules/search/elasticsearch/engine.js:73-78` |
+| es 8.x query 层 fields boost 声明 | `server/modules/search/elasticsearch/engine.js:158` |
+| postgres setweight A/B/C 权重 | `server/modules/search/postgres/engine.js:109-112` |
+| algolia searchableAttributes 顺序权重 | `server/modules/search/algolia/engine.js:26-30` |
+| azure scoringProfiles fieldWeights | `server/modules/search/azure/engine.js:71-79` |
+| HA 多节点缓存失效事件订阅 | `server/models/pages.js:1166-1172` |
+| 权限组 reload 事件订阅 | `server/core/auth.js:479-481` |
+
+---
+
+## 35. 演进观察（最终完整汇总）
 
 1. **安全审计薄弱**：引擎切换、配置修改无审计日志；`query()` 错误仅打 warn 不抛异常，静默失败可能掩盖攻击。`level` 字段预留但未使用，缺少 provider 可信分级。
 2. **无超时控制**：所有搜索引擎调用均未设置超时，网络故障会长时间阻塞请求；搜索查询接口无 rate limit，可被滥用。
-3. **单引擎模型限制**：架构上不支持多引擎组合（如主搜+备搜、混合召回），查询失败时只能返回空结果，无占位回填。
-4. **排序/分页能力原始**：无自定义排序、无 tie-breaker、db 引擎完全无 ORDER BY、es 未设置 `preference`、无深度分页、totalHits 语义不统一。
-5. **同义词/查询重写缺失**：除 postgres 基础转义外，无查询理解层（QUL）；未考虑同义词环检测。
-6. **权限过滤重复代码**：6 处 resolver 重复相同的 `_.filter + checkAccess` 模式，未抽出统一拦截器；provider 内部无 RLS 下推，召回集浪费严重。
-7. **缓存与索引不一致风险**：页面渲染缓存与搜索引擎索引是两套独立失效机制，无分布式事务保证；页面缓存无 eviction（无限增长）、无 TTL、无 LRU/LFU。
-8. **字段映射无集中抽象**：各 provider 字段定义、权重声明、优先级策略硬编码且分散维护，es 6/7/8.x 三个分支存在权重声明重复与不一致风险。
-9. **结构化查询为零**：无 nested/has_child/聚合/范围查询能力；tags 字段仅 es 索引但未提供查询入口。
+3. **单引擎模型限制**：架构上不支持多引擎组合（如主搜+备搜、混合召回），查询失败时只能返回空结果，无占位回填；占位与真实结果合并的歧义未定义。
+4. **排序/分页能力原始**：无自定义排序、无 user-defined tie-breaker、db 引擎完全无 ORDER BY、es 未设置 `preference`、无深度分页、totalHits 语义不统一。
+5. **同义词/查询重写缺失**：除 postgres 基础转义外，无查询理解层（QUL）；未考虑同义词环检测、SCC 自动拆环、业务反馈驱动主词选择。
+6. **权限过滤重复代码**：6 处 resolver 重复相同的 `_.filter + checkAccess` 模式，未抽出统一拦截器；provider 内部无 RLS 下推，召回集浪费严重；权限字符串全库硬编码无常量定义。
+7. **缓存与索引不一致风险**：页面渲染缓存与搜索引擎索引是两套独立失效机制，无分布式事务保证；页面缓存无 eviction（无限增长）、无 TTL、无 LRU/LFU/LFU-Aging 策略。
+8. **字段映射无集中抽象**：各 provider 字段定义、权重声明、优先级策略硬编码且分散维护；es 6/7.x mapping boost 与 8.x query boost 存在双重乘冲突；跨 provider 同权重语义不对等导致换引擎排序剧变。
+9. **结构化查询为零**：无 nested/has_child/聚合/范围查询能力；tags 字段仅 es 索引但未提供查询入口；嵌套上限未暴露配置项。
 10. **Provider 注册非 Registry 模式**：扫描/加载/激活散落在单个 Model 文件中，无注册钩子、无生命周期管理、无版本控制。
+11. **RBAC 扩展点未利用**：pageRules 的 `_applyPageRuleSpecificity` 优先级算法可直接翻译为搜索引擎 filter，但目前仅用于后置过滤；无 `search:advanced` 等细粒度搜索权限。
+12. **异步竞态未防护**：DB ↔ 搜索引擎更新窗口、rebuild + 增量更新冲突、多节点权限 reload 不一致、HA 缓存失效事件丢失均存在 race condition；异步操作幂等性未显式保证。
