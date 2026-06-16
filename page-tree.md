@@ -1232,3 +1232,597 @@ render-page.js (worker job)
        ├─ 更新 pageLinks 反向索引
        └─ 生成 TOC
 ```
+
+---
+
+## 十八、truncate 重试退避
+
+### 18.1 rebuild-tree 本身无重试机制
+
+**文件**：`server/jobs/rebuild-tree.js`
+
+`rebuild-tree.js` 被整个 `try-catch` 包裹，但**没有任何重试逻辑**：
+
+```javascript
+try {
+  // ... 构建 tree 数组 ...
+  await WIKI.models.knex.table('pageTree').truncate()  // 无重试
+  // ... 分块插入 ...
+  WIKI.logger.info('Page tree rebuild: [ COMPLETED ]')
+} catch (err) {
+  WIKI.logger.error(err)
+  WIKI.logger.error('Page tree rebuild: [ FAILED ]')
+  process.exit(1)  // 直接退出 worker 进程
+}
+```
+
+如果 truncate 失败（如锁超时、连接断开），worker 进程直接退出码 1，**任务失败且不重试**。scheduler 会收到 `exit code !== 0` 的信号，调用 `reject(err)`，但不会自动重调度。
+
+### 18.2 数据库连接层的重试
+
+**文件**：`server/core/db.js:179-195`
+
+只有在系统启动时的初始数据库连接才有重试：
+
+```javascript
+try {
+  await self.knex.raw('SELECT 1 + 1;')
+} catch (err) {
+  if (conAttempts < 10) {
+    WIKI.logger.warn(`Will retry in 3 seconds... [Attempt ${++conAttempts} of 10]`)
+    await new Promise(resolve => setTimeout(resolve, 3000))  // 固定 3 秒间隔，无指数退避
+    await initTasks.connect()
+  } else {
+    throw err
+  }
+}
+```
+
+**连接重试特性**：
+- 固定间隔 3 秒，无指数退避
+- 最多 10 次尝试
+- 仅在启动时的初始连接使用，运行时连接断开不会自动重连
+
+### 18.3 手动恢复策略
+
+如果 rebuild-tree 失败，系统提供两种手动恢复方式：
+
+1. **GraphQL mutation**：`rebuildTree`（需 `manage:system` 权限）
+2. **重启系统**：启动时自动触发一次 rebuild-tree（`onInit: true`）
+
+没有自动重试的设计考量：
+- rebuild-tree 是幂等操作，失败了随时可以重试
+- 自动重试可能导致多个重建任务并发，反而加剧问题
+- 树数据不一致的影响相对可控（侧边栏显示异常，但页面仍可通过 URL 直接访问）
+
+---
+
+## 十九、自引用外键的递归深度
+
+### 19.1 应用层无递归深度限制
+
+**文件**：`server/jobs/rebuild-tree.js`
+
+树的深度由页面路径的分段数决定，**没有硬编码的最大深度限制**：
+
+```javascript
+for (const page of pages) {
+  const pagePaths = page.path.split('/')  // 拆分路径段
+  for (const part of pagePaths) {         // 遍历每一段
+    depth++                                // 深度递增
+    // ... 创建节点 ...
+  }
+}
+```
+
+理论上，如果有一个页面路径有 1000 段（虽然极其不现实），rebuild-tree 会创建 1000 层深度的节点。
+
+### 19.2 数据库层的自引用递归限制
+
+虽然应用层无限制，但数据库本身可能有递归查询限制：
+
+| 数据库 | 递归查询深度限制 | 说明 |
+|--------|----------------|------|
+| Postgres | 默认无限制 | `max_stack_depth` 控制递归深度 |
+| MySQL | 1000 层 | `cte_max_recursion_depth` 变量 |
+| SQL Server | 100 层 | `MAXRECURSION` 提示，默认 100 |
+| SQLite | 无明确限制 | 受内存和栈限制 |
+
+**重要**：Wiki.js **从未使用递归 CTE 查询** pageTree 表。所有查询都是单层 `WHERE parent = ?` 或 `WHERE path = ?`，因此数据库的递归深度限制不会成为问题。
+
+### 19.3 实际场景中的深度限制
+
+操作系统和文件系统的限制间接限制了路径深度：
+
+- **URL 长度限制**：大多数浏览器和服务器限制 URL 长度在 2000-8000 字符
+- **磁盘路径长度**：Linux 文件名最长 255 字节，路径总长通常无限制
+- **浏览器历史栈深度**：通常不限制，但极深路径影响 UX
+
+Wiki.js 的路径校验（`pages.js:242-249`）也间接限制了单段长度（不能包含 `.`、空格等），但没有显式的总长度或深度校验。
+
+### 19.4 潜在风险
+
+极深的路径（如 50+ 层）可能导致：
+
+1. **rebuild-tree 内存占用**：每一层都创建节点对象，极深路径会增加内存使用
+2. **页面选择器 UX 问题**：v-treeview 需要多次点击才能展开到深层
+3. **URL 冗长**：复制/分享不便
+
+---
+
+## 二十、MSSQL 自引用 CASCADE 不支持的兼容回退
+
+### 20.1 问题根源
+
+**文件**：`server/db/migrations/2.0.0.js:4-7`
+
+```javascript
+const dbCompat = {
+  selfCascadeDelete: WIKI.config.db.type !== 'mssql'
+}
+```
+
+SQL Server **不支持自引用外键的 CASCADE DELETE**。如果尝试创建这样的约束，MSSQL 会报错：
+
+```
+Introducing FOREIGN KEY constraint '...' on table 'pageTree' may cause cycles or multiple cascade paths.
+```
+
+MSSQL 认为 `parent → pageTree.id` 是一个潜在的循环引用路径，拒绝创建 CASCADE 约束。
+
+### 20.2 兼容回退方案
+
+**文件**：`server/db/migrations/2.0.0.js:304-309`
+
+```javascript
+.table('pageTree', table => {
+  if (dbCompat.selfCascadeDelete) {
+    table.integer('parent').unsigned().references('id').inTable('pageTree').onDelete('CASCADE')
+  } else {
+    table.integer('parent').unsigned()  // MSSQL: 只建普通整数列，无外键约束
+  }
+  table.integer('pageId').unsigned().references('id').inTable('pages').onDelete('CASCADE')
+})
+```
+
+**MSSQL 回退特性**：
+
+1. **无外键约束**：`parent` 列只是普通整数，没有引用完整性保证
+2. **无 CASCADE 删除**：删除父节点时，子节点的 `parent` 字段不会被自动清理
+3. **数据一致性依赖应用层**：完全由 rebuild-tree 的 `truncate + insert` 保证一致性
+
+### 20.3 为什么这个回退是安全的
+
+rebuild-tree 的工作方式使得这个回退几乎没有实际影响：
+
+1. **总是全量重建**：每次都是先 `truncate` 整张表，再 `insert` 所有节点。不存在「删除单个父节点」的操作场景。
+2. **CASCADE 从未被触发**：即使在 Postgres/MySQL 上，`parent` 的 CASCADE DELETE 约束也从未被实际触发过，因为从来不会 delete 单个节点。
+3. **外键仅作为文档**：在非 MSSQL 数据库上，外键更多是文档性质和额外的安全网，而非功能依赖。
+
+### 20.4 MSSQL 的其他兼容问题
+
+MSSQL 还有其他兼容性处理：
+
+```javascript
+// migrations/2.5.122.js:4-6
+const dbCompat = {
+  blobLength: (WIKI.config.db.type === `mysql` || WIKI.config.db.type === `mariadb`),  // MySQL 需要 LONGBLOB
+  charset: (WIKI.config.db.type === `mysql` || WIKI.config.db.type === `mariadb`)       // MySQL 需要 utf8mb4
+}
+```
+
+MSSQL 不需要这些特殊处理，使用标准的 `binary` 和数据库默认字符集。
+
+---
+
+## 二十一、虚拟文件夹命名规范
+
+### 21.1 路径校验规则
+
+**文件**：`server/models/pages.js:242-249`（创建时）、`680-692`（移动时）
+
+```javascript
+if (opts.path.includes('.') || opts.path.includes(' ') ||
+    opts.path.includes('\\') || opts.path.includes('//')) {
+  throw new WIKI.Error.PageIllegalPath()
+}
+if (opts.path.endsWith('/')) { opts.path = opts.path.slice(0, -1) }
+if (opts.path.startsWith('/')) { opts.path = opts.path.slice(1) }
+```
+
+**禁止的字符**：
+
+| 字符 | 禁止原因 |
+|------|----------|
+| `.` | 防止与文件扩展名混淆（`parsePath` 用 `.` 识别资源） |
+| 空格 | 防止 URL 编码问题和路径歧义 |
+| `\` | 防止 Windows 路径分隔符注入 |
+| `//` | 防止空路径段 |
+
+**自动清理**：
+- 开头的 `/` 自动去除
+- 结尾的 `/` 自动去除
+
+### 21.2 文件夹标题的生成规则
+
+**文件**：`server/jobs/rebuild-tree.js:40`
+
+```javascript
+title: isFolder ? part : page.title
+```
+
+虚拟文件夹的 `title` 直接取路径段的**原始文本**（`part` 变量），**不做任何转换**：
+
+1. **大小写敏感**：`API` 和 `api` 是不同的路径，生成两个不同的文件夹节点
+2. **保留特殊字符**：路径段中的 Unicode 字符、数字、连字符、下划线都原样保留
+3. **不做 slugify**：不会将中文自动转为拼音，不会将空格替换为连字符（因为路径校验已经禁止了空格）
+
+### 21.3 允许的路径段
+
+合法的路径段示例：
+
+| 路径 | 说明 |
+|------|------|
+| `docs/guide/install` | 标准 ASCII 路径 |
+| `文档/指南/安装` | 纯中文路径（完全支持） |
+| `api/v2/users` | 含版本号 |
+| `my-guide_2024/chapter-1` | 含下划线和连字符 |
+| `α/β/γ` | Unicode 希腊字母 |
+| `1/2/3` | 纯数字 |
+
+### 21.4 命名冲突的处理
+
+**大小写冲突**：`Docs/Guide` 和 `docs/guide` 会生成两个独立的文件夹树，因为 path 字段是大小写敏感的字符串比较。
+
+**同路径不同 locale**：通过 `localeCode` 区分，不会冲突。
+
+**节点升级冲突**：当页面路径恰好是另一页面的前缀时，节点会被升级为文件夹（同时保留 pageId），这是设计允许的行为，不是冲突。
+
+---
+
+## 二十二、history 快照存储成本
+
+### 22.1 快照数据结构
+
+**文件**：`server/db/migrations/2.0.0.js:115-131`
+
+```javascript
+.createTable('pageHistory', table => {
+  table.increments('id').primary()
+  table.string('path').notNullable()
+  table.string('hash').notNullable()
+  table.string('title').notNullable()
+  table.string('description')
+  table.boolean('isPrivate').notNullable().defaultTo(false)
+  table.boolean('isPublished').notNullable().defaultTo(false)
+  table.string('action').defaultTo('updated')
+  table.integer('pageId').unsigned()
+  table.text('content')           // 完整的原始内容，无压缩
+  table.string('contentType').notNullable()
+  table.string('createdAt').notNullable()
+})
+```
+
+### 22.2 存储成本分析
+
+**每次快照存储的内容**：
+
+| 字段 | 典型大小 | 是否冗余 |
+|------|----------|----------|
+| path | 50-200 字节 | 多次更新时重复存储 |
+| title | 10-100 字节 | 多次更新时重复存储 |
+| content | **1KB-1MB+** | 完整存储，无差异压缩 |
+| 其他元数据 | ~100 字节 | - |
+
+**无增量存储**：每次更新都保存完整的 `content` 副本，即使只修改了一个字。
+
+**无压缩**：`content` 字段是普通的 `TEXT` 类型，数据库层面可能做透明压缩（如 Postgres TOAST、MySQL InnoDB 页压缩），但应用层未做任何压缩。
+
+### 22.3 成本估算公式
+
+```
+总存储 = 页面数 × 平均每次更新内容大小 × 平均每页面更新次数 × 1.3（索引开销）
+```
+
+**典型场景估算**：
+
+| 场景 | 页面数 | 平均内容 | 更新次数 | 估算存储 |
+|------|--------|----------|----------|----------|
+| 小型 Wiki | 100 | 10 KB | 10 次 | ~13 MB |
+| 中型 Wiki | 1,000 | 20 KB | 50 次 | ~1.3 GB |
+| 大型 Wiki | 10,000 | 50 KB | 100 次 | **~65 GB** |
+
+### 22.4 pageHistoryTags 的额外开销
+
+**文件**：`server/db/migrations/2.0.0.js:258-263`
+
+```javascript
+.createTable('pageHistoryTags', table => {
+  table.integer('pageId').unsigned().references('id').inTable('pageHistory').onDelete('CASCADE')
+  table.integer('tagId').unsigned().references('id').inTable('tags').onDelete('CASCADE')
+})
+```
+
+- 每个历史版本的每个标签占用一行（约 16 字节 + 索引）
+- 每次 purgeHistory 时，通过 CASCADE 自动清理对应的标签关联
+
+### 22.5 存储成本的缓解措施
+
+1. **定期 purge**：通过 `purgeHistory(olderThan: "P90D")` 清理旧版本
+2. **关闭历史记录**：可以在配置中关闭（实际代码中未提供开关，但可以通过权限限制 `write:pages` 用户）
+3. **数据库压缩**：依赖数据库的透明压缩功能
+
+---
+
+## 二十三、回滚的部分恢复策略
+
+### 23.1 回滚是「全量恢复」
+
+**文件**：`server/graph/resolvers/page.js:576-608`
+
+```javascript
+async restore (obj, args, context) {
+  const targetVersion = await WIKI.models.pageHistory.getVersion({ ... })
+  await WIKI.models.pages.updatePage({
+    ...targetVersion,    // 展开完整的版本数据
+    id: targetVersion.pageId,
+    user: context.req.user,
+    action: 'restored'
+  })
+}
+```
+
+`restore` 操作是**全量恢复**——将目标版本的所有字段（path, title, description, content, contentType, isPrivate, isPublished, publishStartDate, publishEndDate 等）一次性应用到当前页面。
+
+### 23.2 「部分不恢复」的特例
+
+虽然设计上是全量恢复，但有两处硬编码的「部分不恢复」：
+
+**特例一：Tags 不恢复**
+
+**文件**：`server/models/pageHistory.js:148`
+
+```javascript
+return {
+  ...version,
+  updatedAt: version.createdAt || null,
+  tags: []  // 硬编码为空数组
+}
+```
+
+`getVersion` 方法总是返回 `tags: []`，导致回滚后页面的标签被清空。
+
+**原因分析**：历史标签存储在 `pageHistoryTags` 关联表中，但 `getVersion` 没有 join 这个表。可能是设计疏漏，也可能是有意为之（标签变化不视为内容变化）。
+
+**特例二：editorKey 映射变化**
+
+```javascript
+{
+  versionId: 'pageHistory.id',
+  editor: 'pageHistory.editorKey',  // 字段重命名
+  locale: 'pageHistory.localeCode'
+}
+```
+
+`editorKey` 被重命名为 `editor`，但 `updatePage` 期望的是 `editorKey` 字段。如果 `updatePage` 内部使用 `opts.editorKey`，这个字段会是 `undefined`，可能导致编辑器类型被重置为默认值。
+
+### 23.3 路径恢复的限制
+
+回滚时的路径恢复不是原子操作：
+
+1. `getVersion` 返回历史版本的 `path`（快照时的路径）
+2. `updatePage` 检测到 `opts.path !== currentPage.path`，调用 `movePage`
+3. `movePage` 检查目标路径是否已被占用
+4. 如果已占用，抛出 `PagePathCollision`，回滚失败
+
+这意味着：如果页面被移动后，旧路径被另一个页面占用，就无法回滚到旧版本（因为路径冲突）。
+
+### 23.4 部分恢复的实现思路
+
+当前代码不支持细粒度的部分恢复（如「只恢复内容不恢复标题」）。如果需要，可以通过以下方式扩展：
+
+1. 在 `restore` mutation 中增加可选参数，指定要恢复的字段
+2. 只展开 `targetVersion` 中指定的字段到 `updatePage`
+3. 但 `updatePage` 本身的设计假设传入完整数据，需要调整
+
+---
+
+## 二十四、purgeHistory 审计
+
+### 24.1 权限控制
+
+**文件**：`server/graph/schemas/page.graphql:163-165`
+
+```graphql
+purgeHistory (
+  olderThan: String!
+): DefaultResponse @auth(requires: ["manage:system"])
+```
+
+只有拥有 `manage:system` 权限的用户（系统管理员）才能调用 purgeHistory。
+
+### 24.2 操作实现
+
+**文件**：`server/graph/resolvers/page.js:612-620`
+
+```javascript
+async purgeHistory (obj, args, context) {
+  try {
+    await WIKI.models.pageHistory.purge(args.olderThan)
+    return {
+      responseResult: graphHelper.generateSuccess('Page history purged successfully.')
+    }
+  } catch (err) {
+    return graphHelper.generateError(err)
+  }
+}
+```
+
+**关键缺失**：
+
+1. **无审计日志**：没有记录「谁执行了 purge、在什么时间、删除了多少条记录」
+2. **无操作前备份**：直接 DELETE，不可逆
+3. **无确认机制**：mutation 没有 `confirm: true` 参数或二次确认
+4. **无影响范围预览**：无法先查询「将删除多少条记录、哪些页面的历史」再执行
+
+### 24.3 purge 实际执行的 SQL
+
+**文件**：`server/models/pageHistory.js:238-242`
+
+```javascript
+static async purge (olderThan) {
+  const dur = Duration.fromISO(olderThan)
+  const olderThanISO = DateTime.utc().minus(dur)
+  await WIKI.models.pageHistory.query().where('versionDate', '<', olderThanISO.toISO()).del()
+}
+```
+
+生成的 SQL 大致是：
+
+```sql
+DELETE FROM "pageHistory" WHERE "versionDate" < '2024-01-01T00:00:00.000Z';
+```
+
+`pageHistoryTags` 表中的关联记录通过 `onDelete('CASCADE')` 自动清理。
+
+### 24.4 潜在风险
+
+1. **误操作无法恢复**：管理员误操作 purge 了过短的时间窗口（如 `P1D` 而非 `P90D`），所有昨天及之前的历史版本永久丢失
+2. **无法审计追责**：如果 purge 被恶意执行，无法追溯操作者和时间
+3. **长事务锁表**：如果 pageHistory 表很大（百万行级），DELETE 可能持锁很长时间，阻塞其他操作
+4. **无进度反馈**：purge 是同步执行的，大表删除可能超时
+
+### 24.5 审计改进建议
+
+生产环境建议增加以下审计措施：
+
+1. **操作日志**：在执行 purge 前写入审计日志，记录 userId、timestamp、olderThan 参数
+2. **影响预览**：先执行 `count()` 返回将删除的记录数，让用户确认
+3. **软删除**：增加 `isPurged` 标记，而非物理删除
+4. **定期自动 purge**：通过 cron job 定期执行，避免人工误操作
+
+---
+
+## 二十五、CASCADE 级联深度限制
+
+### 25.1 数据库级联链分析
+
+让我们梳理 Wiki.js 中所有的 CASCADE 删除关系：
+
+#### pageTree 表
+```
+pages.id ──CASCADE──→ pageTree.pageId
+```
+- 深度：**1 层**
+- 说明：删除页面时，pageTree 中对应的行被自动删除（但 rebuild-tree 会重建，所以不重要）
+
+#### pageLinks 表
+```
+pages.id ──CASCADE──→ pageLinks.pageId
+```
+- 深度：**1 层**
+- 说明：删除页面时，该页面引用的所有链接记录被自动删除
+
+#### pageHistory 表
+```
+users.id ──→ pageHistory.authorId  (无 CASCADE)
+editors.key ──→ pageHistory.editorKey  (无 CASCADE)
+```
+- 无 CASCADE 删除，删除用户不会级联删除其编辑的历史版本
+
+#### pageHistoryTags 表
+```
+pageHistory.id ──CASCADE──→ pageHistoryTags.pageId
+tags.id ──CASCADE──→ pageHistoryTags.tagId
+```
+- 深度：**2 层**（pages → pageHistory → pageHistoryTags）
+- 说明：删除页面 → 删除 pageHistory → 删除 pageHistoryTags
+
+#### pageTags 表
+```
+pages.id ──CASCADE──→ pageTags.pageId
+tags.id ──CASCADE──→ pageTags.tagId
+```
+- 深度：**1 层**
+
+#### userGroups 表
+```
+users.id ──CASCADE──→ userGroups.userId
+groups.id ──CASCADE──→ userGroups.groupId
+```
+- 深度：**1 层**
+
+#### commentProviders 等其他表
+均为单层 CASCADE 或无 CASCADE。
+
+### 25.2 最长级联链
+
+整个数据库中最长的 CASCADE 删除链是 **2 层**：
+
+```
+pages.id
+    ↓ CASCADE
+pageHistory.id
+    ↓ CASCADE
+pageHistoryTags
+```
+
+当删除一个页面时：
+1. `pages.id` CASCADE 删除 `pageHistory` 中所有 `pageId` 匹配的行
+2. `pageHistory.id` CASCADE 删除 `pageHistoryTags` 中所有 `pageId` 匹配的行
+
+### 25.3 级联深度限制
+
+各数据库的级联删除深度限制：
+
+| 数据库 | 级联深度限制 | 说明 |
+|--------|------------|------|
+| Postgres | 无明确限制 | 受 `max_stack_depth` 间接限制 |
+| MySQL | 15 层 | 超过时报错 "Too many tables in cascade delete" |
+| SQL Server | 无明确限制 | 受事务日志和锁超时限制 |
+| SQLite | 无明确限制 | 受内存限制 |
+
+Wiki.js 的最长级联链是 2 层，**远低于所有数据库的限制**，不存在级联深度超限问题。
+
+### 25.4 CASCADE 与 pageTree 自引用
+
+如前所述，pageTree 的自引用外键：
+
+```
+pageTree.id ──CASCADE──→ pageTree.parent
+```
+
+在 MSSQL 上被禁用（见第二十章），在其他数据库上启用但**从未实际触发**，因为：
+1. 从未单独删除某个 pageTree 节点（总是 truncate 整表）
+2. truncate 不触发 CASCADE（truncate 是 DDL，不是 DML DELETE）
+
+因此这个自引用 CASCADE 只是"摆设"，不构成实际的级联链。
+
+### 25.5 pageTree.parent 的 CASCADE 触发场景
+
+理论上，以下操作会触发自引用 CASCADE（仅非 MSSQL）：
+
+```sql
+DELETE FROM "pageTree" WHERE id = 123;  -- 假设 id=123 有子节点
+```
+
+但 Wiki.js 的代码中**从来不会执行这样的 DELETE**。所有 pageTree 表的修改都是：
+- `truncate()` → 全表清空，不触发 CASCADE
+- `insert()` → 批量插入
+
+因此，这个自引用 CASCADE 约束更多是防御性设计，防止手动操作数据库时留下孤儿节点。
+
+---
+
+## 二十六、深度风险总结
+
+| 风险点 | 严重程度 | 影响范围 | 触发条件 |
+|--------|----------|----------|----------|
+| rebuild-tree 失败无重试 | 中 | 侧边栏、页面选择器 | 数据库锁冲突、网络闪断 |
+| movePage 无乐观锁 | 中 | 页面内容 | 两个用户同时编辑同一页面 |
+| reconnectLinks 字符串匹配失败 | 高 | 所有内部链接 | 渲染管线修改了 HTML 结构 |
+| 大目录 treeview 性能 | 中 | 前端交互 | 单目录 1000+ 节点 |
+| purgeHistory 无审计 | 高 | 历史版本 | 管理员误操作、账号泄露 |
+| 回滚不恢复 tags | 中 | 页面标签 | 任何回滚操作 |
+| MSSQL 无自引用外键 | 低 | pageTree 数据一致 | 手动操作数据库误删除 |
+| 级联深度超限 | 无 | - | 不可能触发 |
