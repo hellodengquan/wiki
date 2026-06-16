@@ -1826,3 +1826,741 @@ DELETE FROM "pageTree" WHERE id = 123;  -- 假设 id=123 有子节点
 | 回滚不恢复 tags | 中 | 页面标签 | 任何回滚操作 |
 | MSSQL 无自引用外键 | 低 | pageTree 数据一致 | 手动操作数据库误删除 |
 | 级联深度超限 | 无 | - | 不可能触发 |
+
+---
+
+## 二十七、2 层级联未来扩展上限
+
+### 27.1 当前级联链拓扑
+
+当前所有 CASCADE 删除链的最大深度为 2 层：
+
+```
+pages.id ──CASCADE──→ pageHistory.id ──CASCADE──→ pageHistoryTags.id
+pages.id ──CASCADE──→ pageTree.pageId                    (1 层)
+pages.id ──CASCADE──→ pageLinks.pageId                   (1 层)
+pages.id ──CASCADE──→ pageTags.pageId                    (1 层)
+pages.id ──应用层──→ comments.pageId                     (beforeDelete 手动删除)
+```
+
+### 27.2 扩展上限分析
+
+如果未来添加新功能，可能的级联扩展方向：
+
+| 拟议功能 | 新级联链 | 深度 | MySQL 上限 | 是否安全 |
+|----------|----------|------|-----------|----------|
+| 页面评论版本 | pages → comments → commentVersions | 2 层 | 15 | 安全 |
+| 页面子任务 | pages → pageSubtasks → subtaskHistory | 2 层 | 15 | 安全 |
+| 多级 pageTree | pageTree.id → pageTree.parent (自引用) | N 层 | 15 | **有风险** |
+| 页面模板实例化 | pages → pageTemplates → templateParams | 2 层 | 15 | 安全 |
+| 审计日志链 | pages → pageAuditLog → auditDiff | 2 层 | 15 | 安全 |
+
+**关键结论**：只要级联链不引入自引用循环，2-3 层的深度在所有支持的数据库上都是安全的。
+
+### 27.3 自引用级联的扩展风险
+
+如果未来让 pageTree 支持增量更新（而非全量重建），需要单独删除节点，这时自引用 CASCADE 会被真正触发：
+
+```
+pageTree.id = 1 (docs/)
+  └─ pageTree.parent = 1 → id = 2 (docs/guide)
+       └─ pageTree.parent = 2 → id = 3 (docs/guide/intro)
+            └─ ...
+```
+
+删除根节点 `id=1` 会级联删除整棵子树。深度取决于树的实际层级数。MySQL 15 层限制意味着**路径深度不能超过 15 段**（`a/b/c/.../o`），否则 CASCADE DELETE 会报错。
+
+**缓解措施**：
+
+1. 增量更新时不用 CASCADE，而是应用层递归删除（如 `WITH RECURSIVE` 查询）
+2. 或者继续使用全量重建策略，避开单行 DELETE
+3. 设置 `depth` 字段上限，如 `CHECK (depth <= 10)`
+
+---
+
+## 二十八、purgeHistory 权限分级
+
+### 28.1 当前权限设计
+
+**文件**：`server/graph/schemas/page.graphql:163-165`
+
+```graphql
+purgeHistory (
+  olderThan: String!
+): DefaultResponse @auth(requires: ["manage:system"])
+```
+
+purgeHistory 仅允许 `manage:system` 权限，这是最高级别权限，等同于超级管理员。
+
+### 28.2 权限分级现状对比
+
+| 操作 | 权限要求 | 最低角色 |
+|------|----------|----------|
+| restore (回滚) | `write:pages`, `manage:pages`, `manage:system` | 页面编辑者 |
+| delete (删除页面) | `delete:pages` | 页面删除者 |
+| purgeHistory (清理历史) | `manage:system` | **仅超级管理员** |
+| rebuildTree (重建树) | `manage:system` | **仅超级管理员** |
+| flushCache (清缓存) | `manage:system` | **仅超级管理员** |
+
+### 28.3 权限分级建议
+
+当前设计是合理的——purgeHistory 是不可逆的全局操作，应该限制在最高权限。但如果需要更细粒度的控制，可以考虑：
+
+**方案一：按页面级别授权**
+
+```graphql
+purgeHistory (
+  olderThan: String!
+  pageId: Int          # 可选，指定页面
+  locale: String       # 可选，指定语言
+): DefaultResponse @auth(requires: ["manage:pages", "manage:system"])
+```
+
+- `manage:pages` 权限可以 purge 指定页面的历史
+- `manage:system` 权限可以 purge 全部历史（不传 pageId）
+- 这样内容管理员可以清理特定页面的旧版本，而不需要系统管理员权限
+
+**方案二：按时间窗口分级**
+
+```graphql
+purgeHistory (
+  olderThan: String!   # ISO 8601 duration
+  maxAge: String = "P30D"  # 限制最大清理窗口
+): DefaultResponse @auth(requires: ["manage:pages", "manage:system"])
+```
+
+- `manage:pages` 只能清理 `P90D`（90天）以上的数据
+- `manage:system` 可以清理任意时间窗口
+- 防止低权限用户误删近期历史
+
+**方案三：审批流程**
+
+purge 操作标记为 `pending`，需要另一个管理员审批后才执行。适用于合规要求严格的场景。
+
+### 28.4 auth 指令的实现约束
+
+**文件**：`server/graph/directives/auth.js:33-48`
+
+当前 `@auth` 指令只支持简单的 OR 语义（拥有任一列出的权限即可通过）：
+
+```javascript
+if (!_.some(context.req.user.permissions, pm => _.includes(requiredScopes, pm))) {
+  throw new Error('Forbidden')
+}
+```
+
+不支持 AND 语义或条件组合（如 "拥有 manage:pages 且不拥有 manage:system 时只能清理 90 天以上"），这些逻辑需要在 resolver 内部实现。
+
+---
+
+## 二十九、风险总结表的监控指标
+
+### 29.1 现有遥测系统
+
+**文件**：`server/core/telemetry.js`
+
+Wiki.js 的遥测系统目前只收集基础设施指标（版本、平台、CPU、RAM、数据库类型），**不收集任何运行时性能指标**：
+
+```javascript
+variables: {
+  version: WIKI.version,
+  platform,
+  os: osname,
+  architecture: arch,
+  dbType: WIKI.config.db.type.toUpperCase(),
+  dbVersion,
+  nodeVersion: process.version.substr(1),
+  cpuCores: os.cpus().length,
+  ramMBytes: Math.round(os.totalmem() / 1024 / 1024),
+  clientId: WIKI.config.telemetry.clientId,
+  event: eventType
+}
+```
+
+`sendEvent` 和 `sendError` 方法都是空实现（`// TODO`）。
+
+### 29.2 建议的监控指标
+
+针对风险总结表中的每个风险，建议增加以下监控指标：
+
+| 风险点 | 监控指标 | 采集方式 | 告警阈值 |
+|--------|----------|----------|----------|
+| rebuild-tree 失败无重试 | rebuild-tree 执行成功率/耗时 | worker 进程 exit code + 执行时长 | 连续 2 次失败或单次 > 30s |
+| movePage 无乐观锁 | 并发编辑冲突率 | `checkConflicts` 返回 true 的频率 | > 5% 的编辑操作 |
+| reconnectLinks 匹配失败 | REPLACE 影响 rows=0 的比例 | `knex.raw(REPLACE)` 返回 affectedRows | > 10% 的 reconnectLinks 调用 |
+| 大目录 treeview 性能 | 单目录节点数 | tree 查询返回数组长度 | > 500 节点 |
+| purgeHistory 无审计 | purge 调用记录 | resolver 入口记录 userId + args | 任何调用 |
+| 回滚不恢复 tags | 回滚后 tags 变化 | updatePage 前后 tags 对比 | 回滚后 tags 不为空时 |
+| MSSQL 无自引用外键 | pageTree 孤儿节点数 | 定期查询 `parent NOT IN (SELECT id FROM pageTree)` | > 0 |
+| 级联深度超限 | 页面路径最大深度 | rebuild-tree 中 `depth` 最大值 | > 10 |
+
+### 29.3 采集实现方案
+
+**方案：在 rebuild-tree 中嵌入指标**
+
+```javascript
+// rebuild-tree.js 追加
+const metrics = {
+  totalPages: pages.length,
+  totalNodes: tree.length,
+  maxDepth: _.maxBy(tree, 'depth')?.depth || 0,
+  orphanNodes: 0,
+  durationMs: 0
+}
+
+const startTime = Date.now()
+// ... 现有逻辑 ...
+metrics.durationMs = Date.now() - startTime
+
+WIKI.logger.info(`Page tree rebuild metrics: ${JSON.stringify(metrics)}`)
+```
+
+**方案：在 resolver 中嵌入指标**
+
+```javascript
+// page.js resolver 追加
+async purgeHistory (obj, args, context) {
+  WIKI.logger.warn(`purgeHistory called by user ${context.req.user.id}, olderThan: ${args.olderThan}`)
+  // ... 现有逻辑 ...
+}
+```
+
+### 29.4 导出方式
+
+| 方式 | 适用场景 | Wiki.js 现有支持 |
+|------|----------|-----------------|
+| Prometheus metrics | Kubernetes 部署 | 不支持，需新增 `/metrics` 端点 |
+| WIKI.logger | 单机部署 | 支持，但格式不统一 |
+| 事件总线 | HA 多实例 | `WIKI.events.outbound.emit` 已有，但仅用于缓存同步 |
+| 数据库表 | 持久化审计 | 需新增 `auditLog` 表 |
+
+---
+
+## 三十、CASCADE schema 演化
+
+### 30.1 迁移历史中的 CASCADE 变化
+
+**初始版本 2.0.0**（`server/db/migrations/2.0.0.js`）
+
+建立所有基础表和外键关系：
+
+```
+pages.id ──CASCADE──→ pageHistoryTags.pageId (via pageHistory)
+pages.id ──CASCADE──→ pageTags.pageId
+pages.id ──CASCADE──→ pageLinks.pageId
+pages.id ──CASCADE──→ pageTree.pageId
+pageTree.id ──CASCADE──→ pageTree.parent (非 MSSQL)
+tags.id ──CASCADE──→ pageHistoryTags.tagId
+tags.id ──CASCADE──→ pageTags.tagId
+users.id ──CASCADE──→ userGroups.userId
+groups.id ──CASCADE──→ userGroups.groupId
+```
+
+**注意**：`pageHistory.pageId` **没有** CASCADE DELETE。删除页面时，pageHistory 中的记录不会被自动删除。这是有意为之——历史记录应永久保留。
+
+### 30.2 beforeDelete 手动级联
+
+**文件**：`server/models/pages.js:130-133`
+
+```javascript
+static async beforeDelete({ asFindQuery }) {
+  const page = await asFindQuery().select('id')
+  await WIKI.models.comments.query().delete().where('pageId', page[0].id)
+}
+```
+
+comments 表的 `pageId` 外键**没有** CASCADE DELETE（`migrations/2.0.0.js:286`），而是通过 Objection.js 的 `beforeDelete` 钩子在应用层手动删除。
+
+**原因**：comments 表可能在 pageHistory 之前创建，或者开发者希望对评论删除有更精细的控制（如发送通知）。
+
+### 30.3 迁移版本 2.3.23（`server/db/migrations/2.3.23.js`）
+
+```javascript
+exports.up = knex => {
+  return knex.schema
+    .alterTable('pageTree', table => {
+      table.json('ancestors')
+    })
+}
+```
+
+新增 `ancestors` 字段，不涉及 CASCADE 变更。这次迁移反映了树查询的性能优化——将祖先链从运行时计算改为预存储。
+
+### 30.4 迁移版本 2.2.17（`server/db/migrations/2.2.17.js`）
+
+新增 `versionDate` 字段到 `pageHistory` 表，并用复杂 SQL 回填历史数据：
+
+```javascript
+// Postgres
+sqlVersionDate = 'UPDATE "pageHistory" h1 SET "versionDate" = COALESCE(
+  (SELECT prev."createdAt" FROM "pageHistory" prev
+   WHERE prev."pageId" = h1."pageId" AND prev.id < h1.id
+   ORDER BY prev.id DESC LIMIT 1), h1."createdAt")'
+```
+
+这次迁移不涉及 CASCADE 变更，但增加了 pageHistory 的功能复杂度。新增的 `versionDate` 字段后来被 `purge` 方法使用作为清理条件。
+
+### 30.5 演化趋势
+
+| 版本 | CASCADE 变更 | 方向 |
+|------|-------------|------|
+| 2.0.0 | 建立基础 CASCADE 体系 | 初始 |
+| 2.2.17 | 无 CASCADE 变更，增加 versionDate | 功能扩展 |
+| 2.3.23 | 无 CASCADE 变更，增加 ancestors | 性能优化 |
+| 2.4.13 | 无 CASCADE 变更，增加 extra JSON 字段 | 功能扩展 |
+
+**趋势**：CASCADE 体系在 2.0.0 之后基本稳定，后续迁移主要是字段扩展而非关系变更。这表明初始设计相对成熟，但缺乏对级联行为演化的考虑——如果未来需要调整 CASCADE 策略，需要编写专门的迁移脚本。
+
+### 30.6 降级迁移的缺失
+
+**所有迁移文件的 `exports.down` 都是空函数**：
+
+```javascript
+exports.down = knex => { }
+```
+
+这意味着一旦执行了迁移，就无法通过 knex migrate:rollback 回退。CASCADE 约束的变更（如从 CASCADE 改为 SET NULL）也无法通过回退恢复。
+
+---
+
+## 三十一、MySQL 15 层级联与优化器影响
+
+### 31.1 MySQL 级联深度限制
+
+MySQL 文档明确限制 CASCADE DELETE 的级联深度为 15 层：
+
+> "InnoDB allows up to 15 levels of cascading delete."
+
+超过 15 层时报错：
+
+```
+ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails
+```
+
+或运行时报错：
+
+```
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+```
+
+### 31.2 对 Wiki.js 的影响
+
+当前最长级联链为 2 层，**远低于 15 层限制**，不受影响。
+
+但 MySQL 的级联操作还有另一个优化器层面的影响：
+
+**InnoDB 锁升级**：CASCADE DELETE 在 InnoDB 中会对每一层受影响的行加行锁。如果级联链上有大量行，锁的数量可能很大：
+
+```
+DELETE FROM pages WHERE id = 123;
+  → 锁定 pageHistory 中 N 条记录
+    → 锁定 pageHistoryTags 中 M 条记录
+  → 锁定 pageLinks 中 L 条记录
+  → 锁定 pageTree 中 K 条记录
+  → 锁定 pageTags 中 J 条记录
+```
+
+一个热门页面可能有数百条历史版本和数千条链接引用。删除它可能同时锁定数千行，增加锁冲突概率。
+
+### 31.3 优化器执行计划影响
+
+MySQL 优化器在处理 CASCADE DELETE 时，执行计划可能不如手动 DELETE 高效：
+
+| 方式 | 执行计划 | 锁粒度 |
+|------|----------|--------|
+| CASCADE DELETE | 优化器自动选择索引，可能选择非最优索引 | 逐行锁定 |
+| 手动分表 DELETE | 可以精确控制执行顺序和索引 | 可使用 LIMIT 分批 |
+
+**实际表现**：在 Wiki.js 中，`deletePage` 方法使用 `pages.query().delete().where('id', page.id)`，触发 `beforeDelete` 钩子手动删除 comments，其余依赖 CASCADE。这种混合方式在 MySQL 上的锁行为如下：
+
+1. `beforeDelete` → 手动 DELETE comments → 加行锁
+2. `pages.query().delete()` → 删除 pages 行 → CASCADE 触发
+3. CASCADE → 依次删除 pageHistory, pageLinks, pageTree, pageTags → 每个表加行锁
+4. pageHistory CASCADE → 删除 pageHistoryTags → 加行锁
+
+### 31.4 MySQL 特定优化建议
+
+1. **分批删除**：在 `deletePage` 中先手动删除关联数据，再删除 pages 行，减少单次事务锁范围
+2. **临时禁用 FK 检查**：`SET FOREIGN_KEY_CHECKS = 0` 可以临时禁用级联，但需要手动保证数据一致性
+3. **使用事务**：将 deletePage 包裹在显式事务中，确保原子性
+4. **增加死锁重试**：MySQL 级联删除在高并发下可能死锁，需要应用层重试
+
+---
+
+## 三十二、reconnectLinks 与渲染抽象层
+
+### 32.1 渲染管线架构
+
+**文件**：`server/modules/rendering/`
+
+Wiki.js 的渲染管线采用**管道（Pipeline）模式**，分为 PRE 和 POST 两个阶段：
+
+```
+输入内容 (Markdown/AsciiDoc/HTML)
+    │
+    ▼
+┌─ PRE 阶段 ─────────────────────────┐
+│ markdown-core → markdown-emoji →   │
+│ markdown-katex → markdown-tasklists │
+│ ... 更多 markdown 插件              │
+└────────────────────────────────────┘
+    │
+    ▼ HTML 中间产物
+┌─ html-core ────────────────────────┐
+│ cheerio 解析 → 链接检测/标注 →     │
+│ 链接有效性验证 → pageLinks 更新 →  │
+│ header slug 生成                    │
+└────────────────────────────────────┘
+    │
+    ▼ HTML 中间产物
+┌─ POST 阶段 ────────────────────────┐
+│ html-security (DOMPurify) →        │
+│ html-codehighlighter →             │
+│ html-mermaid → html-tabset →       │
+│ ... 更多 html 插件                  │
+└────────────────────────────────────┘
+    │
+    ▼ 最终 HTML 输出 → 存入 pages.render
+```
+
+**关键**：`html-core` 是必经阶段，在 PRE 和 POST 之间执行。链接标注在 html-core 中完成，但 DOMPurify（html-security）在 POST 阶段执行，**可能修改 html-core 输出的 HTML 结构**。
+
+### 32.2 链接标注与 DOMPurify 的交互
+
+**html-core/renderer.js:43-126** 标注链接：
+
+```javascript
+$('a').each((i, elm) => {
+  // 添加 CSS 类
+  $(elm).addClass(`is-internal-link`)   // 或 is-external-link, is-system-link, is-asset-link
+  // ...
+})
+// 后续验证
+$('a.is-internal-link').each((i, elm) => {
+  $(elm).addClass(`is-valid-page`)      // 或 is-invalid-page
+})
+```
+
+**html-security/renderer.js:5-42** 清洗 HTML：
+
+```javascript
+input = DOMPurify.sanitize(input, {
+  ADD_ATTR: ['v-pre', 'v-slot:tabs', 'v-slot:content', 'target'],
+  ADD_TAGS: ['tabset', 'template']
+})
+```
+
+DOMPurify 默认**保留** `class` 属性和 `<a>` 标签，因此 `is-internal-link is-valid-page` 等 CSS 类不会被清除。但如果 DOMPurify 的配置改变了（如添加更严格的标签/属性白名单），reconnectLinks 的字符串匹配可能失效。
+
+### 32.3 reconnectLinks 的耦合层级
+
+reconnectLinks 对渲染输出有以下假设：
+
+| 假设 | 依赖位置 | 脆弱性 |
+|------|----------|--------|
+| 内部链接有 `is-internal-link` 类 | html-core/renderer.js:114 | 低——CSS 类名是常量 |
+| 有效链接有 `is-valid-page` 类 | html-core/renderer.js:159 | 低——同上 |
+| `<a>` 标签的 `href` 和 `class` 属性顺序固定 | reconnectLinks 的 REPLACE 模式 | **高**——HTML 属性顺序不保证 |
+| `href` 在 `class` 之前 | `pages.js:893-897` | **高**——cheerio 输出顺序可能变 |
+
+### 32.4 抽象层改进方案
+
+**方案一：结构化链接存储**（推荐）
+
+不依赖 HTML 字符串匹配，而是在渲染时将链接信息存储到独立的 JSON 字段：
+
+```javascript
+// 渲染时
+page.linkMap = {
+  '/en/docs/guide': { type: 'internal', valid: true, targetPageId: 42 },
+  '/en/old-path':   { type: 'internal', valid: false },
+  'https://ext.com': { type: 'external' }
+}
+
+// reconnectLinks 时
+for (const [href, info] of Object.entries(page.linkMap)) {
+  if (info.type === 'internal' && info.valid && href === oldHref) {
+    info.valid = false  // 或更新 href
+  }
+}
+// 然后基于 linkMap 重新渲染链接部分
+```
+
+**方案二：使用 data-* 属性**
+
+在 `<a>` 标签上添加 `data-*` 属性存储结构化信息，reconnectLinks 通过 `data-page-id` 定位链接：
+
+```html
+<a href="/en/docs/guide" class="is-internal-link is-valid-page"
+   data-locale="en" data-path="docs/guide" data-page-id="42">
+```
+
+reconnectLinks 使用 `data-page-id` 精确定位，不再依赖字符串匹配。
+
+**方案三：延迟渲染链接状态**
+
+不在渲染时嵌入链接状态（`is-valid-page`/`is-invalid-page`），改为前端实时查询：
+
+```vue
+<a :class="{'is-internal-link': true, 'is-valid-page': linkValid}">
+```
+
+前端加载页面时，通过 API 批量检查链接有效性。这样 reconnectLinks 就不需要修改 render 字段了。
+
+---
+
+## 三十三、movePage 乐观锁补偿策略
+
+### 33.1 当前冲突检测机制
+
+**文件**：`server/graph/resolvers/page.js:354-368`
+
+```javascript
+async checkConflicts (obj, args, context, info) {
+  let page = await WIKI.models.pages.query()
+    .select('path', 'localeCode', 'updatedAt')
+    .findById(args.id)
+
+  if (page) {
+    if (WIKI.auth.checkAccess(context.req.user, ['write:pages', 'manage:pages'], {
+      path: page.path, locale: page.localeCode
+    })) {
+      return page.updatedAt > args.checkoutDate  // 比较时间戳
+    }
+  }
+}
+```
+
+前端编辑器在保存前调用 `checkConflicts`，传入 `checkoutDate`（用户开始编辑时的 `updatedAt` 值）。如果 `updatedAt > checkoutDate`，说明页面已被他人修改，存在冲突。
+
+### 33.2 乐观锁缺失位置
+
+| 方法 | 乐观锁 | 说明 |
+|------|--------|------|
+| `createPage` | 无 | 使用 `findOne` 检测重复，但无版本号 |
+| `updatePage` | 前端检查 | `checkConflicts` 仅前端调用，后端不强制 |
+| `movePage` | 无 | 无任何版本检查 |
+| `deletePage` | 无 | 无任何版本检查 |
+| `restore` | 无 | 回滚不检查当前版本是否已变更 |
+
+### 33.3 补偿策略设计
+
+**策略一：updatePage 增加乐观锁（最小改动）**
+
+在 `updatePage` 中增加 `expectedUpdatedAt` 参数：
+
+```javascript
+static async updatePage(opts) {
+  const page = await WIKI.models.pages.query().findById(opts.id)
+
+  // 乐观锁检查
+  if (opts.expectedUpdatedAt && page.updatedAt !== opts.expectedUpdatedAt) {
+    throw new WIKI.Error.PageConflictDetected()
+  }
+
+  // ... 现有逻辑 ...
+}
+```
+
+`$beforeUpdate` 钩子会自动更新 `updatedAt`（`pages.js:118-120`），因此下次冲突检查自然生效。
+
+**策略二：movePage 路径冲突重试**
+
+movePage 的 TOCTOU 竞态可以通过数据库唯一约束 + 重试解决：
+
+```javascript
+static async movePage(opts) {
+  const maxRetries = 3
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      // 现有逻辑
+      return
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY' || err.code === '23505') {  // MySQL/Postgres 唯一约束违反
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, 100 * (attempt + 1)))  // 简单退避
+          continue
+        }
+      }
+      throw err
+    }
+  }
+}
+```
+
+**策略三：CAS（Compare-And-Swap）模式**
+
+使用 Objection.js 的 `where` 条件实现原子 CAS：
+
+```javascript
+const updatedCount = await WIKI.models.pages.query()
+  .patch({
+    path: opts.destinationPath,
+    localeCode: opts.destinationLocale,
+    title: destinationTitle,
+    hash: destinationHash
+  })
+  .findById(page.id)
+  .where('updatedAt', page.updatedAt)  // CAS 条件
+
+if (updatedCount === 0) {
+  throw new WIKI.Error.PageConflictDetected()
+}
+```
+
+这种方式将冲突检测和更新合并为单个原子操作，消除了 TOCTOU 间隙。
+
+### 33.4 冲突恢复的 UI 流程
+
+当前前端在检测到冲突时提供两种选择：
+
+```javascript
+// page.js resolver:conflictLatest
+async conflictLatest (obj, args, context, info) {
+  let page = await WIKI.models.pages.getPageFromDb(args.id)
+  // 返回最新版本的内容，供用户比较
+}
+```
+
+前端展示当前版本和用户版本的 diff，用户选择覆盖或合并。但这个流程**仅在编辑器保存时触发**，movePage 和 deletePage 没有对应的冲突 UI。
+
+---
+
+## 三十四、大目录 treeview 虚拟滚动方案
+
+### 34.1 当前性能瓶颈
+
+**文件**：`client/components/common/page-selector.vue`、`client/themes/default/components/nav-sidebar.vue`
+
+当前使用 Vuetify 的 `v-treeview` 组件，**不支持虚拟滚动**：
+
+```vue
+v-treeview(
+  :items='tree'
+  :load-children='fetchFolders'
+  item-id='path'
+  item-text='title'
+)
+```
+
+每个展开的文件夹会将其所有子节点渲染为 DOM 元素。大目录下的性能问题：
+
+1. **DOM 节点过多**：1000 个节点 = ~3000 个 DOM 元素（每节点含 label, icon, toggle）
+2. **Vue 响应式开销**：每个节点都是响应式对象，修改触发全树 diff
+3. **无回收机制**：展开的节点不会被回收，内存持续增长
+
+### 34.2 虚拟滚动方案
+
+**方案一：vue-virtual-scroll-tree（推荐）**
+
+使用专门的虚拟滚动树组件替代 v-treeview：
+
+```
+┌─────────────────────────────┐
+│ 可视区域（仅渲染 20-30 行）   │
+│  📁 docs/                    │
+│  📄 installation             │
+│  📄 configuration            │
+│  📁 api/                     │
+│  📄 endpoints                │
+│  ...                         │
+├─────────────────────────────┤
+│ 缓冲区（上下各 5 行）         │
+├─────────────────────────────┤
+│ 虚拟空间（不渲染）           │
+│  ... (970 行)                │
+│                              │
+└─────────────────────────────┘
+```
+
+特性：
+- 固定行高（如 32px），通过 `scrollTop / lineHeight` 计算可见范围
+- 只渲染可视区域 + 缓冲区的节点
+- 展开/折叠通过修改数据源的 `expanded` 集合，而非 DOM 操作
+- 与懒加载兼容：滚动到未加载区域时触发 `load-children`
+
+**方案二：平铺列表 + 缩进模拟**
+
+将树结构平铺为列表，用缩进宽度表示层级：
+
+```
+0px   📁 docs/
+32px    📄 installation
+32px    📄 configuration
+32px    📁 api/
+64px      📄 endpoints
+```
+
+这种方式天然适合虚拟滚动（所有项等高），且不需要特殊的树组件。缺点是缩进需要通过 CSS `padding-left` 实现，展开/折叠需要修改数据源。
+
+**方案三：混合方案（按需展开 + 分页）**
+
+后端增加分页支持：
+
+```graphql
+tree(
+  parent: Int
+  mode: PageTreeMode!
+  locale: String!
+  limit: Int = 100      # 新增
+  offset: Int = 0       # 新增
+  search: String        # 新增：搜索过滤
+): PageTreeResponse     # 返回带分页信息
+```
+
+前端侧边栏只展示前 100 个节点 + "加载更多"按钮或滚动加载。搜索框过滤树节点，避免展开大目录。
+
+### 34.3 兼容性考虑
+
+| 方案 | Vue 2 兼容 | Vuetify 2 兼容 | 改动量 |
+|------|-----------|---------------|--------|
+| vue-virtual-scroll-tree | 需确认 | 需替换 v-treeview | 大 |
+| 平铺列表 + 缩进 | 兼容 | 可用 v-virtual-scroll | 中 |
+| 混合方案（分页+搜索） | 兼容 | 兼容 v-treeview | 小 |
+
+Wiki.js 使用 Vue 2 + Vuetify 2，Vuetify 2 的 `v-virtual-scroll` 组件支持固定高度列表虚拟滚动，但不支持树结构。因此**方案三（分页+搜索）是改动最小且向后兼容的选择**。
+
+### 34.4 后端分页改动
+
+```javascript
+// page.js resolver:tree 修改
+async tree (obj, args, context, info) {
+  const limit = args.limit || 100
+  const offset = args.offset || 0
+
+  const results = await WIKI.models.knex('pageTree')
+    .where(/* 现有条件 */)
+    .orderBy(/* 现有排序 */)
+    .limit(limit)
+    .offset(offset)
+
+  const total = await WIKI.models.knex('pageTree')
+    .where(/* 现有条件 */)
+    .count('* as count')
+    .first()
+
+  return {
+    items: results.filter(r => WIKI.auth.checkAccess(...)),
+    total: total.count,
+    hasMore: (offset + limit) < total.count
+  }
+}
+```
+
+---
+
+## 三十五、补充风险总结表（含监控指标与补偿策略）
+
+| 风险点 | 严重度 | 监控指标 | 补偿策略 |
+|--------|--------|----------|----------|
+| rebuild-tree 失败无重试 | 中 | exit code + 执行时长 | 启动时 onInit 自动重建；手动 rebuildTree mutation |
+| movePage 无乐观锁 | 中 | checkConflicts 返回 true 的频率 | CAS 模式 where('updatedAt', val)；唯一约束 + 重试退避 |
+| reconnectLinks 字符串匹配失败 | 高 | REPLACE 影响 rows=0 的比例 | 改用 data-* 属性定位；或改用 linkMap JSON 字段 |
+| 大目录 treeview 性能 | 中 | tree 查询返回节点数 | 后端增加 limit/offset 分页；前端搜索过滤 |
+| purgeHistory 无审计 | 高 | purge 调用记录 (userId, args) | 增加审计日志表；权限分级 manage:pages / manage:system |
+| 回滚不恢复 tags | 中 | 回滚后 tags 差异 | getVersion 中 join pageHistoryTags 表 |
+| MSSQL 无自引用外键 | 低 | pageTree 孤儿节点查询 | 应用层保证一致性（rebuild-tree 全量重建） |
+| 级联深度超限 | 无 | 页面路径最大 depth | 当前最长 2 层，远低于 MySQL 15 层限制 |
+| CASCADE 锁升级（MySQL） | 中 | deletePage 执行时长 | 手动分表删除替代 CASCADE；显式事务 |
+| 渲染管线修改 HTML 结构 | 高 | reconnectLinks 匹配率 | 抽象层解耦：data-* 属性或 linkMap JSON |
+| 自引用 CASCADE 未来触发 | 低 | pageTree 最大深度 | 保持全量重建策略；或限制 depth ≤ 10 |
