@@ -1436,3 +1436,1179 @@ if (_.isEmpty(page.content)) {
 | 内存压力 | 大数据处理直接占用主进程堆 |
 
 当前的非 worker 任务（`purge-uploads`、`sync-storage`、`sync-graph-*`、`fetch-graph-locale`）都是 I/O 密集型，CPU 开销低，因此风险可控。
+
+---
+
+## 十七、5 扩展点 priority schema 设计
+
+### 17.1 优先级的 5 个扩展点回顾
+
+Scheduler 的扩展点分布在 5 个关键位置，每个都对 priority 有不同的影响：
+
+```
+Job 生命周期:
+  constructor()  ← 定义 priority 字段和默认值
+       ↓
+  start(data)    ← 按 priority 对 jobs 数组排序插入
+       ↓
+  enqueue(data)  ← (仅周期任务) setTimeout 与 priority 无关
+       ↓
+  invoke(data)   ← 执行时按 priority 从队列取任务
+       ↓
+  stop()         ← priority 无关
+```
+
+### 17.2 两级 priority 体系设计
+
+Wiki.js 存在两类任务，优先级模型应该分层：
+
+| 层级 | 任务类型 | 优先级区间 | 调度方式 |
+|------|----------|-----------|----------|
+| L1 关键 | 一次性任务（render-page、sanitize-svg） | 100-199 | 立即出队执行，不排队 |
+| L2 后台 | 周期任务（purge-uploads、sync-storage） | 0-99 | 排队执行，按 priority 取队首 |
+
+**L1 一次性任务优先级建议（按紧急程度排序）**：
+
+| 优先级值 | 任务 | 理由 |
+|----------|------|------|
+| 190 | `sanitize-svg` | 用户上传后同步等待，必须先完成才能保存文件 |
+| 180 | `render-page` | 用户保存页面后同步等待渲染结果 |
+| 170 | `fetch-graph-locale` | 用户主动触发下载 |
+| 160 | `rebuild-tree` | 页面变更后后台重建 |
+
+**L2 周期任务优先级建议（按对用户体验影响排序）**：
+
+| 优先级值 | 任务 | 理由 |
+|----------|------|------|
+| 90 | `purge-uploads` | 影响磁盘空间，用户上传阻塞的根因 |
+| 80 | `sync-storage` | 备份时效性影响数据安全 |
+| 50 | `sync-graph-locales` | 语言包更新不紧急 |
+| 10 | `sync-graph-updates` | 版本检查最不紧急 |
+
+### 17.3 constructor 扩展点：priority schema
+
+```javascript
+// scheduler.js:8-23 — 扩展后
+constructor({
+  name,
+  immediate = false,
+  schedule = 'P1D',
+  repeat = false,
+  worker = false,
+  // === 新增 priority schema ===
+  priority,              // 不显式给默认值，而是按任务类型推断
+}, queue) {
+  this.queue = queue
+  this.finished = Promise.resolve()
+  this.name = name
+  this.immediate = immediate
+  this.schedule = moment.duration(schedule)
+  this.repeat = repeat
+  this.worker = worker
+
+  // priority 推断逻辑：一次性任务默认高优先级，周期任务默认低优先级
+  if (priority !== undefined) {
+    this.priority = Math.max(0, Math.min(255, priority))  // clamp 到 0-255
+  } else if (immediate && !repeat) {
+    this.priority = 150   // 一次性任务默认 L1
+  } else {
+    this.priority = 50    // 周期任务默认 L2
+  }
+}
+```
+
+### 17.4 start 扩展点：排序插入
+
+```javascript
+// scheduler.js:30-37 — 扩展后
+start(data) {
+  // 去重检查（按 uniqueKey，见第十四节扩展）
+  if (this.uniqueKey) {
+    const existing = this.queue.jobs.find(j => j.uniqueKey === this.uniqueKey)
+    if (existing) {
+      WIKI.logger.warn(`Job ${this.name} with key ${this.uniqueKey} already queued. [SKIPPED]`)
+      return existing
+    }
+  }
+
+  // 按 priority 降序插入（不是简单 push）
+  this.queue.jobs.push(this)
+  this.queue.jobs.sort((a, b) => {
+    if (b.priority !== a.priority) {
+      return b.priority - a.priority
+    }
+    // 同优先级按入队时间，FIFO
+    return (a._enqueuedAt || 0) - (b._enqueuedAt || 0)
+  })
+  this._enqueuedAt = Date.now()
+
+  if (this.immediate) {
+    this.invoke(data)
+  } else {
+    this.enqueue(data)
+  }
+}
+```
+
+### 17.5 invoke 扩展点：并发控制 + priority 取队首
+
+```javascript
+// scheduler.js:53-92 — 扩展后
+async invoke(data) {
+  // worker 并发上限（全局信号量）
+  if (this.worker) {
+    const MAX_WORKER_CONCURRENCY = WIKI.config.jobs?.maxWorkerConcurrency || 4
+    const runningWorkers = this.queue.jobs.filter(j =>
+      j.worker && j._isRunning && j !== this
+    ).length
+    if (runningWorkers >= MAX_WORKER_CONCURRENCY) {
+      // 超过并发上限，推迟到队首 priority 任务执行完
+      const delayMs = 1000
+      WIKI.logger.debug(`Worker concurrency saturated (${runningWorkers}/${MAX_WORKER_CONCURRENCY}), delaying job ${this.name}`)
+      this.timeout = setTimeout(this.invoke.bind(this), delayMs, data)
+      return
+    }
+  }
+
+  this._isRunning = true
+  // ... 原有执行逻辑 ...
+}
+```
+
+### 17.6 另外两个扩展点与 priority 的关系
+
+- **enqueue**：periodic task 的 setTimeout 与 priority 无关——它们是"到点触发"而非"排队取队首"
+- **stop**：priority 无关——停止就是停止，不区分紧急程度
+
+### 17.7 与 storage.js 现有 priority 概念的协调
+
+`storage.js` 中已经存在一个隐式 priority：按 `key` 排序初始化 storage targets：
+
+```javascript
+// storage.js:118
+this.targets = await WIKI.models.storage.query().where('isEnabled', true).orderBy('key')
+```
+
+调度器的通用 priority 体系应与 storage target 的 `order` 字段（如果未来增加）兼容，避免两套优先级冲突。
+
+---
+
+## 十八、PT0S 无限循环兜底
+
+### 18.1 漏洞场景复现
+
+当前的 duration 校验只检查格式合法性，不检查语义合理性：
+
+```javascript
+// helpers/config.js:26-28
+isValidDurationString (val) {
+  return isoDurationReg.test(val)
+}
+```
+
+```javascript
+// scheduler.js:116
+const schedule = (configHelper.isValidDurationString(queueParams.schedule))
+  ? queueParams.schedule
+  : 'P1D'
+```
+
+`PT0S` 是合法的 ISO 8601 Duration（0 秒），但会导致：
+
+```javascript
+// scheduler.js:20
+this.schedule = moment.duration('PT0S')   // asMilliseconds() = 0
+
+// scheduler.js:44-46
+enqueue(data) {
+  this.timeout = setTimeout(this.invoke.bind(this), 0, data)  // 0ms 延迟
+}
+```
+
+配合 `repeat: true`，执行路径变成：
+
+```
+invoke() → 执行任务 → enqueue() → setTimeout(0) → 立即再次 invoke → ...
+                       ↑                                          │
+                       └──────────────────────────────────────────┘
+```
+
+### 18.2 漏洞影响面分析
+
+| 任务类型 | 触发条件 | 危害等级 |
+|----------|----------|----------|
+| 自定义 storage sync | 用户在 admin UI 设置 `syncInterval = "PT0S"` | **高危** — CPU 100% + DB 连接耗尽 |
+| data.yml 手工修改 | 运维修改配置文件写错 | **中危** — 服务崩溃 |
+| 运行时 registerJob | 代码 bug 传了 0 duration | **中危** — 局部故障 |
+
+storage.js 的默认值有个伏笔：
+
+```javascript
+// storage.js:64
+syncInterval: target.schedule || 'P0D',
+
+// storage.js:145
+if (targetDef.schedule && target.syncInterval !== `P0D`) {
+  WIKI.scheduler.registerJob({ name: `sync-storage`, ... repeat: true }, target.key)
+}
+```
+
+这里用 `P0D` 作为"禁用"的哨兵值，但只检查了 `P0D`，没检查 `PT0S`、`PT0M`、`P0DT0H0M0S` 等等价表示。
+
+### 18.3 三层兜底防护
+
+```javascript
+// 第一层：isValidDurationString 增加语义校验 — helpers/config.js
+const MIN_DURATION_MS = 5000  // 最小 5 秒
+
+isValidDurationString (val) {
+  if (!isoDurationReg.test(val)) return false
+  const dur = moment.duration(val)
+  return dur.asMilliseconds() >= MIN_DURATION_MS
+}
+
+// 第二层：Job constructor 强制下限 — scheduler.js:20
+this.schedule = moment.duration(schedule)
+if (this.repeat && this.schedule.asMilliseconds() < MIN_DURATION_MS) {
+  WIKI.logger.warn(`Job ${name} schedule ${schedule} too short, clamped to ${MIN_DURATION_MS}ms`)
+  this.schedule = moment.duration(MIN_DURATION_MS)
+}
+
+// 第三层：enqueue 防抖兜底 — scheduler.js:44-46
+enqueue(data) {
+  const delay = Math.max(this.schedule.asMilliseconds(), MIN_DURATION_MS)
+
+  // 防止 _invokeCount 爆炸（连续 invoke 超过阈值就暂停）
+  if ((this._invokeCount || 0) > 100 && Date.now() - (this._firstInvokeAt || 0) < 60000) {
+    WIKI.logger.error(`Job ${this.name} invoked ${this._invokeCount} times in 60s, pausing for 60s`)
+    this.timeout = setTimeout(this.invoke.bind(this), 60000, data)
+    return
+  }
+
+  this.timeout = setTimeout(this.invoke.bind(this), delay, data)
+}
+```
+
+### 18.4 第三层兜底的 invoke 计数
+
+```javascript
+// scheduler.js:53 — invoke 开头增加计数
+async invoke(data) {
+  this._invokeCount = (this._invokeCount || 0) + 1
+  if (!this._firstInvokeAt) {
+    this._firstInvokeAt = Date.now()
+  }
+  // 每分钟重置一次计数
+  if (Date.now() - this._firstInvokeAt > 60000) {
+    this._invokeCount = 1
+    this._firstInvokeAt = Date.now()
+  }
+  // ... 原有逻辑
+}
+```
+
+这个三层设计遵循防御性编程原则：第一层在入口拦、第二层在对象创建时拦、第三层在执行运行时最后兜底。即使前两层都漏了（比如代码直接 new Job 绕过 registerJob），第三层的 100次/分钟熔断也能救场。
+
+---
+
+## 十九、P1D 夏令时补偿
+
+### 19.1 问题的数学模型
+
+`moment.duration('P1D')` 永远返回 86400000 毫秒，但"自然日"有三种长度：
+
+| 日期类型 | 实际时长 | 出现频率 | 偏差 |
+|----------|----------|----------|------|
+| 标准日 | 86400s | 362 天/年 | 0 |
+| 春季 DST 开始 | 82800s（23h） | 1 天/年 | -3600s |
+| 秋季 DST 结束 | 90000s（25h） | 1 天/年 | +3600s |
+
+用固定 86400s 的 setTimeout 来调度"每天执行"，会在 DST 切换日出现 ±1 小时漂移。
+
+### 19.2 对现有任务的实际影响
+
+| 任务 | 当前 schedule | DST 影响是否可接受 | 理由 |
+|------|--------------|-------------------|------|
+| `sync-graph-locales` | P1D | ✅ 可接受 | 后台同步，±1 小时无感知 |
+| `sync-graph-updates` | P1D | ✅ 可接受 | 版本检查，时间不敏感 |
+| 自定义 storage sync | 用户配置（P1D 常见） | ⚠️ 取决于业务 | 用户可能预期"每天凌晨 3 点" |
+
+### 19.3 三种补偿策略对比
+
+| 策略 | 实现复杂度 | 精度 | 适用场景 |
+|------|-----------|------|----------|
+| A. 固定 duration（现状） | 极低 | ±1h | 所有后台任务 |
+| B. "距下次目标时间"计算 | 中 | 无偏移 | 用户有明确执行时间预期 |
+| C. cron 表达式 | 高 | 无偏移 | 企业级调度需求 |
+
+### 19.4 策略 B 的具体实现（建议 Wiki.js 采用）
+
+```javascript
+// scheduler.js 新增
+_getNextRunTimestamp() {
+  if (!this.repeat) return null
+
+  const now = DateTime.local()  // 使用 luxon（已在 index.js 引入）
+  const durMs = this.schedule.asMilliseconds()
+
+  // 对"天"级别以上的 schedule 用日历计算，以下用固定毫秒
+  if (durMs >= 86400000) {  // P1D 及更长
+    const days = Math.round(durMs / 86400000)
+    const target = now.plus({ days }).startOf('day')
+      .plus({ hours: this._preferredHour || 3 })  // 默认凌晨 3 点执行
+    return target.toMillis() - now.toMillis()
+  }
+
+  return durMs  // PT15M 级别的继续用固定毫秒
+}
+
+enqueue(data) {
+  const delay = this._getNextRunTimestamp()
+    || this.schedule.asMilliseconds()
+
+  this.timeout = setTimeout(this.invoke.bind(this), delay, data)
+}
+```
+
+利用 luxon 的时区感知计算：`startOf('day')` 会自动处理 DST，保证"下一个自然日凌晨 3 点"在所有时区下都正确。
+
+### 19.5 为什么引入 luxon 而不是 moment-timezone
+
+Wiki.js 已经在 `index.js` 引入了 luxon：
+
+```javascript
+// index.js:8
+const { DateTime } = require('luxon')
+```
+
+而 `moment-timezone` 虽然在 package.json 中存在，但未在调度器中使用。luxon 的 API 更现代且原生支持时区计算，是更合理的选择。
+
+### 19.6 storage sync 的补偿需求
+
+storage.js 中用户可以配置 syncInterval，当前只接受 Duration。补偿后应新增字段：
+
+```javascript
+// storage model 新增 schema — models/storage.js
+// syncPreferredHour: { type: 'integer', minimum: 0, maximum: 23, default: 3 }
+
+// storage.js:145-151 扩展
+if (targetDef.schedule && target.syncInterval !== `P0D`) {
+  const job = WIKI.scheduler.registerJob({
+    name: `sync-storage`,
+    schedule: target.syncInterval,
+    repeat: true
+  }, target.key)
+  job._preferredHour = target.syncPreferredHour || 3  // 注入偏好执行时刻
+}
+```
+
+---
+
+## 二十、50-80MB 每 worker 的集群一致性
+
+### 20.1 集群（HA）模式的现有架构
+
+Wiki.js 的多实例协调依赖 PostgreSQL LISTEN/NOTIFY：
+
+```javascript
+// db.js:231-264
+async subscribeToNotifications () {
+  const useHA = (WIKI.config.ha === true || ...)
+  if (!useHA) return
+
+  const PGPubSub = require('pg-pubsub')
+  this.listener = new PGPubSub(this.knex.client.connectionSettings, ...)
+
+  this.listener.addChannel('wiki', payload => {
+    if (payload.source !== WIKI.INSTANCE_ID) {  // 用 nanoid 区分实例
+      WIKI.events.inbound.emit(payload.event, payload.value)
+    }
+  })
+}
+```
+
+每个实例有唯一 ID：
+```javascript
+// index.js:19
+INSTANCE_ID: nanoid(10),  // 如 "V1StGXR8_Z"
+```
+
+### 20.2 当前的任务一致性问题
+
+在 HA 模式下，N 个实例会各自执行 scheduler.start()，导致周期任务重复执行 N 次：
+
+```
+Instance A (ID: abc123):
+  scheduler.start() → 注册 purge-uploads, sync-*, sync-storage
+
+Instance B (ID: def456):
+  scheduler.start() → 注册 purge-uploads, sync-*, sync-storage
+
+每 15 分钟:
+  Instance A: purge-uploads 执行 ✅
+  Instance B: purge-uploads 执行 ❌ (重复)
+```
+
+对于一次性任务也有问题：
+
+```
+用户保存页面 → HTTP 负载均衡随机分到 Instance A
+  Instance A: registerJob(render-page) → fork worker ✅
+
+但如果是批量操作触发 rebuild-tree:
+  Instance A 和 B 都可能收到事件并各自注册 → 执行两次
+```
+
+### 20.3 内存开销的集群放大
+
+单机 4 个并发 worker ≈ 320MB，在 N 实例集群下：
+
+| 集群规模 | 并发 worker（按单机 4 算） | 总内存占用 | 总 DB 连接数 |
+|----------|------------------------|-----------|-------------|
+| 1 实例 | 4 | ~320 MB | ~4 |
+| 2 实例 | 8 | ~640 MB | ~8 |
+| 3 实例 | 12 | ~960 MB | ~12 |
+| 5 实例 | 20 | ~1.6 GB | ~20 |
+
+而如果有**分布式去重锁**，只有 1 个实例实际执行，内存和连接开销都降回单机水平。
+
+### 20.4 基于 Postgres Advisory Lock 的分布式锁
+
+使用 PostgreSQL Advisory Lock 实现任务级别的集群互斥（不依赖额外中间件）：
+
+```javascript
+// scheduler.js invoke 扩展
+async invoke(data) {
+  // 对 repeat: true 的周期任务加分布式锁
+  let lockAcquired = false
+  const lockKey = this._computeLockKey(data)
+
+  if (this.repeat && WIKI.config.ha && WIKI.config.db.type === 'postgres') {
+    try {
+      // pg_try_advisory_lock: 不阻塞，获取不到返回 false
+      const result = await WIKI.models.knex.raw(
+        'SELECT pg_try_advisory_lock(?);',
+        [lockKey]
+      )
+      lockAcquired = result.rows[0].pg_try_advisory_lock
+    } catch (e) {
+      WIKI.logger.warn(`Failed to acquire lock for job ${this.name}: ${e.message}`)
+      lockAcquired = true  // 降级：锁不可用时本实例继续执行
+    }
+    if (!lockAcquired) {
+      WIKI.logger.debug(`Job ${this.name} skipped: lock held by another instance`)
+      if (this.repeat && this.queue.jobs.includes(this)) {
+        this.enqueue(data)  // 让出本次，继续下次调度
+      }
+      return
+    }
+  }
+
+  try {
+    // ... 原有执行逻辑 ...
+  } finally {
+    if (lockAcquired) {
+      await WIKI.models.knex.raw('SELECT pg_advisory_unlock(?);', [lockKey])
+    }
+  }
+}
+
+_computeLockKey(data) {
+  // 将字符串锁名转成 int8（advisory lock 需要 bigint）
+  let hash = 0
+  const str = `wikijs:job:${this.name}:${data || ''}`
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+```
+
+### 20.5 非 Postgres 数据库的降级方案
+
+对于 MySQL/SQLite（不支持 advisory lock）：
+
+```javascript
+// 用 settings 表实现简单的心跳锁
+// CREATE TABLE jobLocks (
+//   lockKey TEXT PRIMARY KEY,
+//   instanceId TEXT,
+//   acquiredAt TEXT,
+//   heartbeatAt TEXT
+// )
+
+// 心跳 TTL = 5 分钟，超过则认为实例已死
+const LOCK_TTL_MS = 5 * 60 * 1000
+
+async _acquireLockDB(lockKey) {
+  const now = new Date().toISOString()
+  const trx = await WIKI.models.knex.transaction()
+  try {
+    // 1. 清理过期锁
+    await trx('jobLocks')
+      .whereRaw("heartbeatAt < datetime('now', '-5 minutes')")
+      .del()
+
+    // 2. 尝试 INSERT（利用主键唯一）
+    await trx('jobLocks').insert({
+      lockKey,
+      instanceId: WIKI.INSTANCE_ID,
+      acquiredAt: now,
+      heartbeatAt: now
+    })
+
+    await trx.commit()
+    return true
+  } catch (e) {
+    await trx.rollback()
+    // 主键冲突 = 锁被占
+    return false
+  }
+}
+```
+
+### 20.6 锁的 TTL 与 worker 生命周期配合
+
+worker 执行期间必须持续心跳：
+
+```javascript
+async invoke(data) {
+  // ... 加锁成功 ...
+  let heartbeatTimer = null
+  if (lockAcquired) {
+    heartbeatTimer = setInterval(async () => {
+      await WIKI.models.knex('jobLocks')
+        .where({ lockKey })
+        .update({ heartbeatAt: new Date().toISOString() })
+    }, 30000)  // 每 30s 心跳一次
+  }
+
+  try {
+    await this.finished
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer)
+    // ... 释放锁 ...
+  }
+}
+```
+
+---
+
+## 二十一、knex.destroy 后无 return bug 的修复 PR
+
+### 21.1 Bug 定位
+
+**文件**：`server/jobs/render-page.js:24-27`
+
+**当前代码**：
+```javascript
+if (_.isEmpty(page.content)) {
+  await WIKI.models.knex.destroy()
+  WIKI.logger.warn(`Failed to render page ID ${pageId} because content was empty: [ FAILED ]`)
+  // ⚠️ BUG: 没有 return 或 throw！函数继续执行
+}
+```
+
+### 21.2 Bug 的完整执行路径
+
+当 `page.content` 为空时：
+
+```
+1. knex.destroy()  → DB 连接池关闭，所有连接释放
+2. logger.warn(...) → 日志输出
+3. for (let core of pipeline) → 进入渲染循环
+4. 循环中每个 renderer 可能正常执行（不依赖 DB）
+5. 最后执行 WIKI.models.pages.query().patch(...)
+     ↓
+   Knex: Timeout acquiring a connection. The pool is probably full.
+   或: Unable to acquire a connection
+     ↓
+6. catch(err) → logger.error → throw err
+     ↓
+7. worker.js 捕获 → process.exit(1)
+```
+
+**最终结果**：任务确实失败了，但原因是"连接池已关闭"而不是"内容为空"，日志误导排错。
+
+### 21.3 同类问题检查
+
+遍历所有 worker 任务：
+
+| 任务文件 | 是否有类似 bug | 说明 |
+|----------|--------------|------|
+| `render-page.js:24-27` | ✅ **有** | knex.destroy 后无 return |
+| `rebuild-tree.js` | 无 | knex.destroy 在正常流程末尾，try 结尾 |
+| `sanitize-svg.js` | 无 | 不使用 DB（纯文件处理），没有 knex |
+| 非 worker 任务 | N/A | 共享主进程连接池，不调用 destroy |
+
+### 21.4 修复 PR 的 diff
+
+```diff
+--- a/server/jobs/render-page.js
++++ b/server/jobs/render-page.js
+@@ -21,10 +21,12 @@ module.exports = async (pageId) => {
+
+     if (_.isEmpty(page.content)) {
+       await WIKI.models.knex.destroy()
+       WIKI.logger.warn(`Failed to render page ID ${pageId} because content was empty: [ FAILED ]`)
++      throw new Error('Page content is empty')
+     }
+
+     for (let core of pipeline) {
+```
+
+为什么用 `throw` 而不是 `return`：
+
+1. **与 catch 块语义一致**：函数末尾有 `catch (err) { ... throw err }`，throw 能走统一的错误出口
+2. **与 worker.js 约定一致**：worker.js 期待失败时抛异常 → process.exit(1)
+3. **便于主进程识别**：throw 的 error 对象会被 scheduler.js 捕获并 reject，调用方能感知失败
+
+### 21.5 进一步加固：finally 中统一 destroy
+
+更健壮的模式是用 `finally` 统一释放资源，避免每个分支都写 destroy：
+
+```javascript
+// 推荐的完整修复
+module.exports = async (pageId) => {
+  WIKI.logger.info(`Rendering page ID ${pageId}...`)
+
+  try {
+    WIKI.models = require('../core/db').init()
+    await WIKI.configSvc.loadFromDb()
+    await WIKI.configSvc.applyFlags()
+
+    const page = await WIKI.models.pages.getPageFromDb(pageId)
+    if (!page) throw new Error('Invalid Page Id')
+    if (_.isEmpty(page.content)) throw new Error('Page content is empty')
+
+    await WIKI.models.renderers.fetchDefinitions()
+    const pipeline = await WIKI.models.renderers.getRenderingPipeline(page.contentType)
+
+    let output = page.content
+    for (let core of pipeline) {
+      // ... 渲染逻辑不变 ...
+    }
+
+    // ... 保存到 DB、缓存 ...
+
+    WIKI.logger.info(`Rendering page ID ${pageId}: [ COMPLETED ]`)
+  } catch (err) {
+    WIKI.logger.error(`Rendering page ID ${pageId}: [ FAILED ]`)
+    WIKI.logger.error(err.message)
+    throw err
+  } finally {
+    // ✅ finally 中统一释放，无论正常/异常都执行
+    if (WIKI.models && WIKI.models.knex) {
+      await WIKI.models.knex.destroy()
+    }
+  }
+}
+```
+
+`rebuild-tree.js` 也可以套同样的 `finally` 模式，目前它在正常路径末尾 destroy，异常路径会泄漏连接池。
+
+### 21.6 单元测试建议
+
+```javascript
+// test/jobs/render-page.test.js
+describe('render-page job', () => {
+  it('should throw early when content is empty, not attempt DB writes', async () => {
+    // mock empty page
+    // stub knex.destroy to track calls
+    // expect(promise).to.be.rejectedWith('Page content is empty')
+    // expect(knex.destroy).to.have.been.calledOnce
+  })
+})
+```
+
+---
+
+## 二十二、缺失 5 方法的优先级
+
+### 22.1 5 个缺失方法回顾
+
+第十四节列出了调度器模块缺失的 5 个方法：
+
+| 方法 | 用途 |
+|------|------|
+| `getJob(name)` | 按名称查询任务 |
+| `getJobStatus(name)` | 查询任务状态（running/pending/stopped） |
+| `cancelJob(name)` | 按名称取消任务 |
+| `onJobComplete(callback)` | 任务完成回调 |
+| `onJobFailed(callback)` | 任务失败回调 |
+
+### 22.2 优先级排序矩阵
+
+按**实现成本 × 业务价值**排序：
+
+| 优先级 | 方法 | 实现成本 | 业务价值 | 理由 |
+|--------|------|----------|----------|------|
+| **P0** | `cancelJob(name)` | 低 | 高 | storage.js 已经在手写 `_.remove()` + `job.stop()`，应该标准化，否则业务层绕过调度器 API |
+| **P1** | `onJobComplete / onJobFailed` | 中 | 高 | telemetry 已经预留了 sendError 但为空，需要事件钩子把错误送出去；也是告警集成的基础 |
+| **P2** | `getJobStatus(name)` | 极低 | 中 | Admin UI 需要展示任务状态；成本几乎为零，只是给 Job 加个 getter |
+| **P3** | `getJob(name)` | 低 | 低 | 可以直接通过 jobs 数组访问；除非要做权限/封装，否则价值不大 |
+| **P4** | （省略） | — | — | 4 个就够，第 5 个可以不实现 |
+
+### 22.3 P0：cancelJob(name) — 最优先实现
+
+storage.js 当前在绕过 API 手写去重逻辑：
+
+```javascript
+// storage.js:120-124 — 当前绕过调度器 API 的代码
+const prevjobs = _.remove(WIKI.scheduler.jobs, job => job.name === `sync-storage`)
+if (prevjobs.length > 0) {
+  prevjobs.forEach(job => job.stop())
+}
+```
+
+标准化后的 API：
+
+```javascript
+// scheduler.js — 新增
+cancelJob(name, { data = undefined } = {}) {
+  let cancelled = 0
+  this.jobs = this.jobs.filter(job => {
+    if (job.name === name) {
+      if (data === undefined || job._data === data) {
+        job.stop().catch(() => {})
+        cancelled++
+        return false
+      }
+    }
+    return true
+  })
+  WIKI.logger.info(`Cancelled ${cancelled} job(s) with name: ${name}`)
+  return cancelled
+}
+```
+
+storage.js 可以简化为：
+
+```javascript
+// storage.js — 简化后
+WIKI.scheduler.cancelJob('sync-storage', { data: target.key })
+```
+
+### 22.4 P1：onJobComplete / onJobFailed — 事件总线
+
+调度器应该继承 EventEmitter：
+
+```javascript
+// scheduler.js — 改造
+const { EventEmitter } = require('eventemitter2')
+
+const scheduler = new EventEmitter()
+
+scheduler.jobs = []
+scheduler.init = function() { return this }
+// ...
+
+// invoke 中发射事件
+async invoke(data) {
+  try {
+    await this.finished
+    scheduler.emit('job:complete', {
+      name: this.name,
+      data,
+      duration: Date.now() - this._startTime,
+      instanceId: WIKI.INSTANCE_ID
+    })
+  } catch (err) {
+    scheduler.emit('job:failed', {
+      name: this.name,
+      data,
+      error: err.message,
+      exitCode: err.exitCode,
+      instanceId: WIKI.INSTANCE_ID
+    })
+  }
+}
+```
+
+与现有代码的对接：
+
+```javascript
+// telemetry.js — 现在可以非空实现了
+init() {
+  WIKI.telemetry = this
+  if (this.enabled) {
+    WIKI.scheduler.on('job:failed', payload => this.sendError(payload))
+    WIKI.scheduler.on('job:complete', payload => this.sendEvent('job', 'complete', payload.name))
+  }
+}
+```
+
+### 22.5 P2：getJobStatus(name) — 极低成本
+
+```javascript
+// Job 类增加状态 getter
+get status() {
+  if (!this.queue.jobs.includes(this)) return 'stopped'
+  if (this._isRunning) return 'running'
+  if (this.timeout) return 'pending'
+  return 'idle'
+}
+
+// 调度器增加查询方法
+getJobStatus(name, { data = undefined } = {}) {
+  const job = this.jobs.find(j =>
+    j.name === name && (data === undefined || j._data === data)
+  )
+  return job ? job.status : null  // null = 不存在
+}
+```
+
+Admin UI 可以新增一个任务状态面板，前端调 GraphQL 接口展示。
+
+### 22.6 P3：getJob(name) — 价值较低
+
+内部数组已经暴露，这个方法主要是为了 API 完整性：
+
+```javascript
+getJob(name, { data = undefined } = {}) {
+  return this.jobs.find(j =>
+    j.name === name && (data === undefined || j._data === data)
+  ) || null
+}
+```
+
+不建议暴露给业务层直接操作 Job 实例，因为容易绕过调度器的生命周期管理。
+
+---
+
+## 二十三、OS 进程重启策略
+
+### 23.1 当前进程退出的所有路径
+
+遍历代码中所有 `process.exit` 和信号处理：
+
+| 退出路径 | 触发条件 | exit code | 可重启 |
+|----------|----------|-----------|--------|
+| `index.js:46-50` | SIGTERM / SIGINT | graceful shutdown → 0 | 否（运维主动停止） |
+| `index.js:52-56` | 父进程 IPC message 'shutdown' | graceful shutdown → 0 | 否 |
+| `kernel.js:24,47,65` | DB/config 初始化失败 | 1 | **应该重启**（临时故障） |
+| `db.js:132` | 无效 DB type | 1 | 否（配置错误） |
+| `config.js:48,69` | 配置文件缺失或 DB_PASS_FILE 读取失败 | 1 | 否（配置错误） |
+| `servers.js:37,40,85,99,102` | 端口被占 / 权限不足 / SSL 错误 | 1 | **应该重启**（端口暂时被占） |
+| `users.js:885,895` | Admin 账号创建失败 | 1 | 否 |
+| `worker.js:19` | Worker 任务成功 | 0 | 否（任务自然完成） |
+| `worker.js:22` | Worker 任务失败 | 1 | 否（任务失败 ≠ 进程故障） |
+
+### 23.2 主进程 vs Worker 进程的区分
+
+重启策略必须区分两种进程：
+
+```
+主进程 (PID 1 或由 systemd/pm2 管理):
+  exit 0 → 运维停止 → 不重启
+  exit 1 → 根据原因决定
+  崩溃（OOM、uncaughtException）→ 应该重启
+
+Worker 子进程 (child_process.fork 出来):
+  任何 exit code → 都不应该由 OS 重启
+  重启应该由 scheduler.js 的重试逻辑控制
+```
+
+### 23.3 systemd 配置建议（生产部署）
+
+```ini
+# /etc/systemd/system/wikijs.service
+[Unit]
+Description=Wiki.js
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=wikijs
+Group=wikijs
+WorkingDirectory=/var/www/wikijs
+ExecStart=/usr/bin/node server/index.js
+
+# === 重启策略 ===
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# === 安全限制（也限制 worker fork 的权限）===
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/www/wikijs/data
+ProtectHome=true
+
+# === OOM 保护 ===
+OOMScoreAdjust=-500
+
+# === worker 进程数上限（防 fork 炸弹）===
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
+```
+
+关键点：
+- `Restart=on-failure`：只在非 0 exit code 时重启，不重启 graceful shutdown
+- `RestartSec=5`：避免死循环重启
+- `StartLimitBurst=5 / 60s`：1 分钟内重启超过 5 次就放弃，标记为 failed
+- `TasksMax=64`：防止无上限 fork worker 导致 OS 崩溃
+
+### 23.4 Docker/Kubernetes 部署的健康检查
+
+容器环境下不依赖 systemd，而是用 HEALTHCHECK / livenessProbe：
+
+```dockerfile
+# Dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:${PORT:-80}/healthz', r => process.exit(r.statusCode === 200 ? 0 : 1))"
+```
+
+```yaml
+# k8s deployment
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 80
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 80
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+`/healthz` 端点应该检查 scheduler 的健康状态：
+
+```javascript
+// 建议新增的健康检查中间件
+app.get('/healthz', (req, res) => {
+  const stuckJobs = WIKI.scheduler.jobs.filter(j =>
+    j._isRunning && Date.now() - (j._startTime || 0) > 10 * 60 * 1000  // 运行超 10 分钟
+  )
+  if (stuckJobs.length > 0) {
+    res.status(503).json({
+      status: 'degraded',
+      stuckJobs: stuckJobs.map(j => ({ name: j.name, runningFor: Date.now() - j._startTime }))
+    })
+  } else {
+    res.status(200).json({ status: 'ok', runningJobs: WIKI.scheduler.jobs.filter(j => j._isRunning).length })
+  }
+})
+```
+
+### 23.5 Worker 进程的重启：归 scheduler 管
+
+OS 层不应该重启 worker 子进程。worker 的失败重试必须由 scheduler 控制：
+
+```javascript
+// scheduler.js 扩展（与第十一节的 retry 机制配合）
+async invoke(data) {
+  if (this.worker) {
+    const proc = childProcess.fork(...)
+
+    this.finished = new Promise((resolve, reject) => {
+      proc.on('exit', (code, signal) => {
+        // signal 非空说明被外部杀死（如 OOM killer）
+        if (signal && this.attempts < this.maxAttempts) {
+          WIKI.logger.warn(`Worker ${this.name} killed by signal ${signal}, retry ${this.attempts}/${this.maxAttempts}`)
+          // 由 retry 逻辑调度下次执行
+          reject(new Error(`Worker killed by signal ${signal}`))
+          return
+        }
+        // ... 正常 exit code 处理 ...
+      })
+    })
+  }
+}
+```
+
+OS 层的 `OOMScoreAdjust=-500` 只保护主进程，worker 子进程继承不到这个保护（或者应该故意不保护，让 OOM killer 优先杀 worker 而不是主进程）。
+
+### 23.6 崩溃时的 in-flight 任务恢复
+
+进程被 SIGKILL 或 OOM 杀死后，graceful shutdown 不会执行，正在运行的 worker 子进程会：
+
+1. 被 init 进程（PID 1）收养
+2. 继续运行直到完成
+3. 完成后成为僵尸进程等待被收割
+
+这意味着：**崩溃瞬间正在运行的任务其实不会丢失**（worker 是独立进程），但调度器状态会丢。
+
+恢复策略：
+
+```javascript
+// kernel.js 启动时检查孤儿 worker
+async postBootMaster() {
+  // ... 原有启动逻辑 ...
+  WIKI.scheduler.start()
+
+  // 查找可能的孤儿 worker（相同 cwd，参数含 --job=）
+  if (process.platform === 'linux') {
+    try {
+      const pgrep = require('child_process').execSync(
+        `pgrep -f "node.*server/core/worker.js" -P 1 || true`
+      ).toString().trim()
+      if (pgrep) {
+        WIKI.logger.warn(`Found ${pgrep.split('\n').length} orphan worker process(es) adopted by init`)
+        // 不 kill — 让它们跑完，避免重复执行
+      }
+    } catch (e) { /* ignore */ }
+  }
+}
+```
+
+---
+
+## 二十四、补偿式定时器 jitter
+
+### 24.1 为什么需要 jitter
+
+补偿式定时器（第九章）解决了漂移问题，但引入了新问题：**Thundering Herd（惊群）**。
+
+假设 100 个 Wiki.js 实例用 P1D 调度 `sync-graph-updates`，经过补偿后它们都会在**精确的**凌晨 3:00:00.000 触发，同时请求同一个上游服务：
+
+```
+时间        实例 1-100 行为
+03:00:00    全部同时请求 graph.requarks.io
+              ↓
+            上游服务瞬间 QPS = 100
+            可能触发限流 (429 Too Many Requests)
+            或者直接打挂服务
+```
+
+即使是单机，多个周期任务在同一时刻触发也会造成瞬时资源尖峰：
+
+```
+00:00:00    purge-uploads + sync-storage-A + sync-storage-B + sync-storage-C
+            = 4 个任务同时 fork worker + 初始化 DB 连接池
+```
+
+jitter（抖动）就是给触发时间加一个随机偏移，把瞬时峰值摊平。
+
+### 24.2 jitter 的三种常见算法
+
+| 算法 | 公式 | 分散效果 | 偏差 |
+|------|------|----------|------|
+| 无 jitter | `delay = base` | ❌ 全部堆在同一时刻 | 0 |
+| 固定比例 | `delay = base × [0.8, 1.2]` | ⚠️ 有分散但仍可能碰撞 | ±20% |
+| 全随机 | `delay = base × random(0, 1)` | ✅ 均匀分散 | 最大 -50% |
+| Decorrelated | `delay = min(max, random(base, prev×3))` | ✅ 指数退避+随机 | 自适应 |
+
+对于周期任务，建议采用**固定比例 jitter**：分散足够，偏差可控。
+
+### 24.3 与补偿式定时器结合的实现
+
+```javascript
+// scheduler.js — 改造 enqueue
+enqueue(data) {
+  let delay
+
+  // L1: 日历计算（天级别以上，处理 DST）
+  if (this.schedule.asMilliseconds() >= 86400000 && this.repeat) {
+    delay = this._getNextRunTimestamp()
+  } else {
+    // L2: 补偿式定时器（扣除执行耗时）
+    if (this.repeat && this._lastStartTime) {
+      const elapsed = Date.now() - this._lastStartTime
+      delay = Math.max(0, this.schedule.asMilliseconds() - elapsed)
+    } else {
+      delay = this.schedule.asMilliseconds()
+    }
+  }
+
+  // L3: 加 jitter（新增）
+  delay = this._applyJitter(delay)
+
+  this.timeout = setTimeout(this.invoke.bind(this), delay, data)
+}
+
+_applyJitter(delayMs) {
+  // 不对一次性任务加 jitter（immediate: true 的任务不会走 enqueue）
+  if (!this.repeat) return delayMs
+
+  // 对短周期任务减少 jitter 比例，长周期增加
+  let jitterRatio
+  if (delayMs >= 86400000) {       // P1D: ±30 分钟
+    jitterRatio = 0.02
+  } else if (delayMs >= 3600000) {  // PT1H: ±3 分钟
+    jitterRatio = 0.05
+  } else if (delayMs >= 60000) {    // PT1M+: ±10%
+    jitterRatio = 0.1
+  } else {                           // <1分钟: 不加 jitter
+    return delayMs
+  }
+
+  const jitterMin = 1 - jitterRatio
+  const jitterMax = 1 + jitterRatio
+  const jittered = delayMs * (jitterMin + Math.random() * (jitterMax - jitterMin))
+
+  WIKI.logger.debug(
+    `Job ${this.name} scheduled with jitter: ` +
+    `${Math.round(delayMs)}ms → ${Math.round(jittered)}ms (±${Math.round(jitterRatio * 100)}%)`
+  )
+  return Math.round(jittered)
+}
+```
+
+### 24.4 jitter 参数的业务校准
+
+对现有任务逐个分析：
+
+| 任务 | schedule | 推荐 jitterRatio | 实际偏移量 | 为什么 |
+|------|----------|-----------------|-----------|--------|
+| `purge-uploads` | PT15M | 0.10 (±10%) | ±1.5 min | 清理 15 分钟前的文件，±1.5 分钟不影响正确性 |
+| `sync-storage` | 用户配置 | 0.05-0.10 | 随配置 | 备份同步，用户容忍度高 |
+| `sync-graph-locales` | P1D | 0.02 (±2%) | ±28.8 min | 访问公共上游，最重要的是打散流量 |
+| `sync-graph-updates` | P1D | 0.02 (±2%) | ±28.8 min | 同上 |
+
+`sync-graph-*` 两个任务访问同一个上游端点 `graph.requarks.io`，是最需要 jitter 的场景。
+
+### 24.5 确定性 jitter：按实例 ID 散列
+
+完全随机的 jitter 在进程重启时会重新生成随机数，可能导致"同一实例每次重启都在不同时间执行"。对于需要可预测性的场景，可以用确定性 jitter：
+
+```javascript
+_applyJitter(delayMs) {
+  if (!this.repeat) return delayMs
+  let jitterRatio = this._pickJitterRatio(delayMs)
+
+  // 用 name + INSTANCE_ID 做 hash，保证同一实例同一任务的 jitter 固定
+  const seed = `${this.name}:${WIKI.INSTANCE_ID}`
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = ((hash << 5) - hash) + seed.charCodeAt(i)
+    hash |= 0
+  }
+  const deterministic = (Math.abs(hash) % 1000) / 1000  // 0.000 - 0.999
+
+  const jitterMin = 1 - jitterRatio
+  const jitterMax = 1 + jitterRatio
+  return Math.round(delayMs * (jitterMin + deterministic * (jitterMax - jitterMin)))
+}
+```
+
+这样 Instance A 的 `sync-graph-updates` 永远在 3:14 触发，Instance B 永远在 2:47 触发，不会因为重启而重新分配。
+
+### 24.6 jitter + 分布式锁的配合
+
+集群环境下，jitter 和第二十节的分布式锁是互补的：
+
+```
+无 jitter, 有锁:
+  3:00:00  Instance A 抢到锁并执行 ✅
+  3:00:00  Instance B 抢不到，放弃 ❌（浪费一次调度）
+  3:00:00  Instance C 抢不到，放弃 ❌
+
+有 jitter, 有锁:
+  2:47:00  Instance B 抢到锁并执行 ✅
+  3:03:00  Instance A 发现锁已释放? 不，锁在执行完就释放了
+            但任务已由 B 完成，A 应该跳过（用幂等性保证）
+  3:14:00  Instance C 同理跳过
+```
+
+完美组合 = 确定性 jitter（打散触发时间）+ 分布式锁（保证唯一执行）+ 任务幂等性（重复执行安全）。
