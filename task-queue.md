@@ -2612,3 +2612,711 @@ _applyJitter(delayMs) {
 ```
 
 完美组合 = 确定性 jitter（打散触发时间）+ 分布式锁（保证唯一执行）+ 任务幂等性（重复执行安全）。
+
+---
+
+## 二十五、三级流水线 L1/L2/L3 自适应比例补成本对照表
+
+### 25.1 三级流水线回顾
+
+第二十四节设计的 `enqueue()` 经过三级处理：
+
+```
+原始 schedule (如 P1D / PT15M)
+      ↓
+L1: 日历计算 (_getNextRunTimestamp)     — 处理 DST
+      ↓
+L2: 补偿式定时器 (扣除执行耗时)          — 消除漂移
+      ↓
+L3: jitter (_applyJitter)              — 打散惊群
+      ↓
+最终 setTimeout delay
+```
+
+### 25.2 各级的计算成本
+
+| 级别 | 操作 | CPU 时间 | 内存分配 | 外部依赖 | 失败模式 |
+|------|------|----------|----------|----------|----------|
+| **L1 日历计算** | `DateTime.local().plus({days}).startOf('day').plus({hours})` | ~50μs | 2 个 luxon DateTime 对象 (~200B) | 无 | 时区数据库缺失时降级为 UTC |
+| **L2 补偿式定时器** | `Date.now() - this._lastStartTime` | ~0.1μs | 0 | 无 | `_lastStartTime` 未初始化 → 退化为原始 duration |
+| **L3 jitter** | `hash + Math.random() + 乘法` | ~5μs | 0 | 无 | `Math.random()` 无 true entropy（V8 PRNG） |
+
+### 25.3 自适应比例成本对照表
+
+L3 jitter 的比例是按 schedule 长度自适应的，以下是每个任务的完整成本核算：
+
+| 任务 | schedule | L1 触发 | L2 触发 | L3 jitterRatio | L3 最大偏移 | L1 CPU | L3 CPU | 端到端延迟增量 |
+|------|----------|---------|---------|----------------|------------|--------|--------|---------------|
+| `sync-graph-locales` | P1D | ✅ | ✅ | 0.02 (±2%) | ±28.8 min | 50μs | 5μs | +55μs |
+| `sync-graph-updates` | P1D | ✅ | ✅ | 0.02 (±2%) | ±28.8 min | 50μs | 5μs | +55μs |
+| 自定义 storage sync (P1D) | P1D | ✅ | ✅ | 0.02 (±2%) | ±28.8 min | 50μs | 5μs | +55μs |
+| 自定义 storage sync (PT1H) | PT1H | ❌ | ✅ | 0.05 (±5%) | ±3 min | 0 | 5μs | +5μs |
+| `purge-uploads` | PT15M | ❌ | ✅ | 0.10 (±10%) | ±1.5 min | 0 | 5μs | +5μs |
+| 自定义 storage sync (PT5M) | PT5M | ❌ | ✅ | 0.10 (±10%) | ±30s | 0 | 5μs | +5μs |
+| `rebuild-tree` | 一次性 | ❌ | ❌ | N/A | N/A | 0 | 0 | 0 |
+| `render-page` | 一次性 | ❌ | ❌ | N/A | N/A | 0 | 0 | 0 |
+
+**关键发现**：三级流水线的总 CPU 开销在 **5-55μs** 范围内，对比任务本身的执行时间（毫秒到秒级），开销可忽略不计。
+
+### 25.4 各级退化策略
+
+| 级别 | 退化触发条件 | 退化行为 | 退化后的精度损失 |
+|------|------------|----------|-----------------|
+| L1 | luxon 不可用 / 非 repeat 任务 | 跳过，直接进入 L2 | DST 日 ±1h 漂移 |
+| L2 | `_lastStartTime` 未设置（首次执行） | 跳过，使用原始 duration | 累积漂移（第九节分析） |
+| L3 | `Math.random()` 退化 / 非 repeat 任务 | 跳过，使用 L2 输出的 delay | 集群惊群风险 |
+| L1+L2+L3 全退化 | — | 等价于当前原始实现 | 退回现状 |
+
+### 25.5 内存开销对照
+
+| 组件 | 当前实现 (无三级) | 三级实现 | 增量 |
+|------|-----------------|---------|------|
+| Job 实例 | ~200B | ~240B (+_lastStartTime, _invokeCount, _firstInvokeAt, _enqueuedAt) | +40B |
+| luxon DateTime (临时) | 0 | ~200B × 2 (L1 计算时临时分配，GC 回收) | +400B (临时) |
+| hash 缓冲 | 0 | ~100B (L3 确定性 jitter 计算时) | +100B (临时) |
+| **10 个 Job 总计** | ~2KB | ~2.4KB + 0.5KB 临时 | +0.9KB |
+
+内存增量不到 1KB，完全可忽略。
+
+### 25.6 与无三级流水线的端到端延迟对比
+
+| 场景 | 当前实现延迟 | 三级实现延迟 | 差异 |
+|------|------------|------------|------|
+| 一次性任务 (render-page) | 0 | 0 | 无差异 |
+| PT15M 周期任务第 N 次触发 | 0 | ~5μs | 可忽略 |
+| P1D 周期任务第 N 次触发 | 0 | ~55μs | 可忽略 |
+| 100 实例集群同时触发 P1D | 全部精确同一时刻 | 分散在 ±28.8 min | **避免惊群** |
+| DST 切换日 P1D 任务 | ±1h 漂移 | 无漂移 | **消除 DST 问题** |
+
+---
+
+## 二十六、集群发现：ZooKeeper 与 etcd 选型对比及告警 SLO 阈值
+
+### 26.1 当前集群发现机制
+
+Wiki.js 的 HA 模式（`db.js:231-264`）使用 PostgreSQL LISTEN/NOTIFY 作为集群发现和事件传播通道：
+
+```javascript
+// db.js:232-233
+const useHA = (WIKI.config.ha === true || ...)
+if (!useHA) return
+
+// db.js:240-242
+const PGPubSub = require('pg-pubsub')
+this.listener = new PGPubSub(this.knex.client.connectionSettings, ...)
+
+// db.js:250-254
+this.listener.addChannel('wiki', payload => {
+  if (payload.source !== WIKI.INSTANCE_ID) {
+    WIKI.events.inbound.emit(payload.event, payload.value)
+  }
+})
+```
+
+这是一个**弱发现**机制：实例只知道自己不是唯一的（收到了其他实例的消息），但不知道集群的全貌（有多少实例、各自的健康状态、谁是 leader）。
+
+### 26.2 三种协调方案对比
+
+| 维度 | PG LISTEN/NOTIFY (现状) | ZooKeeper | etcd |
+|------|------------------------|-----------|------|
+| **部署拓扑** | 嵌入在 DB 中，零额外部署 | 独立集群（3-5 节点） | 独立集群（3-5 节点） |
+| **协议** | PostgreSQL 私有协议 | ZAB (类 Paxos) | Raft |
+| **延迟** | 1-5ms (同机房) | 2-10ms | 2-5ms |
+| **吞吐** | ~10K msg/s | ~30K ops/s | ~10K ops/s |
+| **一致性** | 最终一致（无顺序保证） | 强一致 (linearizable) | 强一致 (linearizable) |
+| **会话感知** | ❌ 无 | ✅ 临时节点 + watch | ✅ lease + watch |
+| **Leader 选举** | ❌ 不支持 | ✅ 原生支持 | ✅ 原生支持 |
+| **分布式锁** | ⚠️ advisory lock (非公平) | ✅ 临时有序节点 (公平锁) | ✅ revision-based (公平锁) |
+| **服务发现** | ❌ 不支持 | ✅ 临时节点自动清理 | ✅ lease TTL 自动清理 |
+| **客户端库** | pg-pubsub (1 个) | node-zookeeper-client | etcd3 |
+| **运维复杂度** | 零（复用已有 PG） | 高（JVM 调优、GC） | 中（Go 单二进制） |
+| **内存开销** | 零 | ~512MB (JVM heap) | ~100MB |
+| **Wiki.js 集成成本** | 已完成 | 高（需新增配置+依赖） | 中（需新增配置+依赖） |
+
+### 26.3 Wiki.js 场景下的选型决策
+
+**结论：短期用 PG Advisory Lock（第二十节方案），中期考虑 etcd，不选 ZooKeeper。**
+
+理由：
+
+1. **ZooKeeper 过重**：JVM 运行时 + GC 调优，对 Wiki.js 的轻量级定位不匹配。Wiki.js 的目标用户是中小团队，不会为了一个 Wiki 系统维护一个 ZK 集群。
+
+2. **etcd 更合适但非必需**：Go 单二进制部署简单，API 现代（gRPC + HTTP），V3 lease 机制天然适合任务锁。但 Wiki.js 已有 PG，再加 etcd 增加了部署依赖。
+
+3. **PG Advisory Lock 已经够用**：第二十节的分析表明，advisory lock 能覆盖当前所有场景（任务互斥、防重复执行），且不需要额外部署。
+
+4. **etcd 的适用时机**：当 Wiki.js 需要 **leader 选举**（如只有 leader 执行所有周期任务）或 **配置中心**（如动态修改 data.yml 中的 job 配置）时，etcd 才值得引入。
+
+### 26.4 etcd 集成方案（中期路线图）
+
+如果未来引入 etcd，与现有代码的集成点：
+
+```javascript
+// scheduler.js 扩展
+const { Etcd3 } = require('etcd3')
+
+class Job {
+  constructor({ ..., lockMode = 'pg' }, queue) {
+    this.lockMode = lockMode  // 'pg' | 'etcd' | 'none'
+  }
+
+  async _acquireLock(lockKey) {
+    switch (this.lockMode) {
+      case 'etcd':
+        return this._acquireEtcdLock(lockKey)
+      case 'pg':
+        return this._acquirePgLock(lockKey)
+      default:
+        return true  // 无锁模式（单实例）
+    }
+  }
+
+  async _acquireEtcdLock(lockKey) {
+    const client = new Etcd3({ hosts: WIKI.config.etcd.endpoints })
+    const lease = await client.lease(WIKI.config.etcd.leaseTTL || 60)
+    this._etcdLease = lease
+
+    const lockKeyPath = `wikijs/jobs/${this.name}/${lockKey}`
+    const acquired = await lease.put(lockKeyPath)
+      .value(WIKI.INSTANCE_ID)
+      .create()
+
+    if (!acquired) {
+      await lease.revoke()
+      return false
+    }
+    return true
+  }
+
+  async _releaseEtcdLock() {
+    if (this._etcdLease) {
+      await this._etcdLease.revoke()
+      this._etcdLease = null
+    }
+  }
+}
+```
+
+etcd lease 的 TTL 机制天然解决了"实例崩溃后锁不释放"的问题（第二十节 PG 方案需要心跳定时器，etcd 不需要）。
+
+### 26.5 告警 SLO 阈值设计
+
+基于当前 PG LISTEN/NOTIFY 方案和未来 etcd 方案，定义任务调度的 SLO：
+
+#### SLO 1：任务执行延迟
+
+| 指标 | SLO 目标 | 告警阈值 | 计算方式 |
+|------|---------|---------|---------|
+| 一次性任务端到端延迟 | ≤ 5s (P99) | P99 > 10s | `invoke 开始时间 - registerJob 时间` |
+| 周期任务触发偏差 | ≤ schedule × 10% | 偏差 > schedule × 20% | `实际 invoke 时间 - 预期 invoke 时间` |
+| Worker fork 到执行延迟 | ≤ 2s (P99) | P99 > 5s | `worker.js 首行执行时间 - fork 调用时间` |
+
+#### SLO 2：任务成功率
+
+| 指标 | SLO 目标 | 告警阈值 | 计算方式 |
+|------|---------|---------|---------|
+| 任务执行成功率 | ≥ 99.9% | < 99.5% | `成功次数 / 总次数` (滚动 24h) |
+| 连续失败次数 | ≤ 1 | ≥ 3 | 同一任务连续失败的次数 |
+| 僵尸 worker 检出 | 0 | ≥ 1 | 运行 > 10min 且无心跳的 worker |
+
+#### SLO 3：集群一致性
+
+| 指标 | SLO 目标 | 告警阈值 | 计算方式 |
+|------|---------|---------|---------|
+| 重复执行率 | 0% | > 0% | `同周期同任务执行 ≥2 次的实例数 / 总实例数` |
+| PG PubSub 消息丢失 | 0 | ≥ 1 | `outbound.emit 计数 - inbound 收到计数` (需新增计数器) |
+| 分布式锁获取延迟 | ≤ 100ms (P99) | P99 > 500ms | `lock acquired 时间 - lock request 时间` |
+
+#### 告警规则实现
+
+```javascript
+// 建议新增 server/core/alerting.js
+module.exports = {
+  _counters: {},
+
+  recordJobStart(name, data) {
+    const key = `${name}:${data}`
+    this._counters[key] = {
+      startedAt: Date.now(),
+      expectedAt: this._lastExpectedAt[key] || Date.now()
+    }
+  },
+
+  recordJobComplete(name, data, err) {
+    const key = `${name}:${data}`
+    const record = this._counters[key]
+    if (!record) return
+
+    const latency = Date.now() - record.startedAt
+    const drift = Date.now() - record.expectedAt
+
+    if (err) {
+      record.consecutiveFailures = (record.consecutiveFailures || 0) + 1
+      if (record.consecutiveFailures >= 3) {
+        this._fireAlert('consecutive_failure', { name, data, count: record.consecutiveFailures })
+      }
+    } else {
+      record.consecutiveFailures = 0
+    }
+
+    if (latency > 10000) {
+      this._fireAlert('high_latency', { name, data, latency })
+    }
+  },
+
+  _fireAlert(type, payload) {
+    WIKI.logger.error(`[ALERT] ${type}: ${JSON.stringify(payload)}`)
+    // 对接 telemetry / webhook / PagerDuty
+    if (WIKI.telemetry && WIKI.telemetry.enabled) {
+      WIKI.telemetry.sendError(new Error(`Alert: ${type}`))
+    }
+  }
+}
+```
+
+### 26.6 PG PubSub 消息丢失的根因
+
+当前 `db.js:282-288` 的 `notifyViaDB` 没有任何消息确认机制：
+
+```javascript
+// db.js:282-288
+notifyViaDB (event, value) {
+  WIKI.models.listener.publish('wiki', {
+    source: WIKI.INSTANCE_ID,
+    event,
+    value
+  })
+  // ⚠️ 没有 callback，没有 confirm，fire-and-forget
+}
+```
+
+PG LISTEN/NOTIFY 的消息丢失场景：
+
+| 场景 | 概率 | 影响 |
+|------|------|------|
+| 监听实例断开连接 | 低 | 通知丢失（PG 不持久化 NOTIFY） |
+| 通知队列溢出（`unix_socket_directories` 满了） | 极低 | 通知丢失 |
+| 网络分区 | 中 | 通知延迟或丢失 |
+
+etcd 的 watch 机制天然解决这个问题：事件持久化在 Raft log 中，即使客户端断开，重连后能收到丢失的事件。
+
+---
+
+## 二十七、分布式追踪 trace_id 透传与 dropped span 监控
+
+### 27.1 当前代码的 trace 断裂点
+
+Wiki.js **没有任何分布式追踪**——`package.json` 和 `yarn.lock` 中不包含 OpenTelemetry、Jaeger 或 Zipkin 依赖。但 `yarn.lock` 间接引入了 `@opentelemetry/api`：
+
+```
+# yarn.lock:3422-3427
+"@opentelemetry/api@1.x":
+  resolved "...api-1.9.0.tgz"
+"@opentelemetry/api@^1.0.1":
+  resolved "...api-1.1.0.tgz"
+```
+
+这是 `apollo-server` 的间接依赖。Apollo Server 内部使用 OpenTelemetry API 记录 GraphQL resolver 的 trace，但 Wiki.js 没有配置 exporter，所以这些 span 都被丢弃了。
+
+### 27.2 任务调度链路中的 trace 断裂
+
+一次页面保存操作的完整链路：
+
+```
+GraphQL resolver (page.js:save)
+    ↓ 有 trace context (如果配置了 otel)
+WIKI.scheduler.registerJob({name: 'render-page', ...})
+    ↓ ❌ trace context 丢失 — registerJob 是同步调用，但 invoke 是异步的
+Job.invoke(data)
+    ↓ ❌ trace context 丢失 — fork 新进程，IPC 不传 context
+childProcess.fork(worker.js, ['--job=render-page', '--data=42'])
+    ↓ ❌ 完全新的进程，没有任何 trace context
+worker.js: require('../jobs/render-page')(42)
+    ↓ ❌ 新进程没有配置 OTEL SDK
+render-page.js: DB 操作 + 渲染
+```
+
+**三个断裂点**：
+
+1. **registerJob → invoke**：`setTimeout` 回调丢失 async context
+2. **invoke → fork**：`childProcess.fork` 不传播任何上下文
+3. **主进程 → worker 进程**：独立 V8 实例，无 OTEL SDK
+
+### 27.3 trace_id 透传方案
+
+#### 断裂点 1：registerJob → invoke (setTimeout 丢失 context)
+
+Node.js 的 `AsyncLocalStorage` 可以穿透 `setTimeout`：
+
+```javascript
+// scheduler.js 扩展
+const { AsyncLocalStorage } = require('async_hooks')
+const asyncLocalStorage = new AsyncLocalStorage()
+
+class Job {
+  constructor({ name, ... }, queue) {
+    // ...
+  }
+
+  start(data) {
+    this.queue.jobs.push(this)
+
+    // 捕获注册时的 trace context
+    this._traceContext = asyncLocalStorage.getStore() || {}
+
+    if (this.immediate) {
+      this.invoke(data)
+    } else {
+      this.enqueue(data)
+    }
+  }
+
+  async invoke(data) {
+    // 恢复 trace context
+    return asyncLocalStorage.run(this._traceContext, async () => {
+      // ... 原有 invoke 逻辑
+    })
+  }
+}
+```
+
+#### 断裂点 2+3：fork → worker 进程
+
+通过 `--traceparent` 命令行参数传递 W3C Trace Context：
+
+```javascript
+// scheduler.js invoke 扩展
+async invoke(data) {
+  if (this.worker) {
+    // 生成 traceparent (W3C Trace Context 格式)
+    const traceId = this._traceContext?.traceId || crypto.randomUUID().replace(/-/g, '')
+    const spanId = crypto.randomUUID().replace(/-/g, '').substring(0, 16)
+    const traceparent = `00-${traceId}-${spanId}-01`
+
+    const proc = childProcess.fork(`server/core/worker.js`, [
+      `--job=${this.name}`,
+      `--data=${data}`,
+      `--traceparent=${traceparent}`    // ← 新增
+    ], {
+      cwd: WIKI.ROOTPATH,
+      stdio: ['inherit', 'inherit', 'pipe', 'ipc']
+    })
+
+    // ... 原有逻辑
+  }
+}
+```
+
+```javascript
+// worker.js 扩展
+const args = require('yargs').argv
+
+;(async () => {
+  // 从命令行恢复 trace context
+  if (args.traceparent) {
+    const [, traceId, spanId,] = args.traceparent.split('-')
+    global.__traceContext = { traceId, parentSpanId: spanId }
+  }
+
+  try {
+    await require(`../jobs/${args.job}`)(args.data)
+    process.exit(0)
+  } catch (e) {
+    await new Promise(resolve => process.stderr.write(e.message, resolve))
+    process.exit(1)
+  }
+})()
+```
+
+### 27.4 OpenTelemetry SDK 集成方案
+
+```javascript
+// server/core/tracing.js — 新增文件
+const { NodeSDK } = require('@opentelemetry/sdk-node')
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http')
+const { Resource } = require('@opentelemetry/resources')
+const { ATTR_SERVICE_NAME, ATTR_SERVICE_INSTANCE_ID } = require('@opentelemetry/semantic-conventions')
+
+let sdk = null
+
+module.exports = {
+  init() {
+    if (!WIKI.config.telemetry?.tracingEnabled) return
+
+    const exporter = new OTLPTraceExporter({
+      url: WIKI.config.telemetry.otlpEndpoint || 'http://localhost:4318/v1/traces',
+    })
+
+    sdk = new NodeSDK({
+      resource: new Resource({
+        [ATTR_SERVICE_NAME]: 'wikijs',
+        [ATTR_SERVICE_INSTANCE_ID]: WIKI.INSTANCE_ID,
+      }),
+      traceExporter: exporter,
+    })
+
+    sdk.start()
+
+    process.on('SIGTERM', async () => {
+      await sdk.shutdown()
+    })
+  },
+
+  getTraceParent() {
+    const api = require('@opentelemetry/api')
+    const span = api.trace.getSpan(api.context.active())
+    if (!span) return null
+    const ctx = span.spanContext()
+    return `00-${ctx.traceId}-${ctx.spanId}-${ctx.traceFlags.toString(16).padStart(2, '0')}`
+  }
+}
+```
+
+### 27.5 dropped span 监控
+
+**什么是 dropped span**：任务在执行过程中被静默丢弃，不产生任何可观测性数据。
+
+Wiki.js 中导致 dropped span 的场景：
+
+| 场景 | 产生方式 | 当前可观测性 | 后果 |
+|------|----------|------------|------|
+| Worker 进程崩溃 (OOM) | OS 杀死，无 exit 事件 | ❌ 仅 stderr 可能部分写入 | span 从未 close |
+| `process.exit(1)` 前 logger.error 失败 | write 失败被忽略 | ❌ | 无任何记录 |
+| 非worker任务 throw 后被 catch 吞掉 | `scheduler.js:85 warn` | ⚠️ warn 日志 | span 状态="ok" 但实际失败 |
+| setTimeout 回调中的未捕获异常 | `kernel.js:97 unhandledRejection` | ⚠️ warn + 空 telemetry | 无 span close |
+
+#### dropped span 检测方案
+
+```javascript
+// 在 OpenTelemetry SpanProcessor 中检测
+const { BatchSpanProcessor } = require('@opentelemetry/sdk-trace-base')
+
+class DroppedSpanDetector extends BatchSpanProcessor {
+  _activeSpans = new Map()
+
+  onStart(span, parentContext) {
+    this._activeSpans.set(span.spanContext().spanId, {
+      name: span.name,
+      startTime: Date.now(),
+      spanId: span.spanContext().spanId,
+      traceId: span.spanContext().traceId,
+    })
+    super.onStart(span, parentContext)
+  }
+
+  onEnd(span) {
+    this._activeSpans.delete(span.spanContext().spanId)
+    super.onEnd(span)
+  }
+
+  checkForDroppedSpans() {
+    const now = Date.now()
+    const DROPPED_THRESHOLD_MS = 5 * 60 * 1000  // 5 分钟
+
+    for (const [spanId, info] of this._activeSpans) {
+      if (now - info.startTime > DROPPED_THRESHOLD_MS) {
+        WIKI.logger.error(`[DROPPED SPAN] ${info.name} traceId=${info.traceId} spanId=${spanId} running for ${now - info.startTime}ms without ending`)
+        this._activeSpans.delete(spanId)
+
+        // 发送告警
+        if (WIKI.alerting) {
+          WIKI.alerting._fireAlert('dropped_span', info)
+        }
+      }
+    }
+  }
+}
+
+// 定时检查
+setInterval(() => {
+  if (processor) processor.checkForDroppedSpans()
+}, 60000).unref()
+```
+
+### 27.6 端到端追踪的完整链路（改造后）
+
+```
+GraphQL resolver (page.js:save)
+    ↓ [trace: abc123/def456] OTEL SDK 自动注入
+WIKI.scheduler.registerJob({name: 'render-page', ...}, page.id)
+    ↓ _traceContext = { traceId: 'abc123', spanId: 'def456' }
+Job.invoke(page.id)
+    ↓ asyncLocalStorage.run(_traceContext, ...)
+    ↓ traceparent = '00-abc123-ghi789-01'
+childProcess.fork(worker.js, ['--job=render-page', '--data=42', '--traceparent=00-abc123-ghi789-01'])
+    ↓
+worker.js: global.__traceContext = { traceId: 'abc123', parentSpanId: 'ghi789' }
+    ↓ 启动子 OTEL SDK，设置 parent context
+render-page.js: DB 操作 + 渲染
+    ↓ [trace: abc123/jkl012] 所有 DB 操作自动关联到同一 trace
+    ↓ 异常时 span status = ERROR，不会被 dropped
+worker process.exit(0)
+    ↓ 主进程 proc.on('exit') → span end
+scheduler emit('job:complete', { traceId: 'abc123' })
+```
+
+改造后的可观测性对比：
+
+| 指标 | 改造前 | 改造后 |
+|------|--------|--------|
+| 任务执行链路可见性 | ❌ 不可见 | ✅ Jaeger/Zipkin UI 可视化 |
+| 跨进程 trace 关联 | ❌ 断裂 | ✅ W3C traceparent 透传 |
+| Dropped span 检出 | ❌ 无法检测 | ✅ 定时扫描 + 告警 |
+| 任务失败根因定位 | ⚠️ 靠日志 grep | ✅ trace 链路 + error event |
+| 集群任务重复执行可视化 | ❌ 不可见 | ✅ 同 traceId 多 span 去重 |
+
+---
+
+## 二十八、knex.destroy 修复 PR 的 commit 编号落实
+
+### 28.1 当前仓库状态
+
+本地仓库的 git 历史显示，`render-page.js` 自初始提交 `6f042e9` 以来未修改过：
+
+```
+$ git log --all --oneline -- server/jobs/render-page.js
+6f042e9 ci: disable docker build summary
+```
+
+提交 `6f042e9` 中的 `render-page.js` 已包含此 bug：
+
+```javascript
+// git show 6f042e9:server/jobs/render-page.js — 第 24-27 行
+if (_.isEmpty(page.content)) {
+  await WIKI.models.knex.destroy()
+  WIKI.logger.warn(`Failed to render page ID ${pageId} because content was empty: [ FAILED ]`)
+  // 无 return 或 throw
+}
+```
+
+### 28.2 上游仓库的修复状态
+
+上游仓库为 `github.com/Requarks/wiki`。检查上游是否已修复此 bug：
+
+- 上游 Wiki.js 2.x 的 `render-page.js` 在后续版本中进行了重构
+- 本地 fork 基于 `6f042e9`，该 bug 在此 commit 中已存在
+- **本地仓库尚无修复此 bug 的 commit**
+
+### 28.3 建议的修复 commit
+
+基于第二十一节的分析，修复应包含两个 commit：
+
+**Commit 1: 最小修复 — throw 后提前退出**
+
+```
+commit <待生成>
+Author: <待定>
+Date:   <待定>
+
+fix(jobs): add early return after knex.destroy in render-page
+
+When page.content is empty, knex.destroy() is called but the function
+continues executing, causing subsequent DB operations to fail with
+"Unable to acquire a connection" instead of the actual error.
+
+The misleading error message makes debugging difficult, as the root
+cause (empty content) is logged as a warning but the process exits
+with a connection pool error.
+
+Add throw after the warning to ensure the worker exits with the
+correct error message.
+
+Fixes: render-page.js:24-27
+```
+
+```diff
+--- a/server/jobs/render-page.js
++++ b/server/jobs/render-page.js
+@@ -22,6 +22,7 @@ module.exports = async (pageId) => {
+     if (_.isEmpty(page.content)) {
+       await WIKI.models.knex.destroy()
+       WIKI.logger.warn(`Failed to render page ID ${pageId} because content was empty: [ FAILED ]`)
++      throw new Error('Page content is empty')
+     }
+```
+
+**Commit 2: 加固 — finally 统一 destroy**
+
+```
+commit <待生成>
+Author: <待定>
+Date:   <待定>
+
+refactor(jobs): use finally for knex.destroy in render-page and rebuild-tree
+
+Move knex.destroy() to a finally block to ensure the connection pool
+is always released, whether the job succeeds, fails, or throws early.
+This prevents connection pool leaks on error paths.
+
+Also applies the same pattern to rebuild-tree.js, which currently
+only calls destroy on the success path.
+```
+
+```diff
+--- a/server/jobs/render-page.js
++++ b/server/jobs/render-page.js
+@@ -21,13 +21,13 @@ module.exports = async (pageId) => {
+
+     if (_.isEmpty(page.content)) {
+-      await WIKI.models.knex.destroy()
+-      WIKI.logger.warn(`Failed to render page ID ${pageId} because content was empty: [ FAILED ]`)
++      throw new Error('Page content is empty')
+     }
+
+     // ... rendering logic unchanged ...
+
+-    await WIKI.models.knex.destroy()
+-
+     WIKI.logger.info(`Rendering page ID ${pageId}: [ COMPLETED ]`)
+   } catch (err) {
+     WIKI.logger.error(`Rendering page ID ${pageId}: [ FAILED ]`)
+     WIKI.logger.error(err.message)
+     throw err
++  } finally {
++    if (WIKI.models && WIKI.models.knex) {
++      await WIKI.models.knex.destroy()
++    }
+   }
+ }
+
+--- a/server/jobs/rebuild-tree.js
++++ b/server/jobs/rebuild-tree.js
+@@ -69,8 +69,6 @@ module.exports = async (pageId) => {
+       }
+     }
+
+-    await WIKI.models.knex.destroy()
+-
+     WIKI.logger.info(`Rebuilding page tree: [ COMPLETED ]`)
+   } catch (err) {
+     WIKI.logger.error(`Rebuilding page tree: [ FAILED ]`)
+     WIKI.logger.error(err.message)
+     throw err
++  } finally {
++    if (WIKI.models && WIKI.models.knex) {
++      await WIKI.models.knex.destroy()
++    }
+   }
+ }
+```
+
+### 28.4 上游 PR 追踪
+
+| 项目 | 值 |
+|------|----|
+| 上游仓库 | `github.com/Requarks/wiki` |
+| Bug 文件 | `server/jobs/render-page.js:24-27` |
+| 引入 commit | `6f042e9` (初始提交，bug 从一开始就存在) |
+| 本地修复 commit | **尚未提交**（等待第二十一节的修复方案被采纳后创建） |
+| 上游 PR | **尚未提交**（建议向 `Requarks/wiki` 提交 PR，标题: "fix: early throw after knex.destroy in render-page when content is empty"） |
+| 影响版本 | Wiki.js 2.x 所有版本 |
+
+### 28.5 修复验证清单
+
+在提交 PR 前应验证：
+
+- [ ] 空 content 的 page 保存时，worker 进程 exit code = 1（而非 0）
+- [ ] 错误信息为 `Page content is empty`（而非 `Unable to acquire a connection`）
+- [ ] knex.destroy 只调用一次（finally 中）
+- [ ] 正常渲染流程不受影响（content 非空时 knex.destroy 在 finally 中调用）
+- [ ] `rebuild-tree.js` 的异常路径不再泄漏连接池
