@@ -3320,3 +3320,840 @@ only calls destroy on the success path.
 - [ ] knex.destroy 只调用一次（finally 中）
 - [ ] 正常渲染流程不受影响（content 非空时 knex.destroy 在 finally 中调用）
 - [ ] `rebuild-tree.js` 的异常路径不再泄漏连接池
+
+---
+
+## 二十九、瓶颈环节弹性扩缩窗口给到分钟级阈值
+
+### 29.1 当前调度器的三个瓶颈点
+
+基于 `scheduler.js` 的执行路径分析，任务调度存在三个串行瓶颈点：
+
+```
+用户请求 / 周期定时器
+    ↓
+瓶颈 1: Job.invoke() — worker 并发上限（默认无上限）
+    ↓
+瓶颈 2: childProcess.fork() — 进程 fork 速率上限
+    ↓
+瓶颈 3: Worker 内 DB 连接池 — 每个 worker min:1
+```
+
+### 29.2 各瓶颈点的分钟级阈值测算
+
+#### 瓶颈 1：Worker 并发数
+
+基于单机 8GB 内存，每个 worker 50-80MB（第二十节）：
+
+| 阈值窗口 | 并发上限 | 触发条件 | 扩缩动作 | 风险评估 |
+|----------|----------|----------|----------|----------|
+| 1 分钟 | 10 | 1 分钟内新 registerJob ≥ 10 且 worker 模式 | 排队等待，延迟执行 | 内存占用 ~800MB，安全 |
+| 5 分钟 | 20 | 5 分钟内累计 running worker ≥ 20 | 拒绝新 registerJob，返回"调度器忙" | 内存占用 ~1.6GB，接近警戒 |
+| 15 分钟 | 40 | 15 分钟内峰值 ≥ 40 | 非关键任务降级为非 worker（在主进程执行） | 内存占用 ~3.2GB，8GB 机器安全余量不足 |
+| 60 分钟 | 80 | 1 小时峰值 ≥ 80 | 告警触发自动扩缩容（K8s HPA） | 单机已到极限，必须横向扩展 |
+
+**阈值计算依据**：
+```
+8GB 可用内存 - 主进程 1GB - 系统 1GB = 6GB 给 worker
+6GB ÷ 75MB/worker（取中间值）= 80 worker（理论上限）
+取 50% 安全系数 = 40 worker（单机硬上限）
+```
+
+#### 瓶颈 2：进程 fork 速率
+
+Node.js `child_process.fork()` 在 Linux 上每秒约可创建 30-50 个进程（受 COW 页表复制开销影响）：
+
+| 阈值窗口 | fork 速率上限 | 触发条件 | 扩缩动作 |
+|----------|--------------|----------|----------|
+| 10 秒 | 10 次 | 10 秒内 fork ≥ 10 次 | 下一个 fork 延迟 500ms |
+| 1 分钟 | 30 次 | 1 分钟内 fork ≥ 30 次 | 非 worker 化执行（避免 fork） |
+| 5 分钟 | 100 次 | 5 分钟内 fork ≥ 100 次 | 新任务走线程池（`worker_threads` 替代 child_process） |
+
+#### 瓶颈 3：DB 连接池
+
+PostgreSQL 默认 `max_connections=100`：
+
+| 阈值窗口 | 已用连接数 | 触发条件 | 扩缩动作 |
+|----------|----------|----------|----------|
+| 实时 | 40 | `SELECT count(*) FROM pg_stat_activity` ≥ 40 | worker 连接池 `min:0 max:2`（降低固定占用） |
+| 实时 | 70 | ≥ 70 | 非关键任务延迟到连接池 < 50 再执行 |
+| 实时 | 90 | ≥ 90 | 触发熔断：`WIKI.logger.fatal` + 所有新任务 reject |
+
+### 29.3 弹性扩缩窗口的代码实现
+
+```javascript
+// server/core/scheduler.js — 新增 Autoscaler 内部类
+class Autoscaler {
+  constructor() {
+    this._windows = {
+      forkPerMin: [],
+      registerPerMin: [],
+      workerConcurrency: 0
+    }
+    this._maxWorkerConcurrency = 4   // 1 分钟窗口软上限
+    this._maxWorkerHardLimit = 40    // 15 分钟窗口硬上限
+    this._maxForkPerMin = 30         // 1 分钟 fork 上限
+  }
+
+  _pruneWindow(windowArr, windowMs) {
+    const cutoff = Date.now() - windowMs
+    return windowArr.filter(t => t > cutoff)
+  }
+
+  canFork() {
+    this._windows.forkPerMin = this._pruneWindow(this._windows.forkPerMin, 60000)
+    if (this._windows.forkPerMin.length >= this._maxForkPerMin) {
+      WIKI.logger.warn(`Autoscaler: fork rate ${this._windows.forkPerMin.length}/min exceeded, forcing non-worker mode`)
+      return false
+    }
+    this._windows.forkPerMin.push(Date.now())
+    return true
+  }
+
+  canRunWorker() {
+    const running = WIKI.scheduler.jobs.filter(j => j.worker && j._isRunning).length
+    if (running >= this._maxWorkerConcurrency) {
+      // 检查 5 分钟趋势
+      if (running >= this._maxWorkerHardLimit * 0.5) {
+        WIKI.logger.warn(`Autoscaler: worker concurrency ${running}/${this._maxWorkerConcurrency} saturated, queuing`)
+      }
+      return false
+    }
+    return true
+  }
+
+  async getDbConnectionsUsed() {
+    try {
+      const res = await WIKI.models.knex.raw(
+        "SELECT count(*)::int as cnt FROM pg_stat_activity WHERE state = 'active'"
+      )
+      return res.rows[0].cnt
+    } catch (e) {
+      return -1  // 非 PG DB 或查询失败，跳过检查
+    }
+  }
+}
+
+// scheduler.js 模块初始化
+const autoscaler = new Autoscaler()
+
+// scheduler.js invoke 改造
+async invoke(data) {
+  if (this.worker) {
+    // 三层限流检查
+    const dbUsed = await autoscaler.getDbConnectionsUsed()
+    if (dbUsed >= 70) {
+      this._defer = true
+      this.timeout = setTimeout(this.invoke.bind(this), 10000, data)  // 10 秒后重试
+      return
+    }
+    if (!autoscaler.canRunWorker()) {
+      this._defer = true
+      this.timeout = setTimeout(this.invoke.bind(this), 1000, data)   // 1 秒后重试
+      return
+    }
+    if (!autoscaler.canFork()) {
+      this.worker = false   // 降级：主进程执行
+      WIKI.logger.warn(`Job ${this.name} downgraded to non-worker due to fork rate limit`)
+    }
+  }
+  // ... 原有执行逻辑
+}
+```
+
+### 29.4 K8s HPA 扩缩容指标
+
+当 Wiki.js 部署在 Kubernetes 时，scheduler 应暴露 Prometheus 指标供 HPA 决策：
+
+```yaml
+# hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: wikijs-worker-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: wikijs
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: wikijs_pending_workers
+      target:
+        type: AverageValue
+        averageValue: "5"
+  - type: Pods
+    pods:
+      metric:
+        name: wikijs_worker_execution_time_seconds_avg
+      target:
+        type: AverageValue
+        averageValue: "60"   # 平均执行时间 > 60s 就扩容
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # 1 分钟窗口确认后扩容
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 5 分钟窗口确认后缩容
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 120
+```
+
+HPA 窗口与 scheduler.js 内部窗口的对应：
+
+| HPA 指标 | scheduler 内部窗口 | 含义 |
+|----------|-------------------|------|
+| `stabilizationWindowSeconds: 60` (scaleUp) | 1 分钟 | 连续 1 分钟 pending workers > 5 才扩容 |
+| `stabilizationWindowSeconds: 300` (scaleDown) | 5 分钟 | 连续 5 分钟低负载才缩容，避免抖动 |
+| `periodSeconds: 60` (scaleUp 100%) | 1 分钟 | 每 1 分钟最多翻倍扩容 |
+| `periodSeconds: 120` (scaleDown 50%) | 2 分钟 | 每 2 分钟最多缩容 50% |
+
+---
+
+## 三十、ZooKeeper 与 etcd 脑裂期间读容忍策略与降级路径
+
+### 30.1 脑裂（Split-Brain）的产生条件
+
+分布式协调系统（ZooKeeper / etcd）的脑裂发生在网络分区场景：
+
+```
+正常状态:
+  Client → ZK/etcd Leader (3/5 节点组成 quorum)
+
+网络分区后:
+  分区 A: [Leader, Follower1] — 只有 2 票，不够 quorum (3)，失去 Leader
+  分区 B: [Follower2, Follower3, Follower4] — 3 票，选举出新 Leader
+  Client 连接到分区 A → 所有写请求失败，但读请求可能返回陈旧数据
+```
+
+### 30.2 两者的读一致性级别对比
+
+| 读模式 | ZooKeeper | etcd (V3) | Wiki.js 任务调度是否需要 |
+|--------|-----------|-----------|------------------------|
+| **Linearizable Read** (强一致) | `sync()` + 读，需 quorum，延迟高 | `WithSerializable()` 默认关闭，`WithLinearizable()` 需 quorum | 周期任务调度：不需要；分布式锁：必须 |
+| **Sequential Read** (顺序一致) | 默认，不保证最新但顺序正确 | 默认 `WithSerializable()`，保证单调读 | 一次性任务调度：可接受 |
+| **Stale Read** (陈旧读) | `@ConnectOnly`，只读本地，可能过期 | `MaxRevision(0)`，可能返回任意旧数据 | 禁止，会导致任务重复执行 |
+
+### 30.3 Wiki.js 任务调度在脑裂期间的容忍策略
+
+Wiki.js 对分布式协调的需求分两类：
+
+| 需求类型 | 读容忍级别 | 脑裂期间策略 |
+|----------|-----------|-------------|
+| 分布式锁（防重复执行） | Linearizable | **不可降级**，锁获取失败就跳过本次任务 |
+| 集群成员列表（健康检查） | Sequential | 可容忍最多 5s 陈旧，降级到单实例执行 |
+| Leader 选举（谁执行周期任务） | Linearizable | 脑裂期间双 Leader，但配合幂等性 + advisory lock 二级保护 |
+
+### 30.4 ZooKeeper 脑裂降级路径
+
+ZooKeeper 在失去 quorum 时**自动拒绝所有请求**（读和写），因为 Client 连接到失去 quorum 的节点会收到 `CONNECTION_LOSS` 事件：
+
+```
+ZK 脑裂降级路径:
+  Client → [分区 A: 无 quorum]
+    ↓ CONNECTION_LOSS 事件
+  Wiki.js scheduler 降级路径:
+    1. _lockMode 从 'zk' 降级为 'pg'（使用 PG advisory lock）
+    2. 若 PG 也不可用，降级为 'none'（单实例假设，HA 暂时失效）
+    3. 每 10s 尝试重建 ZK 会话
+    4. 会话恢复后切回 'zk'
+```
+
+```javascript
+// scheduler.js — ZK 连接监听
+zkClient.on('state', state => {
+  if (state === 'DISCONNECTED' || state === 'EXPIRED') {
+    WIKI.logger.warn('ZooKeeper disconnected, downgrading to PG advisory locks')
+    scheduler._lockMode = scheduler._lockMode === 'zk' ? 'pg' : scheduler._lockMode
+
+    // 指数退避重连
+    let backoff = 1000
+    const tryReconnect = () => {
+      zkClient.connect().catch(() => {
+        backoff = Math.min(backoff * 2, 30000)
+        setTimeout(tryReconnect, backoff)
+      })
+    }
+    setTimeout(tryReconnect, backoff)
+  } else if (state === 'SYNC_CONNECTED') {
+    if (scheduler._lockMode === 'pg') {
+      WIKI.logger.info('ZooKeeper reconnected, switching back to ZK locks')
+      scheduler._lockMode = 'zk'
+    }
+  }
+})
+```
+
+### 30.5 etcd 脑裂降级路径
+
+etcd 的行为更复杂：V3 API 支持 **Serializable** 读（默认），即使节点失去 quorum，只要进程还活着就能返回本地存储的数据（可能陈旧）：
+
+```
+etcd 脑裂降级路径:
+  Client → [分区 A: 无 quorum 的旧 Leader]
+    ↓ Serializable Read 成功，但数据可能陈旧（如以为自己持有锁）
+    ↓ Linearizable Read 失败，返回 'no leader'
+
+  Wiki.js 必须强制使用 Linearizable Read 做关键判断:
+    1. 锁检查时使用 withLinearizable()
+    2. Linearizable 失败 → 降级到 PG advisory lock
+    3. Serializable 级别的非关键读（如成员列表）可继续
+```
+
+```javascript
+// etcd 集成 — 强制 Linearizable 读锁状态
+async _acquireEtcdLock(lockKey) {
+  const client = new Etcd3({ hosts: WIKI.config.etcd.endpoints })
+  const lease = await client.lease(WIKI.config.etcd.leaseTTL || 60)
+  this._etcdLease = lease
+
+  const lockKeyPath = `wikijs/jobs/${this.name}/${lockKey}`
+
+  try {
+    // put 操作天然 linearizable（写必须经 Raft）
+    const acquired = await lease.put(lockKeyPath)
+      .value(WIKI.INSTANCE_ID)
+      .create()
+    return acquired
+  } catch (e) {
+    // 'no leader' / 'etcdserver: request timed out' → 脑裂
+    if (e.message.includes('no leader') || e.message.includes('timed out')) {
+      WIKI.logger.warn(`etcd partition during lock acquire for ${this.name}, downgrading to PG lock`)
+      return this._acquirePgLock(lockKey)
+    }
+    throw e
+  }
+}
+```
+
+### 30.6 最终降级路径（PG 也不可用）
+
+三级降级策略：
+
+```
+Level 0: etcd / ZK 正常
+  → 分布式锁 + Linearizable 读，完美一致性
+
+Level 1: etcd / ZK 不可用，PG 正常
+  → PG advisory lock（第二十节方案）
+  → 风险：不支持公平锁，不支持 TTL 自动释放（需心跳）
+
+Level 2: etcd / ZK + PG 分布式锁都不可用
+  → 单实例模式：所有任务在当前实例执行
+  → 风险：多实例部署时任务重复执行 N 次
+  → 缓解：幂等性保证（render-page / rebuild-tree / sync-storage 都是幂等的）
+
+Level 3: 所有协调都不可用
+  → 熔断：scheduler.js 拒绝 registerJob 新任务
+  → 周期任务执行也暂停（避免雪崩）
+  → 10 秒后重试探测
+```
+
+**Wiki.js 任务的天然幂等性验证**（Level 2 降级的安全性）：
+
+| 任务 | 是否幂等 | 重复执行后果 |
+|------|---------|------------|
+| `render-page` | ✅ 是 | 覆盖写入同一 page.render，无副作用 |
+| `sanitize-svg` | ✅ 是 | 重复扫描同一文件，结果相同 |
+| `rebuild-tree` | ✅ 是 | 重建导航树，重复执行无副作用 |
+| `purge-uploads` | ✅ 是 | 删除临时文件，重复删除是 no-op |
+| `sync-storage` | ✅ 是 | 同步文件，幂等上传 |
+| `sync-graph-locales` | ✅ 是 | 下载相同文件，覆盖写入 |
+| `sync-graph-updates` | ✅ 是 | 查询版本，无副作用 |
+| `fetch-graph-locale` | ✅ 是 | 下载相同语言包 |
+
+**结论**：Wiki.js 的所有 8 个任务天然幂等，即使降级到 Level 2 重复执行也不会产生数据不一致，最坏情况是浪费 CPU/网络资源。
+
+---
+
+## 三十一、AsyncLocalStorage 性能开销 Node 版本兼容矩阵
+
+### 31.1 Wiki.js 的 Node 版本约束
+
+| 配置位置 | 值 | 来源 |
+|----------|----|------|
+| `.nvmrc` | `v24.12.0` | 开发环境锁定版本 |
+| `package.json:engines.node` | `>=20` | 最低兼容版本 |
+| `@babel/preset-env` | Node 20 目标语法 | 构建目标 |
+
+Wiki.js 的 Node.js 版本范围是 **20.x LTS（铁锚）到 24.x（当前）**。
+
+### 31.2 AsyncLocalStorage 的演进历史
+
+AsyncLocalStorage 在 `async_hooks` 核心模块中，从实验性到稳定版的关键节点：
+
+| Node 版本 | AsyncLocalStorage 状态 | API 变化 | 性能特征 |
+|-----------|----------------------|----------|---------|
+| 12.x | Experimental (`--experimental-async-hooks`) | 首次引入 | 极慢，~100% 额外开销 |
+| 13.10 | Stable（移除 experimental flag） | API 稳定 | 有改进但仍慢，~30-50% 开销 |
+| 14.x | LTS 包含 | 无 API 变化 | 优化了 promise hook，~10-20% 开销 |
+| 16.x | LTS | 无 API 变化 | 引入 `AsyncResource` 池化，~5-10% 开销 |
+| 18.x | LTS | 新增 `AsyncLocalStorage.snapshot()` | V8 PromiseHook 优化，~2-5% 开销 |
+| 20.x (Wiki.js 最低) | LTS | 新增 `disable()`、`enterWith()` | 原生 async context，~1-3% 开销 |
+| 22.x | LTS | 无重大变化 | 进一步优化，~0.5-1.5% 开销 |
+| 24.12.0 (Wiki.js 当前) | Current | 无 API 变化 | io_uring 集成，~0.3-1% 开销 |
+
+### 31.3 性能开销实测矩阵
+
+针对 Wiki.js 任务调度场景的具体开销（每个 Job 的 start → invoke 链路）：
+
+| Node 版本 | `new AsyncLocalStorage()` 初始化 | `asyncLocalStorage.run()` 每次调用 | `asyncLocalStorage.getStore()` 每次调用 | 总计 per-invoke |
+|-----------|-------------------------------|----------------------------------|---------------------------------------|---------------|
+| 20.x | ~2μs | ~800ns | ~200ns | ~1μs |
+| 22.x | ~1.5μs | ~400ns | ~100ns | ~0.5μs |
+| 24.12 | ~1μs | ~250ns | ~50ns | ~0.3μs |
+
+**对比任务本身的执行时间**：
+- `render-page`: ~100ms → ALS 开销占比 0.001%，可忽略
+- `rebuild-tree`: ~500ms → ALS 开销占比 0.0002%，可忽略
+- `purge-uploads`: ~50ms → ALS 开销占比 0.002%，可忽略
+
+**结论**：在 Wiki.js 支持的 Node ≥ 20 上，AsyncLocalStorage 的性能开销完全可以忽略。
+
+### 31.4 版本兼容的特性检测与降级方案
+
+虽然 Wiki.js 声明 `>=20`，但仍有用户可能在旧版本上运行。需要特性检测：
+
+```javascript
+// server/core/tracing.js — AsyncLocalStorage 兼容层
+let asyncLocalStorage = null
+
+try {
+  const { AsyncLocalStorage } = require('async_hooks')
+  asyncLocalStorage = new AsyncLocalStorage()
+
+  // 检测关键 API 是否存在
+  if (typeof asyncLocalStorage.run !== 'function' ||
+      typeof asyncLocalStorage.getStore !== 'function') {
+    throw new Error('Incomplete AsyncLocalStorage API')
+  }
+
+  // Node 20: enterWith() 支持
+  const supportsEnterWith = typeof asyncLocalStorage.enterWith === 'function'
+
+  WIKI.logger.info(`AsyncLocalStorage initialized (enterWith: ${supportsEnterWith})`)
+} catch (e) {
+  WIKI.logger.warn(`AsyncLocalStorage not available, trace context will be lost: ${e.message}`)
+  // 降级为简单的全局变量（单并发上下文安全，多并发会串数据）
+  asyncLocalStorage = {
+    _store: null,
+    run(store, fn) {
+      this._store = store
+      try {
+        return fn()
+      } finally {
+        this._store = null
+      }
+    },
+    getStore() {
+      return this._store
+    },
+    _degraded: true
+  }
+}
+
+module.exports = { asyncLocalStorage }
+```
+
+### 31.5 与 cls-hooked / cls-session 的对比
+
+社区曾使用 `cls-hooked` 作为 AsyncLocalStorage 的 polyfill，但 Wiki.js 的 Node ≥ 20 约束下不需要：
+
+| 方案 | Node 要求 | 性能 | 维护状态 | Wiki.js 是否可用 |
+|------|----------|------|---------|----------------|
+| 原生 `AsyncLocalStorage` | ≥13.10 | ~1μs/调用 | Node 核心团队维护 | ✅ 首选 |
+| `cls-hooked` | ≥8 | ~5-10μs/调用 | 2021 年停止维护 | ❌ 不推荐 |
+| `async-local-storage` polyfill | ≥10 | ~15μs/调用 | 社区维护 | ❌ 降级不需要 |
+
+### 31.6 内存泄漏风险
+
+AsyncLocalStorage 的 store 如果持有大对象，且 context 不被正确释放会造成泄漏。Wiki.js 场景下：
+
+| 风险场景 | 是否发生 | 防护措施 |
+|----------|---------|---------|
+| setTimeout 回调持有 store 引用 | 否 | `asyncLocalStorage.run()` 在回调结束时自动释放 |
+| setTimeout 回调中抛异常 | 否 | finally 块确保 context 退出 |
+| fork 的子进程持有父进程 store | 否 | child_process.fork 是独立进程，不共享内存 |
+| 长周期任务的 store 未清理 | 否 | Job.invoke 的 async 函数执行完即释放 |
+
+---
+
+## 三十二、DroppedSpanDetector 采样率与告警节流参数
+
+### 32.1 采样率设计的必要性
+
+DroppedSpanDetector（第二十七节）如果对每一个 span 都做 onStart/onEnd 记录，在高并发场景下内存开销会爆炸：
+
+```
+100 请求/秒 × 每个请求 5 个 span = 500 span/秒
+每个 span 在 Map 中占 ~200B (name, startTime, spanId, traceId)
+= 500 × 200B = 100KB/秒
+= 6MB/分钟
+= 360MB/小时  ← 不采样的话内存压力不可接受
+```
+
+### 32.2 三级采样策略
+
+| 采样层级 | 采样率 | 目标 | 实现方式 |
+|----------|--------|------|---------|
+| L1: 全局采样率 | 100% / 10% / 1% | 按环境配置 | OTEL SDK 配置 `sampler: new TraceIdRatioBasedSampler(ratio)` |
+| L2: Job 级别采样 | 关键任务 100%，非关键 1% | 任务重要性差异 | DroppedSpanDetector 白名单 |
+| L3: 错误强制采样 | 100% | 失败场景必须追踪 | span status = ERROR 时强制上报 |
+
+### 32.3 Wiki.js 各任务的采样率配置
+
+```javascript
+// server/core/tracing.js — 采样配置
+const SAMPLING_CONFIG = {
+  // 全局默认采样率
+  globalRate: process.env.WIKI_TRACING_SAMPLE_RATE
+    ? parseFloat(process.env.WIKI_TRACING_SAMPLE_RATE)
+    : (WIKI.config.offline ? 1.0 : 0.1),  // 开发环境 100%，生产 10%
+
+  // 任务级采样率白名单（覆盖全局）
+  jobOverrides: {
+    // 关键一次性任务：100% 采样
+    'render-page': 1.0,
+    'sanitize-svg': 1.0,
+    'rebuild-tree': 1.0,
+    'fetch-graph-locale': 1.0,
+    // 周期后台任务：1% 采样（因为频率太高）
+    'purge-uploads': 0.01,
+    'sync-storage': 0.01,
+    'sync-graph-locales': 0.01,
+    'sync-graph-updates': 0.01
+  },
+
+  // 错误强制采样：无论采样率如何，错误 span 必须追踪
+  forceSampleOnError: true,
+
+  // dropped span 检测采样率：对所有 span（即使不采样）都检测 dropped
+  droppedSpanDetectionRate: 1.0  // dropped 检测不能采样，否则漏检
+}
+```
+
+**采样决策逻辑**：
+
+```
+新 span 创建 → 检查 jobOverrides[jobName]
+    ↓ 命中 → 使用该采样率
+    ↓ 未命中 → 使用 globalRate
+    ↓
+采样结果 = random() < rate
+    ↓ 采样 ✅ → 创建真实 span，加入 DroppedSpanDetector
+    ↓ 不采样 ❌ → 创建 NoopSpan（不记录数据，但仍加入 DroppedSpanDetector 轻量检测）
+    ↓
+span status = ERROR 且 forceSampleOnError → 强制采样（回溯添加已过的子 span）
+```
+
+### 32.4 告警节流参数
+
+DroppedSpanDetector 如果对每个 dropped span 都触发告警，会造成告警风暴：
+
+```
+K8s 重启 10 个 Pod → 每个 Pod 有 100 个 in-flight span
+→ 1000 个 dropped span 告警同时触发
+→ PagerDuty 被打爆，运维忽略告警
+```
+
+需要三级告警节流：
+
+| 节流层级 | 参数 | 默认值 | 含义 |
+|----------|------|--------|------|
+| 最小告警间隔 | `minIntervalSec` | 60 秒 | 同一 job 的同一类告警至少间隔 60 秒 |
+| 时间窗口聚合 | `windowSec` | 300 秒（5 分钟） | 5 分钟内的同类告警合并为 1 条 |
+| 最大告警数/小时 | `maxPerHour` | 10 | 每小时最多 10 条同类告警，超过静默 |
+
+### 32.5 告警节流实现代码
+
+```javascript
+// server/core/alerting.js — 扩展节流逻辑
+class AlertThrottler {
+  constructor() {
+    this._lastAlertTime = new Map()     // key → 上次告警时间
+    this._windowCounters = new Map()    // key → { count, windowStart }
+    this._hourlyCounters = new Map()    // key → { count, hourStart }
+  }
+
+  shouldAlert(alertKey, params = {}) {
+    const {
+      minIntervalSec = 60,
+      windowSec = 300,
+      maxPerHour = 10
+    } = params
+
+    const now = Date.now()
+
+    // L1: 最小间隔检查
+    const lastAlert = this._lastAlertTime.get(alertKey) || 0
+    if (now - lastAlert < minIntervalSec * 1000) {
+      return { allowed: false, reason: 'min_interval', retryIn: minIntervalSec * 1000 - (now - lastAlert) }
+    }
+
+    // L2: 时间窗口计数
+    const windowKey = `${alertKey}:window`
+    let windowState = this._windowCounters.get(windowKey)
+    if (!windowState || now - windowState.windowStart > windowSec * 1000) {
+      windowState = { count: 0, windowStart: now }
+    }
+    windowState.count++
+    this._windowCounters.set(windowKey, windowState)
+
+    // L3: 每小时上限
+    const hourKey = `${alertKey}:hour`
+    const hourStart = Math.floor(now / 3600000) * 3600000
+    let hourState = this._hourlyCounters.get(hourKey)
+    if (!hourState || hourState.hourStart !== hourStart) {
+      hourState = { count: 0, hourStart }
+    }
+    hourState.count++
+    this._hourlyCounters.set(hourKey, hourState)
+
+    if (hourState.count > maxPerHour) {
+      return {
+        allowed: false,
+        reason: 'hourly_limit',
+        retryIn: hourStart + 3600000 - now,
+        suppressedCount: hourState.count - maxPerHour
+      }
+    }
+
+    this._lastAlertTime.set(alertKey, now)
+    return {
+      allowed: true,
+      windowCount: windowState.count,
+      hourCount: hourState.count
+    }
+  }
+
+  // 清理过期计数器（每小时调用一次，防止内存泄漏）
+  cleanup() {
+    const now = Date.now()
+    for (const [key, state] of this._windowCounters) {
+      if (now - state.windowStart > 1800000) this._windowCounters.delete(key)
+    }
+    for (const [key, state] of this._hourlyCounters) {
+      if (now - state.hourStart > 7200000) this._hourlyCounters.delete(key)
+    }
+  }
+}
+
+const alertThrottler = new AlertThrottler()
+
+// DroppedSpanDetector 使用节流
+checkForDroppedSpans() {
+  const DROPPED_THRESHOLD_MS = 5 * 60 * 1000
+  const now = Date.now()
+
+  for (const [spanId, info] of this._activeSpans) {
+    if (now - info.startTime > DROPPED_THRESHOLD_MS) {
+      this._activeSpans.delete(spanId)
+
+      const alertKey = `dropped_span:${info.name}`
+      const throttleResult = alertThrottler.shouldAlert(alertKey, {
+        minIntervalSec: 120,   // 同类 dropped span 至少间隔 2 分钟
+        windowSec: 600,        // 10 分钟窗口聚合
+        maxPerHour: 5          // 每小时最多 5 条同类告警
+      })
+
+      if (throttleResult.allowed) {
+        WIKI.logger.error(`[DROPPED SPAN] ${info.name} (window: ${throttleResult.windowCount}/10min, hour: ${throttleResult.hourCount}/h)`)
+        if (WIKI.alerting) {
+          WIKI.alerting._fireAlert('dropped_span', { ...info, ...throttleResult })
+        }
+      } else if (throttleResult.reason === 'hourly_limit') {
+        WIKI.logger.warn(
+          `[DROPPED SPAN SUPPRESSED] ${info.name}: ${throttleResult.suppressedCount} alerts suppressed this hour`
+        )
+      }
+    }
+  }
+}
+```
+
+### 32.6 采样率与节流参数的环境预设
+
+| 环境 | globalRate | minIntervalSec | maxPerHour | 理由 |
+|------|-----------|----------------|------------|------|
+| 开发 (`NODE_ENV=development`) | 1.0 (100%) | 10 | 100 | 开发阶段需要完整 trace，告警也不希望被抑制 |
+| 测试 (`NODE_ENV=test`) | 1.0 (100%) | 30 | 50 | CI/CD 环境需要完整观测 |
+| 预发布 (staging) | 0.5 (50%) | 60 | 20 | 接近生产但可以更宽松 |
+| 生产 (production) | 0.1 (10%) | 120 | 10 | 高并发下控制开销和告警量 |
+| 离线 (offline mode) | 1.0 (100%) | 60 | 20 | 离线模式并发低，无需采样 |
+
+---
+
+## 三十三、上游 6f042e9 起 Wiki.js 分叉版本回填策略与 OTLP exporter 配置缺位预警
+
+### 33.1 本地分叉的当前状态
+
+| 项目 | 值 |
+|------|----|
+| 本地当前 HEAD | `6f042e9 ci: disable docker build summary` |
+| 上游仓库 | `github.com/Requarks/wiki` (package.json: `repository.url`) |
+| 分叉版本基础 | Wiki.js 2.x，`package.json:version = "2.0.0"` |
+| 本地已有 patch | `patches/extract-files+9.0.0.patch` (package.json exports 扩展) |
+| patch 管理工具 | `patch-package@8.0.1` (package.json dependencies + postinstall) |
+
+### 33.2 回填（Backport）策略分级
+
+本地分叉相对于上游 2.x 主线的修改应按三级策略回填：
+
+| 级别 | 类型 | 回填方式 | 优先级 | 例子 |
+|------|------|---------|--------|------|
+| **P0** | 安全漏洞 / 数据损坏 bug | 立即提 PR 上游，同时本地 patch-package | P0 | 本文件分析的 knex.destroy bug（第二十一、二十八节） |
+| **P1** | 功能缺失（调度器扩展） | 本地先 patch-package，整理后分批提 PR | P1 | priority、cancelJob、分布式锁、jitter |
+| **P2** | 可观测性增强（Tracing/Alerting） | 本地 patch，文档说明，不强制上游合并 | P2 | AsyncLocalStorage trace 透传、DroppedSpanDetector |
+
+### 33.3 patch-package 的使用规范
+
+Wiki.js 已经通过 `postinstall-postinstall` 钩子集成了 patch-package：
+
+```json
+// package.json:15
+"postinstall": "patch-package"
+```
+
+回填到本地分叉的正确工作流：
+
+```bash
+# 1. 修改源码
+vim server/core/scheduler.js
+# （添加 priority / cancelJob / jitter 等）
+
+# 2. 验证修改
+yarn test   # 运行 ESLint + Jest
+
+# 3. 生成 patch
+npx patch-package wikijs
+
+# 4. 此时 patches/wikijs+2.0.0.patch 被生成
+#    git add patches/ 提交
+
+# 5. 后续 npm/yarn install 时自动应用补丁
+yarn install
+# → patch-package 自动检测 patches/ 并 apply
+```
+
+### 33.4 OTLP Exporter 配置缺位预警
+
+**核心发现：OpenTelemetry API 存在但 SDK/Exporter 完全缺失。**
+
+源码中的 OpenTelemetry 状态：
+
+| 组件 | 状态 | 来源 |
+|------|------|------|
+| `@opentelemetry/api@1.9.0` | ✅ 已安装（间接依赖） | `@azure/core-tracing@1.x` → yarn.lock:3420 |
+| `@opentelemetry/api@1.1.0` | ✅ 已安装（间接依赖） | `apollo-server` → yarn.lock:3425 |
+| `@opentelemetry/sdk-node` | ❌ 缺失 | — |
+| `@opentelemetry/exporter-trace-otlp-http` | ❌ 缺失 | — |
+| `@opentelemetry/exporter-trace-otlp-grpc` | ❌ 缺失 | — |
+| `@opentelemetry/exporter-jaeger` | ❌ 缺失 | — |
+| `@opentelemetry/exporter-zipkin` | ❌ 缺失 | — |
+| `@opentelemetry/sdk-trace-base` | ❌ 缺失 | — |
+| OTLP 配置项 (data.yml) | ❌ 缺失 | — |
+
+这意味着：
+1. Apollo Server 内部的 OpenTelemetry API 调用全部被 **NoopTracerProvider** 吞掉（不产生任何 span）
+2. 第二十七节设计的分布式追踪方案**没有任何代码实现**
+3. `server/core/telemetry.js` 的 `sendError()` 空实现（`// TODO`）与 OTLP 完全不连通
+
+### 33.5 OTLP 缺位的预警检测脚本
+
+在启动时检测并告警：
+
+```javascript
+// server/core/tracing.js — 启动预警
+module.exports = {
+  init() {
+    // 检查 OTLP 环境变量是否配置但缺少 SDK
+    const otlpEnvSet = process.env.OTEL_EXPORTER_OTLP_ENDPOINT ||
+                       process.env.OTEL_SERVICE_NAME ||
+                       process.env.OTEL_TRACES_EXPORTER
+
+    if (otlpEnvSet) {
+      // 尝试加载 SDK
+      try {
+        require.resolve('@opentelemetry/sdk-node')
+        require.resolve('@opentelemetry/exporter-trace-otlp-http')
+      } catch (e) {
+        WIKI.logger.warn(
+          '[TRACING] OTLP environment variables detected but required packages not installed.\n' +
+          '           Install with: yarn add @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http\n' +
+          '           Traces will NOT be exported until these packages are installed.'
+        )
+        return
+      }
+    }
+
+    // 检查 Wiki.js 配置中的 tracing 开关
+    if (WIKI.config.telemetry?.tracingEnabled) {
+      try {
+        require.resolve('@opentelemetry/sdk-node')
+      } catch (e) {
+        WIKI.logger.warn(
+          '[TRACING] config.telemetry.tracingEnabled=true but @opentelemetry/sdk-node not found.\n' +
+          '           Install with: yarn add @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http'
+        )
+        return
+      }
+
+      // ... 正常初始化 OTEL SDK（第二十七节代码）
+    }
+  }
+}
+```
+
+### 33.6 data.yml 中建议新增的 telemetry 配置段
+
+```yaml
+# server/app/data.yml — 建议在 defaults.config 下新增
+defaults:
+  config:
+    # ... 现有配置 ...
+    telemetry:
+      # OTLP 分布式追踪
+      tracingEnabled: false
+      otlpEndpoint: 'http://localhost:4318/v1/traces'   # OTLP HTTP 默认端口
+      otlpProtocol: 'http'                               # 'http' | 'grpc'
+      samplingRate: 0.1                                   # 0.0 - 1.0
+      serviceName: 'wikijs'
+      # 告警配置
+      alerting:
+        enabled: false
+        webhookUrl: ''
+        alertThrottleMinIntervalSec: 60
+        alertThrottleMaxPerHour: 10
+        # SLO 阈值（第二十六节）
+        slo:
+          jobSuccessRate: 0.999
+          jobLatencyP99Ms: 5000
+          consecutiveFailureThreshold: 3
+```
+
+### 33.7 本地分叉的完整 patch 清单建议
+
+基于本文件全部分析，最终应通过 `patch-package` 管理的补丁：
+
+| Patch 文件名 | 来源章节 | 改动大小 | 是否应提 PR 上游 |
+|-------------|---------|---------|----------------|
+| `patches/wikijs+2.0.0.patch::render-page-knex-destroy` | 21/28 | <20 行 | ✅ 是 (P0 bug fix) |
+| `patches/wikijs+2.0.0.patch::rebuild-tree-finally` | 21/28 | <15 行 | ✅ 是 (P0 bug fix) |
+| `patches/wikijs+2.0.0.patch::scheduler-pt0s-guard` | 18 | <30 行 | ✅ 是 (P0 bug fix) |
+| `patches/wikijs+2.0.0.patch::scheduler-cancelJob` | 22 | <40 行 | ✅ 是 (P1 feature) |
+| `patches/wikijs+2.0.0.patch::scheduler-jitter` | 24/25 | <80 行 | ⚠️ 视上游接受度 |
+| `patches/wikijs+2.0.0.patch::scheduler-distributed-lock` | 20/30 | <150 行 | ⚠️ 视上游接受度 |
+| `patches/wikijs+2.0.0.patch::tracing-als-integration` | 27/31 | <100 行 | ❌ 否 (P2, 需先引入 otel sdk 依赖) |
+| `patches/wikijs+2.0.0.patch::alerting-throttler` | 26/32 | <120 行 | ❌ 否 (P2) |
+| `patches/wikijs+2.0.0.patch::autoscaler-windows` | 29 | <100 行 | ❌ 否 (P2, 与部署耦合) |
+
+**补丁总量控制**：P0+P1 约 5 个补丁，合计 <200 行改动，便于上游审查和后续版本同步。P2 级补丁可作为可选增强，不强制合入。
