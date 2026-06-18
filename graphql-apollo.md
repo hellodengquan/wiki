@@ -734,6 +734,265 @@ router.get('/logout', async (req, res) => {
 
 所有身份状态变化都伴随着页面刷新，从根本上避免了单页应用中常见的"登出后缓存残留"问题。
 
+### 3.11 多 Tab 协同：跨 Tab 同步与登出联动
+
+#### 3.11.1 跨 Tab 同步机制：代码中是否存在？
+
+**结论：不存在任何跨 Tab 同步机制。**
+
+全局搜索结果：
+
+| 搜索项 | 结果 |
+|--------|------|
+| `BroadcastChannel` | 整个项目零匹配 |
+| `addEventListener('storage', ...)` / `onstorage` | 客户端零匹配 |
+| `SharedWorker` | 零匹配 |
+| `postMessage` (跨窗口) | 零匹配 |
+
+客户端对 `localStorage` 的使用仅限于两个无关场景：
+- `nav-sidebar.vue:115` — 存储导航偏好 (`navPref`)
+- `admin-utilities-cache.vue:90-95` — 管理员清除 i18n 缓存
+
+**没有任何代码监听 `storage` 事件或使用 `BroadcastChannel` 来实现跨 Tab 状态同步。**
+
+#### 3.11.2 一个 Tab 退出登录，其他 Tab 会怎样？
+
+**场景**：用户在 Tab A 点击退出登录，Tab B（同源）仍在运行。
+
+**Tab A 的行为**（`client/components/common/nav-header.vue:475-477`）：
+```javascript
+logout () {
+  window.location.assign('/logout')
+}
+```
+
+服务端 `server/controllers/auth.js:129-134`：
+```javascript
+router.get('/logout', async (req, res) => {
+  const redirURL = await WIKI.models.users.logout({ req, res })
+  req.logout()
+  res.clearCookie('jwt')    // 服务端清除 Cookie
+  res.redirect(redirURL)    // 重定向到首页
+})
+```
+
+**Tab B 的状态**：
+
+| 维度 | 状态 | 说明 |
+|------|------|------|
+| Apollo Cache | 仍然存在 | 内存中的 JS 对象，Tab B 的 JS 上下文不受 Tab A 影响 |
+| Vuex Store | 仍然存在 | 同上，内存独立 |
+| Cookie 中的 JWT | **已被清除** | `res.clearCookie('jwt')` 是服务端操作，Cookie 是浏览器共享的，Tab A 的请求导致同源 Cookie 被删除 |
+| WebSocket 连接 | 仍然存活 | 见 3.12 节详述 |
+
+**Tab B 继续使用会发生什么**：
+
+1. **下一次 GraphQL 请求**：BatchHttpLink 自定义 fetch 从 Cookie 读 JWT（`client/client-app.js:96-99`），此时 Cookie 已空，不会注入 `Authorization` 头。请求到达服务端后，Passport JWT 认证失败，服务端设置 `req.user` 为 guest 用户（`server/core/auth.js:170-177`）。
+2. **需要权限的查询**：`@auth` 指令检查 `req.user.permissions`，guest 用户的权限不满足 → 返回 `Forbidden` 错误。
+3. **ErrorLink 处理**：`client/client-app.js:60-68` 捕获 `Forbidden` 错误，弹出通知 "You are not authorized to access this resource."
+4. **Vuex 中的用户信息**：Tab B 的 Vuex 仍然认为用户已认证（`authenticated: true`），这是**过时的状态**。
+
+**关键问题**：Tab B 不会自动感知到登出事件，Vuex 中的 `authenticated` 和 `permissions` 会保持过期状态，直到：
+- 用户手动刷新 Tab B（触发 `REFRESH_AUTH`，Cookie 已空 → `authenticated = false`）
+- 用户在 Tab B 发起任何需要权限的操作（被服务端拒绝，但不会自动跳转登录页）
+
+**当前没有代码处理这种"静默登出"场景**——不会自动跳转登录页，也不会主动清除 Vuex 状态。
+
+#### 3.11.3 `res.clearCookie('jwt')` 的 Cookie 属性匹配问题
+
+Cookie 的 `set` 和 `clear` 必须使用相同的 `domain`、`path`、`secure` 属性才能正确删除。
+
+**写入时**（`server/helpers/common.js:45-49`）：
+```javascript
+getCookieOpts () {
+  return {
+    expires: DateTime.utc().plus({ days: 365 }).toJSDate(),
+    ...(WIKI.config.host.startsWith('https://') ? { secure: true } : {})
+  }
+}
+```
+
+**清除时**（`server/controllers/auth.js:132`）：
+```javascript
+res.clearCookie('jwt')
+```
+
+`clearCookie` 默认使用 `{ path: '/' }`，而 `cookie()` 也默认 `path: '/'`。`secure` 属性在 HTTPS 环境下：`set` 时带 `secure: true`，`clearCookie` 默认不带。但 Express 的 `res.clearCookie` 在 v4.x 中会根据当前请求是否为 HTTPS 自动处理，所以实际不构成问题。
+
+但如果配置了自定义 `domain`（通过反向代理），`clearCookie` 不带 `domain` 可能导致无法删除 Cookie。当前代码中没有显式设置 `domain`，所以默认行为是安全的。
+
+### 3.12 WebSocket / SSE 长连接在 Token 失效时的断开行为
+
+#### 3.12.1 SSE：不存在
+
+**代码中不存在任何 SSE（Server-Sent Events / EventSource）实现。** 全局搜索 `EventSource`、`text/event-stream`、`SSE` 均零匹配（服务端的少量匹配来自存储模块的无关代码）。
+
+Wiki.js 的实时通信完全依赖 GraphQL Subscription over WebSocket。
+
+#### 3.12.2 WebSocket 连接的建立与生命周期
+
+**唯一使用 WebSocket Subscription 的功能**：管理员日志实时控制台（`client/components/admin/admin-logging-console.vue:75-91`）。
+
+**连接建立**（`client/client-app.js:113-123`）：
+```javascript
+const graphQLWSLink = new WebSocketLink({
+  uri: graphQLWSEndpoint,
+  options: {
+    reconnect: true,   // 断开后自动重连
+    lazy: true,        // 延迟连接（首次订阅时才建立）
+    connectionParams: () => {
+      const token = Cookies.get('jwt')
+      return token ? { token } : {}
+    }
+  }
+})
+```
+
+**服务端鉴权**（`server/core/servers.js:128-162`）：
+```javascript
+subscriptions: {
+  onConnect: (connectionParams, webSocket) => {
+    let token = _.get(connectionParams, 'token', null)
+    if (!token) {
+      const cookieHeader = _.get(webSocket, 'upgradeReq.headers.cookie', '')
+      if (cookieHeader) {
+        const cookies = cookie.parse(cookieHeader)
+        token = cookies.jwt || null
+      }
+    }
+    if (!token) throw new Error('Unauthorized')
+    // JWT 验证...
+    if (!_.includes(user.permissions, 'manage:system')) throw new Error('Forbidden')
+    return { user }
+  },
+  // 注意：没有 onDisconnect 回调
+  path: '/graphql-subscriptions'
+}
+```
+
+#### 3.12.3 Token 失效后 WebSocket 是否自然断开？
+
+**结论：不会自然断开。** 具体分析：
+
+**WebSocket 连接一旦建立，就不再校验 Token。**
+
+`subscriptions.onConnect` 只在连接建立时执行一次。连接成功后，服务端**没有 `onDisconnect` 回调**（全局搜索确认），也没有任何定时校验 Token 有效性的机制。
+
+这意味着：
+- **Token 过期** → WebSocket 连接仍然存活，继续推送消息
+- **Cookie 被清除**（另一 Tab 退出登录）→ 不影响已建立的 WebSocket 连接
+- **服务端 Token 撤销**（`revokeUserTokens`）→ 不影响已建立的 WebSocket 连接
+
+**但实际影响有限**，原因：
+
+1. **只有 `manage:system` 权限的管理员能建立 WebSocket**：`onConnect` 中硬性检查（`server/core/servers.js:151`），非管理员根本无法建立订阅连接
+2. **唯一的使用场景是日志实时流**（`admin-logging-console.vue`），仅在管理员主动打开日志控制台时才建立连接
+3. **管理员退出登录时的整页跳转会销毁 WebSocket**：Tab A 执行 `window.location.assign('/logout')` → 页面卸载 → JS 上下文销毁 → WebSocket 连接关闭
+
+#### 3.12.4 WebSocket 重连时的 Token 校验
+
+`apollo-link-ws` 配置了 `reconnect: true`。当连接意外断开后尝试重连时：
+
+```javascript
+connectionParams: () => {
+  const token = Cookies.get('jwt')
+  return token ? { token } : {}
+}
+```
+
+`connectionParams` 是一个**函数**，每次重连时重新调用。此时：
+
+| 场景 | Cookie 状态 | 重连结果 |
+|------|-----------|---------|
+| Token 仍有效 | `jwt` 存在且有效 | 正常重连 |
+| 另一 Tab 已退出登录 | `jwt` 已被清除 | `connectionParams` 返回 `{}`，服务端 `onConnect` 中 `token` 为 `null` → `throw new Error('Unauthorized')` → **重连被拒绝** |
+| Token 过期 | `jwt` 仍存在但过期 | 服务端 JWT 验证失败 → `throw new Error('Unauthorized')` → **重连被拒绝** |
+
+重连失败后，`apollo-link-ws` 会按指数退避策略持续尝试重连，但每次都会被 `onConnect` 拒绝。**不会出现用过期 Token 成功重连的情况。**
+
+但客户端**没有对重连失败做用户可感知的处理**。`admin-logging-console.vue:84-90` 的 `error` 回调：
+```javascript
+error(error) {
+  self.$store.commit('showNotification', {
+    style: 'red',
+    message: error.message,
+    icon: 'warning'
+  })
+}
+```
+
+只在首次错误时弹出通知，后续的持续重连失败不会重复通知。日志控制台的 UI 仍显示 "Streaming..." 状态，用户可能误以为连接正常。
+
+#### 3.12.5 服务端 logout 时的 Token 撤销
+
+**关键发现：服务端 `/logout` 路由没有调用 `revokeUserTokens`。**
+
+`revokeUserTokens` 只在以下场景被调用（`server/graph/resolvers/user.js`、`server/graph/resolvers/group.js`）：
+- 管理员删除用户
+- 管理员停用用户
+- 管理员分配/取消分配用户组
+- 管理员删除/更新用户组
+
+`/logout` 路由（`server/controllers/auth.js:129-134`）只做了：
+1. 调用 `WIKI.models.users.logout()` — 只是获取策略级别的 logout 重定向 URL
+2. `req.logout()` — Passport session 登出（但 Wiki.js 使用 `session: false`，这一步无实际效果）
+3. `res.clearCookie('jwt')` — 清除浏览器 Cookie
+4. `res.redirect(redirURL)` — 重定向
+
+**这意味着**：如果用户在退出登录前，JWT 已被其他客户端截获，该 JWT 在过期前仍然有效（因为没有被加入撤销列表）。这是 Wiki.js 当前架构的一个安全特性缺失——logout 不导致 Token 失效。
+
+不过，由于 JWT 有 `exp` 声明且服务端会验证过期时间，这个窗口期受 `authJwtExpiration` 配置限制（默认较短）。
+
+### 3.13 多 Tab 场景完整时序图
+
+```
+Tab A (退出登录)                     服务端                       Tab B (仍在运行)
+─────────────────                    ───────                      ──────────────
+                                                                 │ Vuex: authenticated=true
+                                                                 │ Cookie: jwt=<valid>
+                                                                 │ WebSocket: 已建立(lazy模式可能未建立)
+                                                                 │ Apollo Cache: 有数据
+                                                                 │
+window.location.assign('/logout')    │                           │
+─────────────────────────────────>   │                           │
+                                     │                           │
+                         GET /logout  │                           │
+                         ──────────>  │                           │
+                                     │                           │
+                      users.logout() │                           │
+                      req.logout()   │                           │
+                      clearCookie('jwt')  ← 浏览器全局生效!      │
+                      redirect('/')  │                           │
+                      <──────────     │                           │
+                                     │                           │
+  [整页刷新, JS上下文销毁]            │                      Cookie: jwt=空!
+  Apollo Cache: 销毁                 │                      Vuex: authenticated=true (过期!)
+  Vuex: 销毁                         │                      Apollo Cache: 仍在 (内存隔离)
+  WebSocket: 断开                     │                      WebSocket: 仍在 (若已建立)
+                                     │                           │
+  [新页面加载]                        │                           │
+  REFRESH_AUTH → Cookie为空           │                           │
+  authenticated=false                 │                           │
+                                     │                      用户操作Tab B:
+                                     │                      ┌──────────────────┐
+                                     │                      │ 发起GraphQL请求   │
+                                     │                      │ → Cookie无jwt    │
+                                     │                      │ → Header无Bearer │
+                                     │                      │ → 服务端设guest   │
+                                     │                      │ → @auth拒绝→Forbidden
+                                     │                      │ → 弹出通知       │
+                                     │                      │ Vuex仍为true!    │
+                                     │                      └──────────────────┘
+                                     │                           │
+                                     │                      用户手动刷新Tab B:
+                                     │                      ┌──────────────────┐
+                                     │                      │ REFRESH_AUTH     │
+                                     │                      │ → Cookie为空     │
+                                     │                      │ → authenticated=false
+                                     │                      │ → 回到正确状态    │
+                                     │                      └──────────────────┘
+```
+
 ---
 
 ## 四、完整请求流程总览
