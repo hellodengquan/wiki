@@ -1031,3 +1031,430 @@ static async savePageToCache(page) {
 2. **撤销列表**：作为紧急通道，允许强制失效（不等待 token 过期）
 3. **分层缓存**：越上层（JWT）缓存时间越长，越下层（页面缓存）失效越快
 4. **HA 同步**：通过事件总线跨节点同步撤销事件
+
+---
+
+## 15. 搜索索引（Search Index）上的权限隔离路径
+
+### 15.1 搜索架构的两层模型
+
+Wiki.js 的搜索采用**"索引全量 + 查询时过滤"**的架构：
+
+```
+┌──────────────────────┐      ┌──────────────────────┐
+│   搜索引擎索引层      │      │   GraphQL Resolver  │
+│   (DB/ES/Algolia)    │      │       过滤层         │
+│                      │      │                      │
+│  索引所有页面数据     │ ───► │  checkAccess 逐页过滤 │
+│  不做权限隔离        │      │  返回可见的结果      │
+└──────────────────────┘      └──────────────────────┘
+```
+
+**核心原则**：搜索引擎本身不感知权限，索引所有页面；权限隔离在查询结果返回前的应用层完成。
+
+### 15.2 索引写入：全量索引，无权限标记
+
+以 Elasticsearch 为例（`server/modules/search/elasticsearch/engine.js:228-244`）：
+
+```js
+async created(page) {
+  await this.client.index({
+    index: this.config.indexName,
+    id: page.hash,
+    body: {
+      suggest: this.buildSuggest(page),
+      locale: page.localeCode,
+      path: page.path,
+      title: page.title,
+      description: page.description,
+      content: page.safeContent,
+      tags: await this.buildTags(page.id)
+    },
+    refresh: true
+  })
+}
+```
+
+索引文档中**不包含任何组ID、权限标记或可见性信息**，只存储：
+- 元数据：`locale`、`path`、`title`、`description`
+- 内容：`content`（安全渲染后的内容）
+- 标签：`tags`
+- 建议词：`suggest`
+
+**所有搜索引擎实现（DB / PostgreSQL / Elasticsearch / Algolia / Azure / AWS / Sphinx / Manticore）均遵循这一模式**。
+
+### 15.3 查询过滤：Resolver 层的事后过滤
+
+`server/graph/resolvers/page.js:52-64` 是搜索权限隔离的核心挂载点：
+
+```js
+async search (obj, args, context) {
+  if (WIKI.data.searchEngine) {
+    const resp = await WIKI.data.searchEngine.query(args.query, args)
+    return {
+      ...resp,
+      results: _.filter(resp.results, r => {
+        return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+          path: r.path,
+          locale: r.locale,
+          tags: r.tags  // 标签用于 TAG 类型规则的匹配
+        })
+      })
+    }
+  }
+}
+```
+
+**过滤过程**：
+1. 搜索引擎返回所有匹配结果（可能包含用户无权访问的页面）
+2. 遍历每一条结果，调用 `checkAccess` 做完整权限检查
+3. 只保留通过检查的结果
+4. `totalHits` 不会被修正（返回的是搜索引擎原始命中数，不是过滤后的数量）
+
+### 15.4 DB 搜索引擎的特殊情况
+
+`server/modules/search/db/engine.js:22-55`，即默认的数据库搜索引擎：
+
+```js
+async query(q, opts) {
+  const results = await WIKI.models.pages.query()
+    .column('pages.id', 'title', 'description', 'path', 'localeCode as locale')
+    .withGraphJoined('tags')  // 特意关联 tags，用于后续权限检查
+    .modifyGraph('tags', builder => {
+      builder.select('tag')
+    })
+    .where(builder => {
+      builder.where('isPublished', true)
+      // ... LIKE 查询
+    })
+    .limit(WIKI.config.search.maxHits)
+  return {
+    results,
+    suggestions: [],
+    totalHits: results.length
+  }
+}
+```
+
+注意：DB 引擎**不在 SQL 层做权限过滤**，而是和其他引擎一样，返回结果后在 resolver 层过滤。这保持了各搜索引擎实现的一致性。
+
+### 15.5 搜索权限隔离的完整调用链
+
+```
+用户搜索请求
+  │
+  ▼
+GraphQL: pages.search(query, path, locale)
+  │
+  ▼
+@auth 指令检查：用户是否有 read:pages 全局权限
+  │  无 → 直接拒绝
+  ▼  有
+WIKI.data.searchEngine.query(q, opts)
+  │
+  ├─ DB 引擎：LIKE 查询 pages 表
+  ├─ ES 引擎：查询 Elasticsearch 索引
+  └─ 其他引擎：各自的查询方式
+  │
+  ▼
+获得原始搜索结果（可能包含不可见页面）
+  │
+  ▼
+_.filter(results, r => checkAccess(user, ['read:pages'], r))
+  │
+  ├─ 全局权限检查（通常已通过，因为 @auth 已检查）
+  ├─ 页面规则检查
+  │   ├─ START/END/EXACT/REGEX/TAG 匹配
+  │   └─ 特异性仲裁
+  │
+  └─ 通过 → 保留；不通过 → 过滤掉
+  │
+  ▼
+返回过滤后的结果给前端
+```
+
+### 15.6 权限隔离的其他搜索相关挂载点
+
+**1. 标签搜索（searchTags）**：`server/graph/resolvers/page.js:56-59`
+
+```
+所有标签来自用户有权限的页面 → 过滤掉无权限页面的标签
+```
+
+**2. 页面列表（list）**：`server/graph/resolvers/page.js:76-147`
+
+```js
+results = _.filter(results, r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path,
+    locale: r.locale
+  })
+})
+```
+
+**3. 页面树（tree）**：`server/graph/resolvers/page.js:249-294`
+
+```js
+return results.filter(r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path,
+    locale: r.localeCode
+  })
+})
+```
+
+**4. 页面链接（links）**：`server/graph/resolvers/page.js:299-350`
+
+```js
+if (!WIKI.auth.checkAccess(..., ['read:pages'], { path: val.path, ... }) ||
+    !WIKI.auth.checkAccess(..., ['read:pages'], { path: val.link, ... })) {
+  return result  // 链接两端都要有权限才返回
+}
+```
+
+### 15.7 设计权衡分析
+
+| 设计选择 | 优点 | 缺点 |
+|---|---|---|
+| **索引全量 + 查询过滤** | 实现简单，索引逻辑与权限解耦；搜索引擎变更不影响权限逻辑 | 搜索性能有损耗（大结果集下过滤慢）；`totalHits` 不准确；可能泄露"存在不可见内容"的信息 |
+| **索引时标记权限** | 查询性能好；总数准确 | 索引复杂度高；组变更时需重建索引；权限变更延迟 |
+
+Wiki.js 选择了**前者**，优先保证实现简单和权限逻辑的一致性。
+
+---
+
+## 16. 跨空间（Locale / 组）的权限合并路径
+
+> **注意**：Wiki.js 2.x 没有名为 "Space" 的一等概念。权限"空间"主要体现在两个维度：
+> 1. **Locale（语言空间）**：不同语言的内容是独立的，页面规则可按语言限定
+> 2. **Groups（组空间）**：不同组有不同的权限集合，用户可跨组
+> 3. **Path 命名空间**：通过 START 匹配实现的路径级权限分区
+>
+> 以下从代码层面梳理这三个维度的权限合并逻辑。
+
+### 16.1 跨 Locale（语言空间）的权限合并
+
+#### 16.1.1 多语言内容的隔离基础
+
+Wiki.js 中每个页面都有 `localeCode`，不同语言的同名页面是独立的记录：
+
+```
+pages 表：
+  id    path              localeCode
+  1     home               en
+  2     home               zh
+  3     geography/countries  en
+  4     geography/countries  zh
+```
+
+`pageTree` 也是按语言分开构建的（`rebuild-tree.js:13` 中 `orderBy(['localeCode', 'path'])`）。
+
+#### 16.1.2 页面规则的 Locale 过滤
+
+`server/core/auth.js:249-251`，在规则匹配前先做语言过滤：
+
+```js
+if (rule.locales && rule.locales.length > 0) {
+  if (!rule.locales.includes(page.locale)) { return }
+}
+```
+
+**规则的 `locales` 字段语义**：
+- 空数组 `[]`：规则作用于**所有语言**
+- 非空数组 `['en', 'zh']`：规则**只作用于**指定的语言
+
+#### 16.1.3 跨语言的权限合并过程
+
+```
+用户访问 /geography/countries（locale=en）
+  │
+  ▼
+checkAccess(user, ['read:pages'], { path: 'geography/countries', locale: 'en' })
+  │
+  ├─ 遍历用户所有组的所有 pageRules
+  │
+  ├─ 规则 A：locales=[], match=START, path='geography' → 跳过语言过滤 → 匹配
+  │
+  ├─ 规则 B：locales=['zh'], match=EXACT, path='geography/countries' → 语言不匹配 → 跳过
+  │
+  ├─ 规则 C：locales=['en'], match=EXACT, path='geography/countries' → 语言匹配 → 匹配
+  │
+  ▼
+在匹配的规则中按特异性竞争决出最终结果
+```
+
+**关键理解**：语言过滤是第一道关卡——语言不匹配的规则直接被忽略，不参与后续的特异性竞争。
+
+#### 16.1.4 多语言下的权限继承
+
+每个语言空间的权限是**独立计算**的，不会跨语言继承：
+
+```
+组有一条规则：{ locales: ['en'], match: 'START', path: 'geography', roles: ['read:pages'] }
+
+用户访问：
+  ✓ /en/geography/countries → 通过（en 语言有 START 规则）
+  ✗ /zh/geography/countries → 拒绝（zh 语言没有匹配的规则）
+```
+
+如果要让所有语言都生效，规则的 `locales` 必须设为空数组（或者包含所有语言）。
+
+### 16.2 跨 Groups（组空间）的权限合并
+
+#### 16.2.1 全局权限：并集合并
+
+`server/models/users.js:153-155`：
+
+```js
+getGlobalPermissions() {
+  return _.uniq(_.flatten(_.map(this.groups, 'permissions')))
+}
+```
+
+**合并策略**：所有组的权限数组扁平化 → 去重 → 并集
+
+```
+组 A: [read:pages, write:pages]
+组 B: [read:pages, manage:assets]
+─────────────────────────────────
+用户: [read:pages, write:pages, manage:assets]
+```
+
+#### 16.2.2 页面规则：竞争合并
+
+与全局权限的"并集"不同，页面规则是**竞争**关系，不是并集。
+
+`server/core/auth.js:246-289`：
+
+```js
+user.groups.forEach(grp => {
+  const grpId = _.isObject(grp) ? _.get(grp, 'id', 0) : grp
+  _.get(WIKI.auth.groups, `${grpId}.pageRules`, []).forEach(rule => {
+    // ... 语言过滤 + 权限维度过滤 + 路径匹配
+    // 匹配的规则通过 _applyPageRuleSpecificity 竞争
+  })
+})
+```
+
+**所有组的所有规则放在同一个竞争池中**，按特异性优先级决出最终结果：
+- 路径更长的规则覆盖更短的
+- 匹配类型优先级高的覆盖低的
+- 同优先级下 DENY 覆盖 ALLOW
+
+#### 16.2.3 跨组合并的示例
+
+```
+组 A（编辑组）的规则：
+  - 规则1: START 'geography', roles=[read:pages, write:pages], deny=false
+
+组 B（审核组）的规则：
+  - 规则2: START 'geography/countries', roles=[read:pages], deny=false
+  - 规则3: EXACT 'geography/countries/china', roles=[write:pages], deny=true
+
+用户同时属于 A 和 B 两个组
+
+权限判定：
+  /geography/rivers → 匹配规则1（START） → 允许读+写
+  /geography/countries → 匹配规则1 + 规则2 → 规则2路径更长胜出 → 允许读
+  /geography/countries/china → 匹配规则1 + 规则2 + 规则3 → 规则3 EXACT 优先级最高 → 拒绝写
+```
+
+**注意**：即使组 A 允许写 `geography/countries/china`，只要组 B 有一条更高特异性的 DENY 规则，最终结果就是 DENY。因为所有规则共同竞争，不是"任一组允许就允许"。
+
+### 16.3 Path 命名空间的权限分区
+
+#### 16.3.1 START 规则的命名空间效果
+
+虽然 Wiki.js 没有名为 "namespace" 或 "space" 的正式概念，但通过 `START` 匹配可以实现路径级的权限分区：
+
+```
+规则 A：START 'engineering' → 作用于 engineering/ 下所有页面
+规则 B：START 'marketing'   → 作用于 marketing/ 下所有页面
+规则 C：START ''            → 作用于所有页面（空路径匹配一切）
+```
+
+这在效果上等同于把 wiki 分成多个"命名空间"，每个命名空间有独立的权限控制。
+
+#### 16.3.2 命名空间的嵌套覆盖
+
+由于特异性系统的存在，子命名空间可以覆盖父命名空间的规则：
+
+```
+规则 1（公司级）：START ''               → 全员 read:pages
+规则 2（部门级）：START 'engineering'    → eng 组 write:pages
+规则 3（项目级）：START 'engineering/secret' → 只有 management 组 read:pages
+```
+
+权限从粗到细逐层收敛，最具体的规则胜出。
+
+### 16.4 三维度合并的总流程
+
+```
+权限判定总公式：
+  最终结果 = 全局权限（组并集） ∩ 页面规则（跨组竞争 + 语言过滤 + 路径特异性）
+```
+
+完整流程：
+
+```
+用户发起操作（带 locale + path）
+  │
+  ├─ 第一步：全局权限检查
+  │   └─ 合并所有组的 permissions（并集）
+  │   └─ 与所需权限做交集
+  │   └─ 无交集 → 直接拒绝
+  │
+  ├─ 第二步：页面规则匹配（无页面上下文时跳过）
+  │   │
+  │   ├─ 遍历所有组的所有 pageRules
+  │   │
+  │   ├─ 语言过滤：rule.locales 包含 page.locale？
+  │   │   └─ 不包含 → 跳过该规则
+  │   │
+  │   ├─ 权限维度过滤：rule.roles 与所需权限有交集？
+  │   │   └─ 无交集 → 跳过该规则
+  │   │
+  │   ├─ 路径匹配：按 match 类型（START/END/EXACT/REGEX/TAG）判断
+  │   │   └─ 不匹配 → 跳过该规则
+  │   │
+  │   └─ 特异性仲裁：
+  │       ├─ 路径更长 → 覆盖
+  │       ├─ 路径相同但匹配类型优先级更高 → 覆盖
+  │       ├─ 都相同但 DENY → 覆盖 ALLOW
+  │       └─ 否则 → 保持当前胜出规则
+  │
+  └─ 第三步：最终判定
+      ├─ 没有任何规则匹配 → 拒绝（默认最严）
+      ├─ 匹配且 DENY → 拒绝
+      └─ 匹配且 ALLOW → 通过
+```
+
+### 16.5 Private NS（私有命名空间）：未完成的空间机制
+
+代码中存在 `isPrivate` 和 `privateNS` 字段（`server/models/pages.js:45`），但从实现来看**功能未完成**，多处使用 `'TODO'` 占位：
+
+```js
+// server/models/pages.js:306
+hash: pageHelper.generateHash({ path: opts.path, locale: opts.locale, privateNS: opts.isPrivate ? 'TODO' : '' }),
+```
+
+`pageHelper.generateHash` 的设计（`server/helpers/page.js:72`）：
+```js
+generateHash(opts) {
+  return crypto.createHash('sha1').update(`${opts.locale}|${opts.path}|${opts.privateNS}`).digest('hex')
+}
+```
+
+**设计意图推测**：privateNS 是为了实现真正的"私有命名空间"，同一 locale + path 在不同命名空间下是不同的页面（hash 不同）。但目前这一功能尚未实现。
+
+`checkAccess` 函数中也**没有使用 `page.private` 或 `page.privateNS` 做特殊处理**——私有页面的权限控制目前完全依赖页面规则实现，没有独立的私有命名空间权限机制。
+
+### 16.6 跨空间权限合并的关键特性总结
+
+| 维度 | 合并策略 | 关键代码位置 |
+|---|---|---|
+| **跨组全局权限** | 并集（任一组成员拥有即拥有） | `users.js:153-155` |
+| **跨组页面规则** | 竞争（特异性最高者胜出） | `auth.js:246-291` |
+| **跨语言规则** | 过滤（不匹配语言的规则忽略） | `auth.js:249-251` |
+| **跨路径（命名空间）** | 前缀匹配 + 特异性覆盖 | `auth.js:254-257` + `_applyPageRuleSpecificity` |
+| **私有命名空间** | 未实现（TODO 占位） | `pages.js:306` 等 |
