@@ -943,7 +943,166 @@ error(error) {
 
 不过，由于 JWT 有 `exp` 声明且服务端会验证过期时间，这个窗口期受 `authJwtExpiration` 配置限制（默认较短）。
 
-### 3.13 多 Tab 场景完整时序图
+### 3.14 修复路径分析：在 `/logout` 中补充 `revokeUserTokens`
+
+#### 3.14.1 在 `/logout` 中直接调用 `revokeUserTokens` 的可行性
+
+**可行，但需要正确获取用户 ID。**
+
+当前 `/logout` 路由的实现（`server/controllers/auth.js:129-134`）：
+```javascript
+router.get('/logout', async (req, res) => {
+  const redirURL = await WIKI.models.users.logout({ req, res })
+  req.logout()
+  res.clearCookie('jwt')
+  res.redirect(redirURL)
+})
+```
+
+此时 `req.user` 仍然可用（JWT 中间件已在 `server/core/auth.js` 中完成认证），所以可以直接：
+
+```javascript
+router.get('/logout', async (req, res) => {
+  const redirURL = await WIKI.models.users.logout({ req, res })
+  if (req.user && req.user.id !== 2) {              // id=2 是 Guest 用户，不需要撤销
+    WIKI.auth.revokeUserTokens({ id: req.user.id, kind: 'u' })
+    WIKI.events.outbound.emit('addAuthRevoke', { id: req.user.id, kind: 'u' })
+  }
+  req.logout()
+  res.clearCookie('jwt')
+  res.redirect(redirURL)
+})
+```
+
+**边界情况处理**：
+- `req.user` 为 `null` / 不存在（用户已通过其他方式登出）：跳过撤销操作
+- `req.user.id === 2`（Guest 用户）：Guest 用户永远不需要撤销，因为其权限是全局的、固定的
+- 撤销列表 TTL：`revokeUserTokens` 的 TTL 等于 `auth.tokenExpiration`，过期自动清理，无需手动维护
+
+#### 3.14.2 现有 `revokeUserTokens` 调用点是否需要重构成共享 helper
+
+**结论：建议重构，目前存在调用模板重复。**
+
+当前共有 7 处调用，每次都重复同一模式（`revokeUserTokens` + `outbound.emit`）：
+
+| 位置 | 触发场景 | kind |
+|------|---------|------|
+| `resolvers/user.js:87-88` | 删除用户 | `'u'` |
+| `resolvers/user.js:145-146` | 停用用户 | `'u'` |
+| `resolvers/group.js:86-87` | 分配用户到组 | `'u'` |
+| `resolvers/group.js:120-121` | 删除组 | `'g'` |
+| `resolvers/group.js:150-151` | 从组中取消分配用户 | `'u'` |
+| `resolvers/group.js:199-202` | 更新组（权限/规则变动时） | `'g'` |
+| `server/core/auth.js:488-489` | HA 事件订阅（inbound） | 通用 |
+
+**调用模板重复内容**：
+```javascript
+WIKI.auth.revokeUserTokens({ id: xxx, kind: 'u'|'g' })
+WIKI.events.outbound.emit('addAuthRevoke', { id: xxx, kind: 'u'|'g' })
+```
+
+**`outbound.emit('addAuthRevoke')` 的作用**（`server/core/auth.js:488-490`）：
+这是 Wiki.js 的 HA（高可用）多节点传播机制。`outbound` 事件在当前节点处理后，通过消息总线（MQ/Redis 等）广播给其他节点，其他节点的 `inbound.on('addAuthRevoke')` 监听器调用本地的 `revokeUserTokens`。所以**两个调用缺一不可**：一个更新本地内存中的撤销列表，一个通知其他节点同步更新。
+
+**重构建议**：在 `WIKI.auth` 上新增一个 helper 方法：
+
+```javascript
+// server/core/auth.js
+broadcastRevokeTokens ({ id, kind }) {
+  this.revokeUserTokens({ id, kind })
+  WIKI.events.outbound.emit('addAuthRevoke', { id, kind })
+}
+```
+
+这样 7 处调用可以简化为一行，同时避免遗漏 `outbound.emit` 导致的多节点不一致问题。重构后 `/logout` 修复也只需要调用 `WIKI.auth.broadcastRevokeTokens({ id: req.user.id, kind: 'u' })`。
+
+#### 3.14.3 OIDC / SAML 等外部 IdP 场景下的 session 一致性
+
+Wiki.js 支持 20+ 种认证策略，包括 OIDC、SAML、Keycloak、Auth0、CAS 等。需要分析登出时外部 IdP session 与本地 session 的一致性。
+
+**（1）登出流程中外部 IdP session 的处理方式**
+
+`WIKI.models.users.logout()`（`server/models/users.js:870-877`）：
+```javascript
+static async logout (context) {
+  if (!context.req.user || context.req.user.id === 2) {
+    return '/'
+  }
+  const usr = await WIKI.models.users.query().findById(context.req.user.id).select('providerKey')
+  const provider = _.find(WIKI.auth.strategies, ['key', usr.providerKey])
+  return provider.logout ? provider.logout(provider.config, context) : '/'
+}
+```
+
+逻辑：
+1. 取当前用户的 `providerKey`（登录时使用的策略 key）
+2. 在 `WIKI.auth.strategies` 中查找该策略
+3. 如果策略定义了 `logout()` 方法，调用它获取重定向 URL；否则返回 `/`
+
+**（2）各外部 IdP 策略的 `logout` 实现现状**
+
+| 策略 | logout 实现 | 行为 |
+|------|------------|------|
+| `local` | **未实现** | 返回 `/`（不登出外部，因为没有外部） |
+| `ldap` | **未实现** | 返回 `/` |
+| `oidc` | 有 | 返回配置的 `logoutURL`（可选），未配置时返回 `/` |
+| `oauth2` | 有 | 返回配置的 `logoutURL`（可选），未配置时返回 `/` |
+| `saml` | **未实现** | 返回 `/`（SAML SLO 需要签名的登出请求，当前未实现） |
+| `keycloak` | 有 | 支持 `logoutUpstream` 开关，Keycloak 18+ 时传递 `id_token_hint` |
+| `auth0` | 有 | 自动拼接 `https://${domain}/v2/logout?client_id=...&returnTo=...` |
+| `google` | 有 | 返回 `/`（不登出 Google 账户） |
+| `rocketchat` | 有 | 返回配置的 `logoutURL`（可选） |
+| `microsoft` | **未实现** | 返回 `/` |
+| `azure` | **未实现** | 返回 `/` |
+| 其他（discord/dropbox/facebook/firebase/github/gitlab/slack/twitch/cas） | **未实现** | 返回 `/` |
+
+**（3）session 一致性的四种场景**
+
+**场景 A：本地策略（local/ldap）登出**
+- 本地 JWT：`clearCookie('jwt')` ✅
+- 外部 session：不存在 ✅
+- **状态一致**
+
+**场景 B：OIDC / OAuth2 / Auth0（配置了 logoutURL）登出**
+- 本地 JWT：`clearCookie('jwt')` ✅
+- 外部 IdP session：通过重定向到 IdP 的 logout endpoint，由 IdP 处理登出 ✅
+- 补充 revokeUserTokens 后：JWT 即使被截获也立即失效 ✅
+- **状态一致**（前提是 IdP 的 logoutURL 正确配置）
+
+**场景 C：OIDC / OAuth2 / RocketChat（未配置 logoutURL）登出**
+- 本地 JWT：`clearCookie('jwt')` ✅
+- 外部 IdP session：**仍然存活** ❌
+- 用户点击再次登录时，外部 IdP 可能因为仍有 session 而自动重新登录（SSO 效果）
+- 这是设计选择（由配置项控制），不是 bug。但用户可能误以为已经完全登出
+- **状态不完全一致，由配置决定**
+
+**场景 D：SAML 登出（任何配置）**
+- 本地 JWT：`clearCookie('jwt')` ✅
+- 外部 IdP session：**仍然存活** ❌
+- SAML 模块（`server/modules/authentication/saml/authentication.js`）没有 `logout` 方法
+- SAML SLO（Single Logout）需要带签名的 LogoutRequest，当前完全未实现
+- **状态不一致**，这是一个真实的功能缺失
+
+**场景 E：Keycloak（logoutUpstream=false）登出**
+- 同场景 C，是配置决定的行为
+- Keycloak 的 `logoutUpstream` 开关（`definition.yml` 中配置）明确允许用户选择是否同步登出外部
+- `logoutUpstream=true` 时行为等同于场景 B，还会传递 `id_token_hint`（Keycloak 18+）以实现无提示登出
+
+**（4）补充 `revokeUserTokens` 对外部 IdP 场景的影响**
+
+在 `/logout` 中增加 `revokeUserTokens` **不影响**外部 IdP 的 session 管理，二者是独立的：
+
+- `revokeUserTokens` 只影响 Wiki.js 内部 JWT 验证逻辑（加入撤销列表）
+- 外部 IdP session 仍由各策略的 `logout()` 返回值 + 浏览器重定向处理
+- 二者互不干扰，补充 revoke 只会增强本地安全性，不会破坏现有外部登出逻辑
+
+**（5）一个特殊风险：Keycloak 的 `id_token` 存储在 Passport session 中**
+
+Keycloak 策略（`server/modules/authentication/keycloak/authentication.js:39`）将 `id_token` 存储在 `req.session.keycloak_id_token` 中，logout 时用于拼接 `id_token_hint` 参数。但 Wiki.js 的 JWT 认证配置使用了 `session: false`（`server/core/auth.js`），这意味着 Passport session 实际上不持久化。
+
+实际效果：Keycloak 18+ 模式下 `id_token_hint` 可能为空，登出时退回到无 `id_token_hint` 的 URL，Keycloak 可能会提示用户确认登出而不是静默登出。这是一个独立的小问题，但不影响 session 一致性的主体逻辑。
+
+### 3.15 多 Tab 场景完整时序图
 
 ```
 Tab A (退出登录)                     服务端                       Tab B (仍在运行)
