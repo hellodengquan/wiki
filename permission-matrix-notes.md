@@ -496,3 +496,538 @@ WIKI.auth.checkAccess(user, requiredPermissions, page?)
 | Administrators 组(id=1)的特殊性 | 前端显示"此组可访问所有内容"，后端通过 `manage:system` 短路实现 |
 | 导航可见性 vs 页面可见性 | 导航=基于组ID的简单交集；页面=全局权限+页面规则两阶段 |
 | Guest 用户(id=2) | 未登录用户自动映射为 Guest，其权限来自 id=2 的组，结果缓存1分钟 |
+
+---
+
+## 12. 多级 Page Tree 下的级联路径权限继承
+
+### 12.1 Page Tree 的数据结构
+
+`server/jobs/rebuild-tree.js` 中的 `pageTree` 表存储的是**扁平的树节点**，每个页面路径的每一层都有独立的节点：
+
+```
+页面路径：geography/countries/china
+
+在 pageTree 中生成的节点：
+1. geography        (depth=1, isFolder=true,  pageId=null, parent=null)
+2. countries        (depth=2, isFolder=true,  pageId=null, parent=1)
+3. china            (depth=3, isFolder=false, pageId=实际页面ID, parent=2)
+```
+
+关键字段（`rebuild-tree.js:33-45`）：
+```js
+tree.push({
+  id: pik,                      // 节点自增ID
+  localeCode: page.localeCode,  // 语言
+  path: currentPath,            // 该层路径（如 'geography/countries'）
+  depth: depth,                 // 层级深度
+  title: isFolder ? part : page.title,
+  isFolder: isFolder,           // 是否为文件夹节点
+  parent: parentId,             // 父节点ID
+  pageId: isFolder ? null : page.id,  // 实际页面ID（仅叶子节点）
+  ancestors: JSON.stringify(ancestors) // 祖先节点ID数组
+})
+```
+
+### 12.2 Tree 查询的级联过滤
+
+`server/graph/resolvers/page.js:249-294` 的 `tree` 查询：
+
+```
+1. 先从 pageTree 表按 parent 条件批量拉取节点
+2. 对结果数组调用 filter()，每个节点独立做 checkAccess 检查
+3. 只有通过 checkAccess 的节点才会返回给前端
+```
+
+**过滤是"节点级"的，不是"树级"的**——即每个节点独立检查权限。但因为 `parent` 查询条件的存在，如果父节点被过滤掉，子节点虽然在数据库中存在，但不会被这一次查询拉取到。
+
+### 12.3 START 规则实现"级联继承"
+
+权限系统**没有**专门的"继承"机制，级联效果是通过 `START` 匹配类型实现的：
+
+```
+规则：{ match: 'START', path: 'geography', roles: ['read:pages'], deny: false }
+
+匹配路径：
+  ✅ /geography
+  ✅ /geography/countries
+  ✅ /geography/countries/china
+  ✅ /geography/cities
+  ❌ /history
+```
+
+`server/core/auth.js:254-257`：
+```js
+case 'START':
+  if (_.startsWith(`/${page.path}`, `/${rule.path}`)) {
+    checkState = this._applyPageRuleSpecificity({...})
+  }
+  break
+```
+
+**重要理解**：Wiki.js 的"级联权限"本质上是**前缀匹配**，不是显式的继承关系。如果在 `/geography/countries` 上设置了更具体的规则（EXACT 或更长路径），会因为特异性更高而覆盖 START 规则。
+
+### 12.4 多层级树的权限判定过程
+
+```
+请求 GET /geography/countries/china
+  │
+  ▼
+path = 'geography/countries/china', locale = 'en'
+  │
+  ▼
+checkAccess(user, ['read:pages'], { path, locale })
+  │
+  ├─ 全局权限检查：用户是否有 read:pages？
+  │
+  └─ 页面规则检查：
+      │
+      ├─ 规则1：START 'geography' → 匹配 → specificity='geography'(9)
+      │
+      ├─ 规则2：START 'geography/countries' → 匹配 → specificity='geography/countries'(19)
+      │   更长，覆盖规则1
+      │
+      └─ 规则3：EXACT 'geography/countries/china' → 匹配 → specificity相同, EXACT优先级更高
+          覆盖规则2
+```
+
+**特异性系统天然支持多层级覆盖**——路径越长、匹配类型越精确的规则优先级越高。
+
+### 12.5 文件夹节点的特殊处理
+
+`pageTree` 中的文件夹节点（`isFolder=true`）没有实际的 `pageId`，但它的 `path` 是完整的中间路径（如 `geography/countries`）。权限检查时：
+
+1. 文件夹节点用它自己的 `path` 做 checkAccess
+2. 如果用户无权访问 `geography/countries` 文件夹，即使有权访问 `geography/countries/china` 页面，在树浏览时也看不到父文件夹
+3. 但直接通过完整 URL 访问页面不受影响（因为直接用完整路径做权限检查）
+
+---
+
+## 13. 匿名用户的可见性裁剪代码挂载点
+
+### 13.1 匿名用户身份注入
+
+`server/core/auth.js:169-177` 是匿名用户的**核心挂载点**：
+
+```js
+// JWT is NOT valid, set as guest
+if (!user) {
+  if (WIKI.auth.guest.cacheExpiration <= DateTime.utc()) {
+    WIKI.auth.guest = await WIKI.models.users.getGuestUser()
+    WIKI.auth.guest.cacheExpiration = DateTime.utc().plus({ minutes: 1 })
+  }
+  req.user = WIKI.auth.guest
+  return next()
+}
+```
+
+**触发条件**：
+- JWT 无效（缺失、过期、签名错误）
+- 或 JWT 中的用户/组已被撤销
+
+注入后，后续所有中间件和控制器看到的 `req.user` 就是 Guest 用户（id=2），权限检查完全走正常流程。
+
+### 13.2 Guest 用户初始化
+
+首次创建（`server/setup.js:246-253`）：
+```js
+const guestGroup = await WIKI.models.groups.query().insert({
+  name: 'Guests',
+  permissions: JSON.stringify(['read:pages', 'read:assets', 'read:comments']),
+  pageRules: JSON.stringify([
+    { id: 'guest', roles: ['read:pages', 'read:assets', 'read:comments'], 
+      match: 'START', deny: false, path: '', locales: [] }
+  ]),
+  isSystem: true
+})
+```
+
+默认权限：全局 `read:pages` + `read:assets` + `read:comments`，页面规则允许所有路径。
+
+### 13.3 可见性裁剪的完整挂载点列表
+
+**1. 路由入口：`server/core/auth.js:169-177`**
+- 位置：Express 中间件 `authenticate` 内
+- 作用：将无 JWT 请求映射为 Guest 用户
+
+**2. 页面浏览：`server/controllers/common.js:417-457`（`/*` 路由）**
+```js
+const effectivePermissions = WIKI.auth.getEffectivePermissions(req, pageArgs)
+if (!effectivePermissions.pages.read) {
+  if (req.user.id === 2) {  // 是 Guest？
+    res.cookie('loginRedirect', req.path, { maxAge: 15 * 60 * 1000 })
+  }
+  if (pageArgs.path === 'home' && req.user.id === 2) {
+    return res.redirect('/login')
+  }
+  return res.status(403).render('unauthorized', { action: 'view' })
+}
+```
+- Guest 访问被拒绝时，记录登录后跳转目标，首页直接跳转登录
+
+**3. 页面编辑：`server/controllers/common.js:104-235`（`/e/*` 路由）**
+```js
+const effectivePermissions = WIKI.auth.getEffectivePermissions(req, pageArgs)
+if (!(effectivePermissions.pages.write || effectivePermissions.pages.manage)) {
+  return res.status(403).render('unauthorized', { action: 'edit' })
+}
+```
+
+**4. 搜索结果：`server/graph/resolvers/page.js:52-64`**
+```js
+results: _.filter(resp.results, r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path, locale: r.locale, tags: r.tags
+  })
+})
+```
+- 搜索结果按权限过滤，Guest 只能看到允许的页面
+
+**5. 页面列表：`server/graph/resolvers/page.js:76-147`**
+```js
+results = _.filter(results, r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path, locale: r.locale
+  })
+})
+```
+
+**6. 页面树：`server/graph/resolvers/page.js:249-294`**
+```js
+return results.filter(r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path, locale: r.localeCode
+  })
+})
+```
+
+**7. 标签列表：`server/graph/resolvers/page.js:200-213`**
+```js
+const allTags = _.filter(pages, r => {
+  return WIKI.auth.checkAccess(context.req.user, ['read:pages'], {
+    path: r.path, locale: r.locale
+  })
+}).flatMap(r => r.tags)
+```
+
+**8. 页面链接：`server/graph/resolvers/page.js:299-350`**
+```js
+if (!WIKI.auth.checkAccess(..., ['read:pages'], { path: val.path, ... }) ||
+    !WIKI.auth.checkAccess(..., ['read:pages'], { path: val.link, ... })) {
+  return result  // 链接两端都要有权限
+}
+```
+
+**9. 导航菜单：`server/models/navigation.js:62-65`**
+```js
+static getAuthorizedItems(tree = [], groups = []) {
+  return _.filter(tree, leaf => {
+    return leaf.visibilityMode === 'all' || 
+           _.intersection(leaf.visibilityGroups, groups).length > 0
+  })
+}
+```
+- 导航项可见性直接基于组 ID 交集，Guest 的组是 [2]
+
+**10. 资源访问：`server/controllers/common.js:575-581`**
+```js
+if (!WIKI.auth.checkAccess(req.user, ['read:assets'], pageArgs)) {
+  return res.sendStatus(403)
+}
+```
+
+### 13.4 Guest 可见性裁剪的两层防御
+
+```
+HTTP 请求到达
+  │
+  ▼
+┌──────────────────────────────────────┐
+│  第一层：身份映射                      │
+│  auth.js:169-177                      │
+│  无 JWT → req.user = Guest(id=2)     │
+└──────────────────────────────────────┘
+  │
+  ▼
+┌──────────────────────────────────────┐
+│  第二层：各挂载点的权限检查            │
+│  所有后续代码走完全相同的 checkAccess │
+│  - 页面浏览 check read:pages         │
+│  - 搜索结果过滤                       │
+│  - 页面树过滤                         │
+│  - 导航过滤                           │
+│  - 资源访问检查                       │
+└──────────────────────────────────────┘
+  │
+  ▼
+返回 403 / 404 / 过滤后的结果
+```
+
+**关键设计**：Guest 用户没有"特殊对待"，完全复用普通用户的权限检查逻辑。区别仅在于：
+1. Guest 属于固定的组 id=2
+2. 首页访问被拒绝时自动跳转登录页
+3. 被拒绝时记录登录跳转 cookie
+
+---
+
+## 14. 权限缓存与变更失效路径
+
+### 14.1 多层级缓存架构
+
+Wiki.js 的权限缓存分布在四个层级：
+
+| 缓存层级 | 存储位置 | 缓存内容 | 过期时间 |
+|---|---|---|---|
+| **L1：JWT 令牌** | 客户端浏览器 Cookie | 用户ID、全局权限数组、组ID数组 | 30分钟（默认） |
+| **L2：组信息内存缓存** | 服务端 `WIKI.auth.groups` | 所有组的 permissions + pageRules | 手动失效 |
+| **L3：Guest 用户缓存** | 服务端 `WIKI.auth.guest` | Guest 用户的权限信息 | 1分钟 |
+| **L4：撤销列表** | 服务端 `WIKI.auth.revocationList` | 已撤销的用户/组 ID | 30分钟（与 token 同） |
+| **L5：导航树缓存** | 服务端 `WIKI.cache` | 各语言的导航树 | 300秒 |
+| **L6：页面渲染缓存** | 本地文件系统 | 页面渲染后的 HTML（`.bin`） | 手动失效 |
+
+### 14.2 L1：JWT 中的权限缓存
+
+`server/models/users.js:440-452`，登录时签发：
+
+```js
+jwt.sign({
+  id: user.id,
+  permissions: user.getGlobalPermissions(),  // 全局权限数组快照
+  groups: user.getGroups(),                   // 组ID数组快照
+  iat: issuedAtTimestamp,
+  exp: issuedAtTimestamp + 30min
+}, privateKey, { algorithm: 'RS256' })
+```
+
+**优点**：服务端无状态，性能高
+**缺点**：权限变更后不能立即生效，需等待 token 过期或触发撤销
+
+### 14.3 L2：组信息内存缓存
+
+`server/core/auth.js:393-396`，启动时加载 + 手动刷新：
+
+```js
+async reloadGroups () {
+  const groupsArray = await WIKI.models.groups.query()
+  this.groups = _.keyBy(groupsArray, 'id')  // { id: { permissions, pageRules, ... } }
+  WIKI.auth.guest.cacheExpiration = DateTime.utc().minus({ days: 1 })  // 同时失效 Guest 缓存
+}
+```
+
+调用时机（`server/graph/resolvers/group.js`）：
+- 创建组：`create()` → `reloadGroups()`（`group.js:103`）
+- 更新组：`update()` → `reloadGroups()`（`group.js:205`）
+- 删除组：`delete()` → `reloadGroups()`（`group.js:123`）
+
+### 14.4 L3：Guest 用户缓存
+
+`server/core/auth.js:171-173`：
+```js
+if (WIKI.auth.guest.cacheExpiration <= DateTime.utc()) {
+  WIKI.auth.guest = await WIKI.models.users.getGuestUser()
+  WIKI.auth.guest.cacheExpiration = DateTime.utc().plus({ minutes: 1 })
+}
+```
+
+Guest 用户的权限来自 id=2 的组，因此组变更时会通过 `reloadGroups()` 间接失效 Guest 缓存。
+
+### 14.5 L4：撤销列表（Revocation List）
+
+`server/core/auth.js:23`：
+```js
+revocationList: require('./cache').init()  // NodeCache 实例
+```
+
+**添加撤销记录**（`server/core/auth.js:526-527`）：
+```js
+revokeUserTokens ({ id, kind = 'u' }) {
+  WIKI.auth.revocationList.set(
+    `${kind}${_.toString(id)}`,        // key: 'u123' 或 'g456'
+    Math.round(DateTime.utc().minus({ seconds: 5 }).toSeconds()),  // 值：撤销时间戳
+    Math.ceil(ms(WIKI.config.auth.tokenExpiration) / 1000)         // TTL：token 有效期
+  )
+}
+```
+
+**撤销检查**（`server/core/auth.js:126-141`）：
+```js
+if (user && !user.api && !mustRevalidate) {
+  // 检查用户级撤销
+  const uRevalidate = WIKI.auth.revocationList.get(`u${user.id}`)
+  if (uRevalidate && user.iat < uRevalidate) {
+    mustRevalidate = true  // token 签发时间早于撤销时间 → 需要重新验证
+  }
+  // 检查服务重启（所有旧 token 失效）
+  else if (DateTime.fromSeconds(user.iat) <= WIKI.startedAt) {
+    mustRevalidate = true
+  }
+  // 检查组级撤销
+  else {
+    for (const gid of user.groups) {
+      const gRevalidate = WIKI.auth.revocationList.get(`g${gid}`)
+      if (gRevalidate && user.iat < gRevalidate) {
+        mustRevalidate = true
+        break
+      }
+    }
+  }
+}
+```
+
+### 14.6 完整的变更失效流程
+
+**场景 1：组权限/规则变更**
+
+```
+管理员修改 Group(id=3) 的 pageRules
+  │
+  ▼
+graph/resolvers/group.js update() 被调用
+  │
+  ├─ ① 更新 DB：groups 表的 permissions / pageRules
+  │
+  ├─ ② 撤销组 token：
+  │    WIKI.auth.revokeUserTokens({ id: 3, kind: 'g' })
+  │    → 写入 revocationList['g3'] = 当前时间戳
+  │
+  ├─ ③ 事件传播：
+  │    WIKI.events.outbound.emit('addAuthRevoke', { id: 3, kind: 'g' })
+  │    → 跨 HA 实例同步撤销
+  │
+  └─ ④ 刷新组缓存：
+       WIKI.auth.reloadGroups()
+       → 重新从 DB 读取所有组到 WIKI.auth.groups
+
+下一次请求到来（用户 token 包含 groups: [1,3]）：
+  │
+  ▼
+auth.js:134-140 检查 revocationList['g3']
+  │
+  ├─ user.iat < revocationList['g3'] → mustRevalidate = true
+  │
+  ▼
+auth.js:145-162 重新从 DB 拉取用户+组信息，签发新 token
+  │
+  ▼
+用户获得最新权限
+```
+
+**场景 2：用户所属组变更**
+
+```
+用户 User(id=123) 被加入/移出组
+  │
+  ▼
+graph/resolvers/group.js assignUser() / unassignUser()
+  │
+  ├─ ① 更新 DB：userGroups 关联表
+  │
+  ├─ ② 撤销用户 token：
+       WIKI.auth.revokeUserTokens({ id: 123, kind: 'u' })
+       WIKI.events.outbound.emit('addAuthRevoke', { id: 123, kind: 'u' })
+
+下一次请求：
+  auth.js:128-130 检查 revocationList['u123']
+  → mustRevalidate = true
+  → 重新签发 token（包含最新 groups 数组）
+```
+
+**场景 3：服务重启**
+
+```
+服务启动时设置 WIKI.startedAt = 当前时间
+  │
+  ▼
+请求携带旧 token（iat < startedAt）
+  │
+  ▼
+auth.js:131-132
+  else if (DateTime.fromSeconds(user.iat) <= WIKI.startedAt) {
+    mustRevalidate = true
+  }
+```
+
+所有重启前签发的 token 都会被强制重新验证。
+
+### 14.7 L5：导航树缓存
+
+`server/models/navigation.js:26-49`：
+```js
+const navTreeCached = await WIKI.cache.get(`nav:sidebar:${locale}`)
+if (navTreeCached) {
+  return bypassAuth ? navTreeCached : 
+    WIKI.models.navigation.getAuthorizedItems(navTreeCached, groups)
+}
+// ... 未命中则从 DB 读取，写入缓存，TTL=300秒
+await WIKI.cache.set(`nav:sidebar:${tree.locale}`, tree.items, 300)
+```
+
+**重要**：缓存的是**原始导航树**，权限过滤（`getAuthorizedItems`）在每次请求时实时进行。因此导航树缓存不影响权限判断，只是避免重复读取 DB。
+
+### 14.8 L6：页面渲染缓存
+
+`server/models/pages.js:1052-1078`，基于页面 hash 存储 `.bin` 文件：
+```js
+static async savePageToCache(page) {
+  const cachePath = path.resolve(..., `cache/${page.hash}.bin`)
+  await fs.outputFile(cachePath, WIKI.models.pages.cacheSchema.encode({
+    id: page.id, render: page.render, ...
+  }))
+}
+```
+
+**注意**：页面缓存只缓存渲染结果，**不缓存权限判定结果**。每次访问页面时，权限检查先于缓存读取进行：
+- 无权限 → 直接 403，不会读取缓存
+- 有权限 → 才尝试读取缓存，未命中则从 DB 加载
+
+### 14.9 失效链路全景图
+
+```
+权限变更（组/用户）
+  │
+  ├─ DB 写入
+  ├─ revocationList 添加（key='uX'/'gX'，value=时间戳）
+  ├─ outbound 事件 → 跨 HA 节点同步
+  └─ reloadGroups() → 刷新 WIKI.auth.groups 内存缓存
+        │
+        └─ guest.cacheExpiration 置为过期 → Guest 缓存下次请求时刷新
+
+下一次用户请求
+  │
+  ├─ 读取 JWT → 获得 user.iat, user.permissions, user.groups
+  │
+  ├─ 检查 revocationList
+  │   ├─ 用户 ID 是否在撤销列表中？
+  │   ├─ 用户的任一组是否在撤销列表中？
+  │   └─ token.iat <= 服务启动时间？
+  │
+  ├─ ✅ 无需重验证 → 使用 JWT 内的权限快照
+  │
+  └─ ❌ 需要重验证 → 从 DB 重新拉取用户+组信息，签发新 JWT
+        │
+        └─ 新 JWT 包含最新的 permissions 和 groups 数组
+
+权限检查（每次操作都执行）
+  │
+  ├─ checkAccess(user, permissions, page?)
+  │   ├─ 全局权限检查（使用 user.permissions）
+  │   └─ 页面规则检查（使用 WIKI.auth.groups[gid].pageRules）
+  │
+  └─ getEffectivePermissions() → 生成页面级权限矩阵，传给前端模板
+```
+
+### 14.10 缓存一致性保障
+
+| 变更类型 | 失效范围 | 生效延迟 |
+|---|---|---|
+| 组权限/规则变更 | 组所有成员的 token | 最多到 token 过期（30分钟），或下一次请求时立即刷新 |
+| 用户组关系变更 | 单个用户的 token | 同上 |
+| 组删除 | 组所有成员 | 同上 |
+| 服务重启 | 所有用户 token | 立即（下一次请求强制刷新） |
+| 页面内容更新 | 单个页面缓存 | 立即（保存时删除缓存文件） |
+
+**关键设计原则**：
+1. **最终一致性**：不追求强一致，利用 token 过期自然轮转
+2. **撤销列表**：作为紧急通道，允许强制失效（不等待 token 过期）
+3. **分层缓存**：越上层（JWT）缓存时间越长，越下层（页面缓存）失效越快
+4. **HA 同步**：通过事件总线跨节点同步撤销事件
