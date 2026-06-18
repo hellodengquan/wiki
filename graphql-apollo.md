@@ -534,13 +534,67 @@ module.exports = createRateLimitDirective({
 })
 ```
 
-以 `客户端IP + 类型名.字段名` 作为限流 key。示例：
+以 `客户端IP + 类型名.字段名` 作为限流 key。
+
+**当前使用 @rateLimit 的字段**（全在 mutation 上）：
+
+| 字段 | 限流规则 | 所在 schema |
+|------|---------|------------|
+| `authentication.login` | 每分钟 5 次 | `authentication.graphql` |
+| `authentication.loginTFA` | 每分钟 5 次 | `authentication.graphql` |
+| `authentication.loginChangePassword` | 每分钟 5 次 | `authentication.graphql` |
+| `authentication.forgotPassword` | 每分钟 3 次 | `authentication.graphql` |
+| `comments.create` | 每 15 秒 1 次 | `comment.graphql` |
+
+#### 3.7.1 @rateLimit 在 Subscription 路径上是否生效？
+
+**结论：当前代码中 subscription 路径上 @rateLimit 完全不生效**，原因有两层：
+
+**第一层：现有 subscription 字段上没有加 @rateLimit**
+
+全局唯一的 subscription 字段是 `loggingLiveTrail`（`server/graph/schemas/logging.graphql:14`）：
 
 ```graphql
-login(...): AuthenticationLoginResponse @rateLimit(limit: 5, duration: 60)
+extend type Subscription {
+  loggingLiveTrail: LoggerTrailLine
+}
 ```
 
-登录接口限流为：同一 IP 每分钟最多 5 次。
+该字段上**没有** `@rateLimit` 指令，也没有 `@auth` 指令（但实际在 `subscriptions.onConnect` 中做了更严格的鉴权）。
+
+**第二层：即便加上，graphql-rate-limit-directive 对 subscription 的行为也与 query/mutation 不同**
+
+`graphql-rate-limit-directive` 1.2.1 版本是通过包装字段的 `resolve` 函数实现限流的。而 subscription 有两个函数：
+- `subscribe` — 返回 AsyncIterator，在订阅建立时执行一次
+- `resolve` — 每条推送消息经过时执行（可选，用于转换 payload）
+
+在 Wiki.js 的实现中（`server/graph/resolvers/logging.js:14-16`）：
+
+```javascript
+Subscription: {
+  loggingLiveTrail: {
+    subscribe: () => WIKI.GQLEmitter.asyncIterator('livetrail')
+  }
+}
+```
+
+只有 `subscribe` 函数，没有 `resolve` 函数。如果给该字段加 `@rateLimit`，指令会尝试包装 `resolve` 函数，但由于不存在自定义 resolve，限流逻辑**只可能作用在订阅建立的瞬间**（而不是每条推送消息）。
+
+但实际测试中，`graphql-rate-limit-directive` 对 Subscription 类型的支持并不完整，因为：
+1. `info.parentType` 对于 Subscription 是 `Subscription`
+2. 但限流指令通常绑定的是字段 resolver，而 subscription 的核心是 `subscribe` 而非 `resolve`
+3. WebSocket 连接建立时走的是 `subscriptions.onConnect`，根本不经过 schema directive
+
+#### 3.7.2 超出限流时：断开连接 vs 拒收消息？
+
+**HTTP 路径（query/mutation）**：
+超出限流时，`graphql-rate-limit-directive` 会返回 GraphQL error，错误信息类似 `"You are trying to access 'login' too often"`，HTTP 状态码仍然是 200（GraphQL 错误作为 errors 数组返回）。连接本身**不会断开**，只是请求被拒绝。
+
+**WebSocket 路径（subscription）**：
+由于现有代码中 subscription 没有 @rateLimit，不存在"超出限流"的场景。但如果从连接维度看：
+
+- **连接建立阶段**（`subscriptions.onConnect`）：鉴权失败直接 `throw new Error('Unauthorized'/'Forbidden')`，Apollo Server 会拒绝 WebSocket 连接，连接**不会建立**
+- **连接已建立后**：没有消息级别的限流，服务端通过 PubSub 主动推送，客户端无法"频繁请求"消息，因此也不需要消息级限流
 
 ### 3.8 Resolver 内部二次鉴权
 
@@ -561,6 +615,124 @@ async history(obj, args, context, info) {
 ```
 
 此处调用 `WIKI.auth.checkAccess`，结合用户组的 `pageRules`（路径、语言、标签匹配规则）进行更精细的页面级访问控制。
+
+### 3.9 登录态信息在 Apollo Client Cache 中的写入位置
+
+#### 3.9.1 用户登录态的存储分层
+
+Wiki.js 客户端的登录态信息**不直接写入 Apollo cache**，而是采用三层存储架构：
+
+| 存储层 | 存储内容 | 位置 | 生命周期 |
+|--------|---------|------|---------|
+| 第一层 | 原始 JWT Token | Cookie（`jwt`） | 持久化，365 天过期 |
+| 第二层 | 解码后的用户信息（id/name/email/permissions 等） | Vuex Store（`user` module） | 内存中，页面刷新后重建 |
+| 第三层 | 查询结果缓存（如 profile 数据） | Apollo InMemoryCache | 内存中，页面刷新后清空 |
+
+#### 3.9.2 登录态写入流程
+
+**登录时**（`client/components/login.vue:644`）：
+```javascript
+Cookies.set('jwt', respObj.jwt, { expires: 365, secure: window.location.protocol === 'https:' })
+// 随后 window.location.replace('/') —— 整页跳转
+```
+
+登录成功后只做两件事：
+1. 把 JWT 写入 Cookie
+2. **整页跳转**到首页（或登录前页面）
+
+**应用启动时**（`client/client-app.js:46`）：
+```javascript
+store.commit('user/REFRESH_AUTH')
+```
+
+在 `client/store/user.js:26-48` 的 `REFRESH_AUTH` mutation 中：
+- 从 Cookie 读取 JWT
+- 前端 `jwt.decode` 解码 payload（不验证签名）
+- 提取 `id`、`email`、`name`、`permissions` 等字段写入 Vuex state
+- 设置 `authenticated = true`
+
+**注意**：这里的解码只是前端展示用，**实际权限校验永远在服务端**。
+
+#### 3.9.3 Apollo Cache 中是否有登录态信息？
+
+**结论：没有主动写入的登录态信息，但查询结果会被自动缓存。**
+
+代码中**不存在**任何 `cache.writeQuery`、`cache.writeData`、`cache.writeFragment` 等手动写入用户信息的调用。
+
+但 Apollo cache 会自动缓存查询结果，例如：
+- 个人资料页的 `users.profile` 查询（`client/components/profile/profile.vue:887-918`）
+- 导航栏等组件发起的各类查询
+
+这些缓存数据中可能包含用户相关信息，但它们是**查询副作用**，不是登录态的"官方存储位置"。
+
+特别地，`profile` 查询使用了 `fetchPolicy: 'network-only'`（`client/components/profile/profile.vue:913`），意味着该查询每次都走网络、不读缓存，进一步降低了缓存中残留敏感用户信息的可能性。
+
+### 3.10 退出登录时的缓存清理范围与残留问题
+
+#### 3.10.1 退出登录的代码路径
+
+退出登录入口在 `client/components/common/nav-header.vue:475-477`：
+```javascript
+logout () {
+  window.location.assign('/logout')
+}
+```
+
+**关键特点：整页跳转，不是 SPA 内的状态切换。**
+
+服务端处理（`server/controllers/auth.js:129-134`）：
+```javascript
+router.get('/logout', async (req, res) => {
+  const redirURL = await WIKI.models.users.logout({ req, res })
+  req.logout()          // Passport session 登出
+  res.clearCookie('jwt') // 清除 JWT Cookie
+  res.redirect(redirURL) // 重定向到首页
+})
+```
+
+#### 3.10.2 缓存清理的实际范围
+
+由于退出登录是**整页跳转 + 服务端重定向**，浏览器会加载一个全新的页面：
+
+| 存储层 | 清理方式 | 是否完全清理 |
+|--------|---------|------------|
+| Cookie 中的 JWT | 服务端 `res.clearCookie('jwt')` | ✅ 是 |
+| Vuex Store | 页面刷新，JS 内存完全重建 | ✅ 是 |
+| Apollo InMemoryCache | 页面刷新，JS 内存完全重建 | ✅ 是 |
+| localStorage / sessionStorage | 不涉及 | N/A |
+
+**不存在手动调用 `client.resetStore()` 或 `client.clearStore()` 的代码**，因为根本不需要——整页刷新后一切归零。
+
+#### 3.10.3 残留缓存是否会被后续匿名查询误用？
+
+**结论：不会。** 原因有三层保障：
+
+**第一层：架构层面 — 整页跳转自然清空内存**
+
+退出登录通过 `window.location.assign('/logout')` 触发整页跳转，服务端重定向回首页。新页面是一个完全独立的 JavaScript 执行上下文：
+- Apollo Client 重新初始化
+- InMemoryCache 从零开始构建
+- 不存在"缓存数据残留到下一个会话"的可能
+
+**第二层：服务端层面 — 权限校验在服务端**
+
+即便假设（理论上）缓存中有数据，匿名用户发起新查询时：
+- Apollo cache 基于 `__typename + id` 做归一化，没有对应 id 的数据不会命中
+- 更重要的是：**实际数据永远由服务端返回**，缓存只是加速读取
+- 匿名请求到达服务端后，`@auth` 指令会拒绝需要权限的查询，返回错误而不是数据
+
+**第三层：fetchPolicy 层面 — 敏感查询不走缓存**
+
+涉及用户信息的关键查询（如 `profile`）使用 `fetchPolicy: 'network-only'`，每次都强制走网络，不依赖缓存。
+
+#### 3.10.4 理论上的边界情况
+
+如果在**同一个页面内**（不刷新）实现登录/登出切换，就会出现缓存残留问题。但 Wiki.js 当前的架构不支持这种模式：
+- 登录成功 → `window.location.replace('/')` 整页跳转（`client/components/login.vue:661`）
+- 退出登录 → `window.location.assign('/logout')` 整页跳转（`client/components/common/nav-header.vue:476`）
+- Token 续签 → 只更新 Cookie，不影响当前页面的 Apollo cache 数据
+
+所有身份状态变化都伴随着页面刷新，从根本上避免了单页应用中常见的"登出后缓存残留"问题。
 
 ---
 
