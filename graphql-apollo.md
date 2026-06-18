@@ -1096,13 +1096,150 @@ static async logout (context) {
 - 外部 IdP session 仍由各策略的 `logout()` 返回值 + 浏览器重定向处理
 - 二者互不干扰，补充 revoke 只会增强本地安全性，不会破坏现有外部登出逻辑
 
-**（5）一个特殊风险：Keycloak 的 `id_token` 存储在 Passport session 中**
+**（5）关于 Keycloak `id_token` 存储的说明**
 
-Keycloak 策略（`server/modules/authentication/keycloak/authentication.js:39`）将 `id_token` 存储在 `req.session.keycloak_id_token` 中，logout 时用于拼接 `id_token_hint` 参数。但 Wiki.js 的 JWT 认证配置使用了 `session: false`（`server/core/auth.js`），这意味着 Passport session 实际上不持久化。
+Keycloak 策略（`server/modules/authentication/keycloak/authentication.js:39`）将 `id_token` 存储在 `req.session.keycloak_id_token` 中，logout 时用于拼接 `id_token_hint` 参数。关于这一点的详细分析见 **§3.16**。
 
-实际效果：Keycloak 18+ 模式下 `id_token_hint` 可能为空，登出时退回到无 `id_token_hint` 的 URL，Keycloak 可能会提示用户确认登出而不是静默登出。这是一个独立的小问题，但不影响 session 一致性的主体逻辑。
+### 3.16 `session: false` 的真实含义与改成 `session: true` 的影响
 
-### 3.15 多 Tab 场景完整时序图
+#### 3.16.1 `session: false` 出现的位置与各自含义
+
+`session: false` 在代码中出现 **3 处**，但它们的语义完全不同，不是"历史遗留默认值"，而是各有明确目的：
+
+| 位置 | 代码 | 含义 |
+|------|------|------|
+| `server/models/users.js:312` | `passport.authenticate(..., { session: !strInfo.useForm, ... })` | OAuth 握手时是否将中间状态存入 session |
+| `server/models/users.js:407` | `context.req.login(user, { session: false }, ...)` | JWT 登录后是否将用户序列化到 Passport session |
+| `server/models/users.js:512` | `context.req.logIn(usr, { session: false }, ...)` | 改密码后登录，同上 |
+| `server/core/auth.js:114` | `passport.authenticate('jwt', {session: false}, ...)` | JWT 鉴权中间件是否从 Passport session 反序列化用户 |
+| `server/core/auth.js:207` | `req.logIn(user, { session: false }, ...)` | JWT/API Key 鉴权通过后是否序列化到 session |
+
+**关键点：Wiki.js 同时使用了两种认证机制，session 配置不同：**
+
+1. **OAuth/OIDC/SAML/CAS 等外部策略的握手阶段**（`users.js:312`）— 使用 `session: !useForm`
+   - `useForm: false` 的策略（全部 OAuth/OIDC/SAML/CAS 类，共 20 种）→ `session: true`
+   - `useForm: true` 的策略（local、ldap）→ `session: false`
+   - **这是有意为之的设计**：OAuth 握手需要在 session 中存储 `state`、`nonce` 等临时参数，Passport 的 OAuth 策略内部依赖 session
+
+2. **JWT 鉴权与登录态建立**（`auth.js:114,207` 和 `users.js:407,512`）— 全部使用 `session: false`
+   - JWT 是无状态认证，不希望 Passport 将用户序列化到 session
+   - 每次请求都通过 JWT 重新验证，不依赖 session 中的用户对象
+
+#### 3.16.2 `express-session` 实际上已启用并持久化到数据库
+
+虽然 JWT 路径上使用 `session: false`，但 **Express 层面的 session 中间件实际上是启用的**（`server/master.js:79-86`）：
+
+```javascript
+app.use(session({
+  secret: WIKI.config.sessionSecret,
+  resave: false,
+  saveUninitialized: false,
+  store: new KnexSessionStore({
+    knex: WIKI.models.knex
+  })
+}))
+```
+
+Session 使用 `connect-session-knex` 持久化到数据库，`saveUninitialized: false` 意味着只有实际写入了数据的 session 才会被保存。
+
+同时，Passport 的 `serializeUser` / `deserializeUser` 也已定义（`server/core/auth.js:31-48`），只是在 JWT 路径上因为 `session: false` 从未被调用。
+
+**结论：`session: false` 不是"历史遗留默认值"，而是精确区分两种认证模式的有意设计：**
+- OAuth 握手需要 session（`session: true`，由 `!useForm` 自动推导）
+- JWT 无状态认证不需要 session（`session: false`，显式写出）
+
+#### 3.16.3 各策略对 session 的实际依赖情况
+
+按 `useForm` 分组，各策略对 session 的依赖：
+
+| 分组 | 策略 | useForm | OAuth 握手 session | 对 session 数据的主动读写 |
+|------|------|---------|-------------------|-------------------------|
+| 表单型 | local、ldap | `true` | `session: false` | 无 |
+| 外部 IdP 型 | oidc、oauth2、saml、keycloak、auth0、okta、microsoft、azure、google、github、gitlab、facebook、discord、dropbox、slack、twitch、cas、rocketchat、firebase | `false` | `session: true` | **仅 keycloak**（读写 `keycloak_id_token`） |
+| 其他 | — | — | — | — |
+
+**外部 IdP 策略对 session 的使用情况详解**：
+
+1. **OAuth 类（github/gitlab/google/facebook/discord/dropbox/slack/twitch/microsoft/auth0/okta/rocketchat/oauth2/oidc）** — 共 14 种
+   - 登录握手时由底层 Passport 策略（如 `passport-github`）**自动使用 session** 存储 OAuth `state` 参数（防止 CSRF）
+   - 登录成功后，`afterLoginChecks` 调用 `req.login(user, { session: false })`，**不会把用户对象序列化到 session**
+   - logout 时不读取 session，直接返回重定向 URL
+   - session 中的 OAuth 临时数据在握手完成后由 Passport 自动清理
+
+2. **SAML**
+   - `passport-saml` 默认使用 session 存储请求 ID（防止重放攻击）
+   - 登录成功后同样 `req.login(..., { session: false })`
+   - **无 logout 方法**，logout 时不访问 session
+
+3. **CAS**
+   - `passport-cas` 使用 session 存储 CAS ticket 校验的中间状态
+   - 登录成功后同样 `req.login(..., { session: false })`
+   - **无 logout 方法**
+
+4. **Azure AD**（`passport-azure-ad`）
+   - 特殊实现：如果配置了 `cookieEncryptionKeyString`，使用 `useCookieInsteadOfSession: true`（`azure/authentication.js:37`），**不依赖 session**，而是把 nonce 等状态存在加密 Cookie 中
+   - 未配置 `cookieEncryptionKeyString` 时才会回退到使用 session
+   - **无 logout 方法**
+
+5. **Keycloak**（唯一主动读写 session 业务数据的策略）
+   - 登录时写入：`req.session.keycloak_id_token = results.id_token`（`keycloak/authentication.js:39`）
+   - 登出时读取：`const idToken = context.req.session.keycloak_id_token`（`keycloak/authentication.js:51`）
+   - 这是因为 Keycloak 18+ 的 logout endpoint 需要 `id_token_hint` 参数以实现无提示登出
+
+#### 3.16.4 把 JWT 路径的 `session: false` 改成 `session: true` 的影响
+
+假设我们把以下 3 处的 `session: false` 改成 `session: true`：
+- `server/core/auth.js:114`（JWT 鉴权中间件）
+- `server/core/auth.js:207`（JWT/API Key 鉴权通过后 `req.logIn`）
+- `server/models/users.js:407` / `users.js:512`（登录/改密码后 `req.login`）
+
+**对 SAML / microsoft / azure / 其他 10+ strategy 的 logout 路径的影响：**
+
+| 维度 | 影响 | 说明 |
+|------|------|------|
+| SAML logout | **无影响** | SAML 没有 logout 方法，始终返回 `/`；`req.logout()` 在 logout 路由中已调用，但 SAML SLO 未实现，与 session 配置无关 |
+| microsoft logout | **无影响** | microsoft 没有 logout 方法，始终返回 `/` |
+| azure logout | **无影响** | azure 没有 logout 方法，始终返回 `/`；azure 使用 `useCookieInsteadOfSession`，不依赖 session |
+| google / github 等无 logout 方法的策略 | **无影响** | 始终返回 `/` |
+| auth0 / oidc / oauth2 / rocketchat | **无影响** | logout 只读取静态配置（`conf.logoutURL` / `conf.domain`），不读取 session |
+| keycloak logout | **有正面影响，但非必须** | keycloak logout 需要读 `req.session.keycloak_id_token`，这个值是在 **OAuth 握手时**（`session: !useForm = true`）写入的，跟 JWT 路径的 session 配置无关；但改成 `true` 后，如果 session 存储后端正常，keycloak 的 `id_token_hint` 功能会更可靠 |
+
+**对其他路径的影响（超出 logout 范围）：**
+
+| 路径 | 影响 |
+|------|------|
+| 所有后续请求 | Passport 会自动从 session 反序列化用户（调用 `deserializeUser`），产生额外数据库查询 |
+| 数据库 | `sessions` 表记录数会显著增加（每个登录用户一条） |
+| 多节点 HA | session 已持久化到数据库（KnexSessionStore），多节点共享无问题 |
+| 页面刷新/重连 | 无变化，JWT Cookie 仍然是认证的主凭证；session 中的用户对象只是辅助 |
+| Guest 用户 | 无变化，Guest 不经过 JWT 登录流程 |
+| API Key | `server/core/auth.js:207` 也会把 API Key 认证的用户序列化到 session，可能非预期 |
+
+**会不会让既有 logout 路径走到不一致分支？不会。**
+
+Logout 路由（`server/controllers/auth.js:129-134`）的执行顺序：
+1. `WIKI.models.users.logout()` — 读取 `providerKey` → 调用策略的 `logout()` 获取重定向 URL
+2. `req.logout()` — Passport 清理 session 中的用户对象
+3. `res.clearCookie('jwt')` — 清除 JWT Cookie
+4. `res.redirect(redirURL)` — 重定向
+
+无论 JWT 路径是 `session: false` 还是 `true`，这个流程都不会走到不一致分支：
+- 步骤 1 中策略的 `logout()`：除 keycloak 外都不读 session；keycloak 读的 `keycloak_id_token` 是在 OAuth 握手时（`session: true`）写入的，跟 JWT 路径配置无关
+- 步骤 2 `req.logout()`：`session: false` 时无操作；`session: true` 时清理 session，反而更干净
+- 步骤 3、4 与 session 无关
+
+#### 3.16.5 总结：`session: false` 不是遗留值，无需全局改
+
+- **JWT 路径上的 `session: false` 是正确的设计**：JWT 本就是无状态认证，不需要 session 来维持登录态
+- **OAuth 握手上的 `session: !useForm` 也是正确的设计**：OAuth 的 CSRF 防护（state 参数）必须依赖 session 或加密 Cookie
+- **当前的真实问题**是：Keycloak 的 `keycloak_id_token` 依赖 session，而 session 的生命周期（由 `express-session` 配置决定，默认无过期或很长）可能与 JWT Token 的过期时间不一致。但由于 OAuth 登录的 session 会在握手后自动被 Passport 清理临时数据，Keycloak 写入的业务数据（`keycloak_id_token`）取决于 `express-session` 的 TTL 配置
+- **全局改成 `session: true` 不会修复任何现有问题，反而会引入额外的数据库查询和 session 存储膨胀**
+
+如果需要修复 Keycloak 18+ 无提示登出的问题，正确路径是：
+1. 在登录回调中将 `id_token` 存入 JWT payload（而不是 session），或者
+2. 在登录回调中将 `id_token` 存入一个单独的、有明确 TTL 的 Cookie（类似 JWT Cookie），logout 时从该 Cookie 读取
+
+### 3.17 多 Tab 场景完整时序图
 
 ```
 Tab A (退出登录)                     服务端                       Tab B (仍在运行)
