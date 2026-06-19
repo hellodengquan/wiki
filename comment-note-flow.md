@@ -8,38 +8,44 @@
 ## 1. 整体架构一图
 
 ```
-用户浏览器                    服务端
-──────────                  ──────────────────────────────────────────────
-comments.vue                GraphQL Schema (comment.graphql)
-  │  Apollo mutation/create ──▶ @auth 指令（全局权限门控）
-  │                           │
-  │                           ▼
-  │                         Resolver (comment.js)
-  │                           │  WIKI.models.comments.postNewComment()
-  │                           ▼
-  │                         Comment Model (comments.js)
-  │                           │  WIKI.auth.checkAccess()（页面级权限）
-  │                           ▼
-  │                         CommentProvider (default/comment.js)
-  │                           │  Markdown渲染 + DOMPurify + Akismet反垃圾
-  │                           ▼
-  │                         DB INSERT (Objection.js → comments 表)
+用户浏览器                          服务端
+──────────                          ──────────────────────────────────────────────
+comments.vue                        GraphQL Schema (comment.graphql)
+  │  Apollo mutation/create ─────────▶ @auth 指令（全局权限门控）
+  │  (isAuthenticated? 显示guest字段) │ @rateLimit（15s/次 IP 级限流）
+  │                                   ▼
+  │                                 Resolver (comment.js)
+  │                                   │  WIKI.models.comments.postNewComment()
+  │                                   ▼
+  │                                 Comment Model (comments.js)
+  │                                   │  user.id===2? 校验guestName/Email
+  │                                   │  WIKI.auth.checkAccess()（页面级权限）
+  │                                   ▼
+  │                                 CommentProvider (default/comment.js)
+  │                                   │  ├─ Markdown 渲染(html:false + emoji)
+  │                                   │  ├─ DOMPurify XSS 清洗
+  │                                   │  ├─ Akismet 反垃圾(role=guest/user/admin)
+  │                                   │  ├─ minDelay 频率控制(Guest 全局共享)
+  │                                   │  └─ 硬删除 / 直接覆盖(无版本历史)
+  │                                   ▼
+  │                                 DB INSERT (Objection.js → comments 表)
   │
-  ├─ Apollo query/list ──────▶ Resolver.list()
-  │                           │  查 pages 表 → checkAccess → 查 comments 表
-  │                           ▼
-  │                         返回 [CommentPost]
+  ├─ Apollo query/list ─────────────▶ Resolver.list()
+  │                                   │  查 pages 表 → checkAccess → 查 comments 表
+  │                                   ▼
+  │                                 返回 [CommentPost]
 
-page.vue (主题层)           SSR Controller (common.js)
-  │  读取 effectivePermissions ◀── WIKI.auth.getEffectivePermissions()
-  │  决定是否渲染评论区         │  → page.pug → 传入 commentsEnabled / effectivePermissions
-  │                           ▼
-page.pug (SSR 模板)         → 传入 <page :comments-enabled :effective-permissions>
-  │                           → <template slot='comments'> 嵌入 comments.main
+page.vue (主题层)                     SSR Controller (common.js)
+  │  读取 effectivePermissions ◀────── WIKI.auth.getEffectivePermissions()
+  │  决定是否渲染评论区               │  → page.pug → 传入 commentsEnabled / effectivePermissions
+  │                                   ▼
+page.pug (SSR 模板)                 → 传入 <page :comments-enabled :effective-permissions>
+  │                                   → <template slot='comments'> 嵌入 comments.main
   ▼
 comments.vue 挂载
   │  v-intersect → fetch()
   │  根据 permissions.write / permissions.manage 控制UI
+  │  (注意：作者本人也需 manage:comments 才能编辑/删除)
 ```
 
 ---
@@ -119,6 +125,260 @@ async create(obj, args, context) {
 3. **最小发言间隔**（:110-115）：若配置了 `minDelay`，检查同一用户最近一条评论的时间间隔
 4. **写入数据库**（:118）：`WIKI.models.comments.query().insert(newComment)` → Objection.js → `comments` 表
 5. **返回评论 ID**
+
+---
+
+## 2.8 匿名 vs 已登录用户：差异化路径与限制策略
+
+评论功能对匿名（Guest）和已登录用户采用不同的代码路径和限制策略，差异贯穿前端 UI、后端校验、反垃圾评分、频率控制四个层面。
+
+### 2.8.1 Guest 用户的标识
+
+系统用 **`user.id === 2`** 标识 Guest 用户，定义在 `server/models/users.js:879-889`：
+
+```js
+static async getGuestUser() {
+  const user = await WIKI.models.users.query().findById(2).withGraphJoined('groups')
+  // ...
+  user.permissions = user.getGlobalPermissions()
+  return user
+}
+```
+
+Guest 是一个系统预置账户（`isSystem: true`），默认属于 `id=2` 的 Guest 组。未登录用户访问时，`auth.js:170-176` 会将 `req.user` 设置为该 Guest 对象。
+
+### 2.8.2 前端差异化（`client/components/comments.vue`）
+
+| 差异点 | 已登录用户（`isAuthenticated=true`） | 匿名用户（`!isAuthenticated`） | 代码位置 |
+|--------|-----------------------------------|-----------------------------|----------|
+| 额外输入字段 | 无 | 显示 `guestName` + `guestEmail` 文本框 | `comments.vue:17-42` |
+| 身份显示 | 显示 "Posting as **用户名**" | 无 | `comments.vue:47-49` |
+| 前端校验规则 | 仅校验 `content` 长度≥2 | 额外校验 `name`（2~255字符）和 `email`（合法邮箱格式） | `comments.vue:234-250` |
+| Apollo 变量 | `guestName`/`guestEmail` 传 `''` | 传用户输入值 | `comments.vue:298-300` |
+
+### 2.8.3 后端差异化（`server/models/comments.js`）
+
+`postNewComment()` 方法（:65-89）中针对 Guest 用户做额外校验：
+
+```js
+if (user.id === 2) {
+  const validation = validate({
+    email: _.toLower(guestEmail),
+    name: guestName
+  }, {
+    email: { email: true, length: { maximum: 255 } },
+    name: { presence: { allowEmpty: false }, length: { minimum: 2, maximum: 255 } }
+  }, { format: 'flat' })
+  if (validation && validation.length > 0) {
+    throw new WIKI.Error.InputInvalid(validation[0])
+  }
+}
+```
+
+**数据层差异**（`postNewComment()` :116-123）：传入 Provider 时，Guest 用户的 name/email 会被 `guestName`/`guestEmail` 覆盖：
+
+```js
+user: {
+  ...user,
+  ...(user.id === 2) ? { name: guestName, email: guestEmail } : {},
+  ip
+}
+```
+
+### 2.8.4 反垃圾评分差异化（`default/comment.js:78-84`）
+
+Akismet 反垃圾检查中，根据用户组标识角色：
+
+```js
+let userRole = 'user'
+if (user.groups.indexOf(1) >= 0) {
+  userRole = 'administrator'
+} else if (user.groups.indexOf(2) >= 0) {
+  userRole = 'guest'   // ← Guest 组用户标记为 guest，反垃圾评分更严格
+}
+```
+
+### 2.8.5 频率控制差异化
+
+`definition.yml:21` 的 `minDelay` 配置注释明确说明：
+
+> "Minimum delay (in seconds) between comments per account. Note that **all guests are considered as a single account**."
+
+`default/comment.js:110-115` 实现：
+
+```js
+if (WIKI.data.commentProvider.config.minDelay > 0) {
+  const lastComment = await WIKI.models.comments.query()
+    .select('updatedAt')
+    .findOne('authorId', user.id)   // ← 所有 Guest 都是 id=2，共享同一个延迟计数器
+    .orderBy('updatedAt', 'desc')
+  // ...
+}
+```
+
+关键含义：**所有匿名用户共享同一个 `minDelay` 计数器**，因为他们的 `authorId` 都是 2。这是防止匿名用户刷屏的重要策略。
+
+---
+
+## 2.9 评论编辑与删除：无状态机、无版本历史
+
+### 2.9.1 数据库结构分析
+
+`comments` 表的字段演进（来自三次迁移）：
+
+1. **初始建表**（`migrations/2.0.0.js:63-69`）：
+   ```js
+   table.increments('id').primary()
+   table.text('content').notNullable()
+   table.string('createdAt').notNullable()
+   table.string('updatedAt').notNullable()
+   ```
+
+2. **2.4.36** 新增：`render`、`name`、`email`、`ip`
+3. **2.4.61** 新增：`replyTo`
+
+**关键观察**：没有 `isDeleted`、`deletedAt`、`version`、`status` 等字段，也没有 `commentHistory` 或 `commentVersions` 表。
+
+### 2.9.2 更新操作：直接覆盖，无版本记录
+
+`default/comment.js:126-133` 的 `update()` 方法：
+
+```js
+async update ({ id, content, user }) {
+  const renderedContent = DOMPurify.sanitize(mkdown.render(content))
+  await WIKI.models.comments.query().findById(id).patch({
+    content,              // 直接覆盖
+    render: renderedContent
+  })
+  return renderedContent
+}
+```
+
+- 没有保存历史版本
+- 没有变更日志
+- 仅 `updatedAt` 自动更新（`comments.js:52-54` 的 `$beforeUpdate()` 钩子）
+
+前端在 `comments.vue:89` 通过比较 `createdAt` 和 `updatedAt` 显示 "Modified" 提示，但无法恢复旧版本。
+
+### 2.9.3 删除操作：硬删除，不可恢复
+
+`default/comment.js:137-139` 的 `remove()` 方法：
+
+```js
+async remove ({ id, user }) {
+  return WIKI.models.comments.query().findById(id).delete()
+}
+```
+
+- **物理删除**（`DELETE` 语句），不是软删除
+- 删除后数据不可恢复
+- 没有回收站/撤销机制
+- 没有 `deleteComment` 审计日志
+
+### 2.9.4 权限要求
+
+| 操作 | 所需权限 | 代码位置 |
+|------|----------|----------|
+| 编辑评论 | `manage:comments` 或 `manage:system` | `comment.graphql:50` |
+| 删除评论 | `manage:comments` 或 `manage:system` | `comment.graphql:54` |
+
+注意：**评论作者本人也不能编辑/删除自己的评论**，除非拥有 `manage:comments` 权限。这是因为 Schema 层和 Model 层的权限校验只检查权限位，不比较 `authorId`。
+
+---
+
+## 2.10 Markdown 渲染管道、转义和反垃圾过滤
+
+评论内容的处理走**独立的轻量级管道**，与 Wiki 页面的完整渲染管道（Renderer 系统）完全分离。
+
+### 2.10.1 渲染管道架构
+
+`default/comment.js:1-25` 初始化独立的 Markdown 实例：
+
+```js
+const md = require('markdown-it')
+const { full: mdEmoji } = require('markdown-it-emoji')
+const { JSDOM } = require('jsdom')
+const createDOMPurify = require('dompurify')
+
+const window = new JSDOM('').window
+const DOMPurify = createDOMPurify(window)
+
+const mkdown = md({
+  html: false,        // 禁止原始 HTML（关键安全措施）
+  breaks: true,       // 换行转 <br>
+  linkify: true,      // 自动识别链接
+  highlight(str, lang) {
+    return `<pre><code class="language-${lang}">${_.escape(str)}</code></pre>`
+  }
+})
+
+mkdown.use(mdEmoji)   // 启用 Emoji 支持
+```
+
+**与页面渲染管道的差异**：
+
+| 特征 | 评论渲染 | 页面渲染 |
+|------|---------|---------|
+| HTML 支持 | `html: false`，完全禁止 | 部分支持，依赖 renderer |
+| 插件系统 | 仅 `markdown-it-emoji` | 完整插件链（PlantUML, KaTeX, Kroki 等） |
+| 代码高亮 | 简单转义，无高亮 | Prism.js 完整语法高亮 |
+| XSS 防护 | DOMPurify + `html:false` 双重防护 | DOMPurify + 插件链各自防护 |
+| 自定义扩展 | 无 | 支持自定义 renderer 模块 |
+
+### 2.10.2 WYSIWYG 支持情况
+
+**评论功能不支持 WYSIWYG 编辑器**，仅支持纯 Markdown 文本输入。证据：
+
+1. `comments.vue:3-16` 的输入框是 `<v-textarea>`，没有富文本编辑器
+2. `comments.vue:44-45` 明确提示 "Markdown format" 并显示 Markdown 图标
+3. 代码库中搜索不到 `wysiwyg` 或 `editor.*comment` 相关实现
+
+### 2.10.3 完整处理流程
+
+```
+用户输入 content
+    │
+    ├─ 前端校验（validate.js）
+    │    ├─ 长度 ≥ 2
+    │    └─ Guest 额外校验 name/email
+    │
+    ▼
+┌─ @rateLimit（IP 级别：15 秒 1 次）
+│
+├─ @auth 权限校验（write:comments）
+│
+├─ Model 层 checkAccess（页面级权限）
+│
+└─ Provider 层处理（default/comment.js）
+     ├─ 1. Markdown 渲染：mkdown.render(content)
+     │       ├─ html: false → 所有 HTML 标签转义
+     │       ├─ breaks: true → 换行转 <br>
+     │       ├─ linkify: true → URL 自动转链接
+     │       └─ emoji 插件 → :emoji: 转 Unicode
+     │
+     ├─ 2. XSS 防护：DOMPurify.sanitize(renderedHtml)
+     │       └─ 即使 Markdown 渲染有漏洞，DOMPurify 兜底
+     │
+     ├─ 3. Akismet 反垃圾检查（如果配置了 API Key）
+     │       ├─ 检查内容、作者名、邮箱、IP、User-Agent
+     │       ├─ 根据 userRole（administrator/user/guest）调整评分权重
+     │       └─ 标记为 spam 则直接拒绝
+     │
+     ├─ 4. minDelay 频率控制（用户级别）
+     │       └─ 所有 Guest 共享 id=2，因此全站点 Guest 共享此限制
+     │
+     └─ 5. 写入 DB：content（原始）+ render（HTML）同时存储
+```
+
+### 2.10.4 安全层次总结
+
+评论内容经过**五道安全防线**：
+
+1. **输入过滤**：`html: false` 禁止原始 HTML
+2. **代码转义**：代码块内容用 `_.escape()` 转义
+3. **XSS 清洗**：DOMPurify 对最终 HTML 做白名单过滤
+4. **反垃圾**：Akismet 基于内容和用户特征的垃圾检测
+5. **频率控制**：IP 级（15s/次）+ 用户级（minDelay 配置）双重限流
 
 ---
 
@@ -328,8 +588,13 @@ page(
 | `server/graph/directives/auth.js` | @auth 指令，全局权限拦截 |
 | `server/graph/directives/rate-limit.js` | @rateLimit 指令，频率限制 |
 | `server/models/comments.js` | Comment Model，核心业务逻辑 + 页面级权限校验 |
+| `server/models/users.js` | Guest 用户定义（id=2）、getGuestUser() |
 | `server/models/commentProviders.js` | Provider 注册、初始化、磁盘扫描 |
 | `server/modules/comments/default/comment.js` | 内置 Provider：Markdown渲染、Akismet、入库 |
+| `server/modules/comments/default/definition.yml` | 内置 Provider 配置（akismet, minDelay 参数） |
+| `server/db/migrations/2.0.0.js` | comments 表初始建表（id, content, createdAt, updatedAt） |
+| `server/db/migrations/2.4.36.js` | comments 表新增 render, name, email, ip 字段 |
+| `server/db/migrations/2.4.61.js` | comments 表新增 replyTo 字段 |
 | `server/core/auth.js` | `checkAccess()` 页面级权限引擎、`getEffectivePermissions()` |
 | `server/controllers/common.js` | SSR 控制器，计算 effectivePermissions + 注入评论模板 |
 | `server/views/page.pug` | SSR 模板，传递 comments 变量到 Vue 组件 |
@@ -340,13 +605,56 @@ page(
 
 ---
 
-## 7. 权限决策流程总结
+## 7. 完整旁路分析总结
+
+### 7.1 匿名 vs 已登录用户差异总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Guest (id=2)               │   已登录用户 (id!=2)   │
+├─────────────────────────────────────────┼────────────────────────┤
+│  前端显示 guestName/guestEmail 输入框     │  显示"Posting as 用户名"│
+│  前端额外校验 name/email                │  仅校验 content       │
+│  后端额外校验 guestEmail/guestName       │  无额外校验           │
+│  name/email 被 guestName/guestEmail 覆盖 │  使用用户本身的 name   │
+│  Akismet role=guest（更严格）            │  role=user            │
+│  所有 Guest 共享 minDelay 计数器         │  独立 minDelay 计数器  │
+│  存储 authorId=2                        │  存储 authorId=用户ID  │
+└─────────────────────────────────────────┴────────────────────────┘
+```
+
+### 7.2 编辑/删除机制的设计限制
+
+- **无版本历史**：更新直接覆盖 `content` 和 `render` 字段，不保存旧版本
+- **硬删除**：`DELETE` 语句物理删除，不可恢复
+- **无状态机**：没有 `status` 字段，评论只有"存在/不存在"两种状态
+- **无作者权限**：作者本人不能编辑/删除自己的评论，需要 `manage:comments` 权限
+
+### 7.3 渲染与安全管道关键参数
+
+| 组件 | 参数 | 值 | 目的 |
+|------|------|----|------|
+| markdown-it | `html: false` | 禁止原始 HTML | 防止 XSS 第一层 |
+| markdown-it | `breaks: true` | 换行转 `<br>` | 用户体验 |
+| markdown-it | `linkify: true` | 自动识别链接 | 用户体验 |
+| DOMPurify | 默认配置 | 白名单过滤 | 防止 XSS 第二层 |
+| Akismet | `role=guest/user/admin` | 差异化评分 | 反垃圾 |
+| @rateLimit | `1/15s per IP` | IP 级限流 | 防刷屏 |
+| minDelay | 默认 30s | 用户级限流 | 防刷屏 |
+
+---
+
+## 8. 权限决策流程总结（含旁路）
 
 ```
 请求到达
   │
   ├─ GraphQL @auth 指令
   │    检查用户全局 permissions 是否包含所需权限
+  │    ↓ 通过
+  │
+  ├─ @rateLimit（创建评论时）
+  │    同一 IP 15 秒内只允许 1 次
   │    ↓ 通过
   │
   ├─ Resolver / Model 层
@@ -356,15 +664,32 @@ page(
   │    └─ 页面规则匹配 → 按 START/END/REGEX/EXACT/TAG + 优先级 + deny 判定
   │    ↓ 通过
   │
+  ├─ Model 层差异化校验（仅创建时）
+  │    ├─ user.id === 2 (Guest) → 额外校验 guestName + guestEmail
+  │    └─ user.id !== 2 → 直接通过
+  │    ↓ 通过
+  │
+  ├─ Provider 层处理（内置 Default）
+  │    ├─ 1. Markdown 渲染：html:false + breaks:true + linkify:true + emoji
+  │    ├─ 2. XSS 防护：DOMPurify.sanitize()
+  │    ├─ 3. Akismet 反垃圾（配置了 API Key 时）
+  │    │    ├─ Guest → role=guest（更严格评分）
+  │    │    └─ 已登录 → role=user
+  │    ├─ 4. minDelay 频率控制
+  │    │    ├─ Guest → 全站点共享 id=2 的计数器
+  │    │    └─ 已登录 → 独立计数器
+  │    └─ 5. 写入 DB：content(原始) + render(HTML)
+  │
   └─ 前端 UI 门控
        effectivePermissions.comments.{read,write,manage}
        ├─ read → 是否显示评论区
        ├─ write → 是否显示输入框和发布按钮
+       │    └─ !isAuthenticated → 额外显示 guestName/guestEmail 字段
        └─ manage → 是否显示编辑/删除操作
+            └─ 注意：作者本人也需要 manage:comments 权限
 
 额外约束：
   - featurePageComments 全局开关关闭 → 所有评论权限为 false
-  - @rateLimit → 创建评论时同一 IP 15 秒限 1 次
-  - Guest 用户 → 必须提供 guestName + guestEmail
-  - 内置 Provider → Akismet 反垃圾 + minDelay 最小发言间隔
+  - 编辑/删除无状态机：更新直接覆盖，删除物理删除，无版本历史
+  - 无 WYSIWYG：仅纯 Markdown 文本输入，使用独立的轻量级渲染管道
 ```
