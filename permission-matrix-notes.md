@@ -1458,3 +1458,532 @@ generateHash(opts) {
 | **跨语言规则** | 过滤（不匹配语言的规则忽略） | `auth.js:249-251` |
 | **跨路径（命名空间）** | 前缀匹配 + 特异性覆盖 | `auth.js:254-257` + `_applyPageRuleSpecificity` |
 | **私有命名空间** | 未实现（TODO 占位） | `pages.js:306` 等 |
+
+---
+
+## 17. 权限批量修改时缓存失效顺序的代码路径
+
+### 17.1 概述
+
+Wiki.js 的权限变更分为三类操作，每类的缓存失效步骤和顺序不同。本节从 resolver 代码逐行追踪各操作下**内存缓存 → 撤销列表 → 事件传播**的精确执行顺序。
+
+### 17.2 组更新（update）— 最完整的失效链路
+
+`server/graph/resolvers/group.js:160-211`：
+
+```js
+async update (obj, args, { req }) {
+  // ① 安全检查（unsafe regex、权限提升检查）
+  //    - checkExclusiveAccess 校验操作者权限边界
+
+  // ② 写入数据库
+  await WIKI.models.groups.query().patch({
+    name: args.name,
+    redirectOnLogin: args.redirectOnLogin,
+    permissions: JSON.stringify(args.permissions),
+    pageRules: JSON.stringify(args.pageRules)
+  }).where('id', args.id)
+
+  // ③ 撤销组 token（本地内存）
+  WIKI.auth.revokeUserTokens({ id: args.id, kind: 'g' })
+
+  // ④ 跨 HA 节点同步撤销
+  WIKI.events.outbound.emit('addAuthRevoke', { id: args.id, kind: 'g' })
+
+  // ⑤ 刷新组内存缓存（本地）
+  await WIKI.auth.reloadGroups()
+
+  // ⑥ 跨 HA 节点同步组缓存
+  WIKI.events.outbound.emit('reloadGroups')
+}
+```
+
+**执行顺序图**：
+
+```
+① 安全校验
+     │
+     ▼
+② DB 写入（事务提交）
+     │
+     ▼
+③ 本地 revocationList 写入  ←─ key='g3', value=时间戳
+     │
+     ▼
+④ outbound 事件广播          ←─ 其他 HA 节点收到后执行 revocationList 写入
+     │
+     ▼
+⑤ 本地 WIKI.auth.groups 刷新 ←─ 从 DB 重新读取所有组
+     │                         ←─ 同时：guest.cacheExpiration 置为过期
+     ▼
+⑥ outbound 事件广播          ←─ 其他 HA 节点收到后执行 reloadGroups()
+```
+
+**顺序关键点**：
+
+1. **② 先于 ③**：DB 写入成功后才开始缓存失效，避免读到旧数据
+2. **③ 先于 ⑤**：撤销列表先写入，确保在刷新组缓存的过程中，如果有请求进来，token 也会被标记为需要重验证
+3. **⑤ 是 await**：`reloadGroups()` 必须等待完成才返回响应，保证后续请求能读到最新组信息
+4. **④ 和 ⑥ 是 fire-and-forget**：事件广播不等待其他节点完成
+
+### 17.3 组创建（create）— 无撤销，只有缓存刷新
+
+`server/graph/resolvers/group.js:96-109`：
+
+```js
+async create (obj, args, { req }) {
+  const group = await WIKI.models.groups.query().insertAndFetch({
+    name: args.name,
+    permissions: JSON.stringify(WIKI.data.groups.defaultPermissions),
+    pageRules: JSON.stringify(WIKI.data.groups.defaultPageRules),
+    isSystem: false
+  })
+  await WIKI.auth.reloadGroups()
+  WIKI.events.outbound.emit('reloadGroups')
+  return { ... }
+}
+```
+
+**为什么不需要撤销 token？**
+
+新建组时，没有任何用户属于这个组，所以不需要撤销任何用户的 token。只需刷新组缓存，让系统能识别这个新组。
+
+```
+① DB 插入
+     │
+     ▼
+② 本地 WIKI.auth.groups 刷新
+     │
+     ▼
+③ outbound 事件广播
+```
+
+### 17.4 组删除（delete）— 撤销 + 刷新
+
+`server/graph/resolvers/group.js:113-129`：
+
+```js
+async delete (obj, args) {
+  await WIKI.models.groups.query().deleteById(args.id)
+
+  WIKI.auth.revokeUserTokens({ id: args.id, kind: 'g' })
+  WIKI.events.outbound.emit('addAuthRevoke', { id: args.id, kind: 'g' })
+
+  await WIKI.auth.reloadGroups()
+  WIKI.events.outbound.emit('reloadGroups')
+  return { ... }
+}
+```
+
+**顺序**：DB 删除 → 撤销组 token → 刷新组缓存。
+
+**与 update 的区别**：删除操作不需要安全检查（因为组 ID 1/2 已在入口处拦截），其余步骤一致。
+
+### 17.5 用户分配到组（assignUser）— 只撤销用户 token
+
+`server/graph/resolvers/group.js:36-92`：
+
+```js
+async assignUser (obj, args, { req }) {
+  // ① 安全校验（Guest 用户、组有效性、权限边界）
+  // ② 检查是否已存在关系
+  // ③ 写入 userGroups 关联
+  await grp.$relatedQuery('users').relate(usr.id)
+
+  // ④ 撤销该用户 token
+  WIKI.auth.revokeUserTokens({ id: usr.id, kind: 'u' })
+  WIKI.events.outbound.emit('addAuthRevoke', { id: usr.id, kind: 'u' })
+}
+```
+
+**关键**：
+- 只撤销**单个用户**的 token（kind='u'），不是组级撤销
+- **不需要 `reloadGroups()`**：组定义没变，只是用户-组关系变了
+- 用户下次请求时，重验证流程会从 DB 重新读取用户的组关系
+
+### 17.6 用户移出组（unassignUser）— 同 assignUser
+
+`server/graph/resolvers/group.js:133-156`：
+
+```js
+async unassignUser (obj, args) {
+  // ① 安全校验
+  // ② 删除 userGroups 关联
+  await grp.$relatedQuery('users').unrelate().where('userId', usr.id)
+
+  // ③ 撤销该用户 token
+  WIKI.auth.revokeUserTokens({ id: usr.id, kind: 'u' })
+  WIKI.events.outbound.emit('addAuthRevoke', { id: usr.id, kind: 'u' })
+}
+```
+
+### 17.7 用户删除 / 停用 — 撤销用户 token
+
+`server/graph/resolvers/user.js:80-99`（delete）：
+```js
+WIKI.auth.revokeUserTokens({ id: args.id, kind: 'u' })
+WIKI.events.outbound.emit('addAuthRevoke', { id: args.id, kind: 'u' })
+```
+
+`server/graph/resolvers/user.js:138-153`（deactivate）：
+```js
+WIKI.auth.revokeUserTokens({ id: args.id, kind: 'u' })
+WIKI.events.outbound.emit('addAuthRevoke', { id: args.id, kind: 'u' })
+```
+
+### 17.8 各操作的缓存失效步骤对比
+
+| 操作 | DB 写入 | revocationList（本地） | outbound 同步 | reloadGroups（本地） | outbound 同步 |
+|---|---|---|---|---|---|
+| **组更新** | ✅ patch | ✅ kind='g' | ✅ addAuthRevoke | ✅ await | ✅ reloadGroups |
+| **组创建** | ✅ insert | — | — | ✅ await | ✅ reloadGroups |
+| **组删除** | ✅ delete | ✅ kind='g' | ✅ addAuthRevoke | ✅ await | ✅ reloadGroups |
+| **用户分配到组** | ✅ relate | ✅ kind='u' | ✅ addAuthRevoke | — | — |
+| **用户移出组** | ✅ unrelate | ✅ kind='u' | ✅ addAuthRevoke | — | — |
+| **用户删除** | ✅ delete | ✅ kind='u' | ✅ addAuthRevoke | — | — |
+| **用户停用** | ✅ patch | ✅ kind='u' | ✅ addAuthRevoke | — | — |
+
+### 17.9 HA 事件订阅：跨节点缓存同步
+
+`server/core/auth.js:478-490`：
+
+```js
+subscribeToEvents() {
+  WIKI.events.inbound.on('reloadGroups', () => {
+    WIKI.auth.reloadGroups()
+  })
+  WIKI.events.inbound.on('addAuthRevoke', (args) => {
+    WIKI.auth.revokeUserTokens(args)
+  })
+}
+```
+
+**事件方向**：
+
+```
+节点 A 执行组更新
+  │
+  ├─ 本地：revokeUserTokens + reloadGroups
+  │
+  └─ outbound.emit('addAuthRevoke') + outbound.emit('reloadGroups')
+       │
+       ▼
+  消息队列 / 进程间通信
+       │
+       ▼
+  节点 B 的 inbound 收到事件
+       │
+       ├─ inbound.on('addAuthRevoke') → revokeUserTokens()
+       └─ inbound.on('reloadGroups')  → reloadGroups()
+```
+
+**注意**：HA 同步是异步的，不保证两个节点同时生效。存在短暂的不一致窗口。
+
+### 17.10 `revokeUserTokens` 的精确语义
+
+`server/core/auth.js:526-528`：
+
+```js
+revokeUserTokens ({ id, kind = 'u' }) {
+  WIKI.auth.revocationList.set(
+    `${kind}${_.toString(id)}`,          // key: 'u123' 或 'g3'
+    Math.round(                          // value: 撤销时间戳（5秒前）
+      DateTime.utc().minus({ seconds: 5 }).toSeconds()
+    ),
+    Math.ceil(ms(WIKI.config.auth.tokenExpiration) / 1000)  // TTL: 与 token 有效期相同
+  )
+}
+```
+
+**设计细节**：
+- 时间戳减去 5 秒：留出时钟偏移的容错，确保撤销前 5 秒签发的 token 也能被强制重验证
+- TTL 设为 token 有效期：撤销记录不需要比 token 存活更久，过期自动清理
+- kind='g'（组级撤销）：影响该组所有用户的 token
+- kind='u'（用户级撤销）：只影响单个用户的 token
+
+### 17.11 请求时的失效检查时序
+
+`server/core/auth.js:113-177`，每次请求经过 `authenticate` 中间件时：
+
+```
+请求到达
+  │
+  ▼
+JWT 解码 → 得到 user.id, user.iat, user.groups
+  │
+  ▼
+检查1：用户级撤销
+  revocationList.get(`u${user.id}`)
+  如果存在且 user.iat < 撤销时间 → mustRevalidate = true
+  │
+  ▼
+检查2：服务重启
+  DateTime.fromSeconds(user.iat) <= WIKI.startedAt → mustRevalidate = true
+  │
+  ▼
+检查3：组级撤销（遍历 user.groups）
+  for (gid of user.groups):
+    revocationList.get(`g${gid}`)
+    如果存在且 user.iat < 撤销时间 → mustRevalidate = true
+  │
+  ▼
+mustRevalidate?
+  ├─ true: 从 DB 重新读取用户信息 → 签发新 JWT → 写入响应
+  └─ false: 使用当前 JWT 继续
+  │
+  ▼
+JWT 无效?
+  └─ true: req.user = Guest（缓存1分钟）
+```
+
+**检查顺序的设计理由**：
+1. 先检查用户级（最常见、最快判断），再检查组级（需遍历）
+2. 服务重启检查放在中间，因为只在启动后短时间内有意义
+3. 一旦任一检查触发 mustRevalidate，就跳过后续检查
+
+---
+
+## 18. 超级管理员绕过权限链的代码挂载点
+
+### 18.1 概述
+
+超级管理员通过 `manage:system` 权限实现全面绕过。这不是一个统一的"superadmin 模式"，而是在权限链的**不同层级**各有独立的短路点。本节逐一列出所有挂载点。
+
+### 18.2 挂载点 1：`checkAccess` — 运行时权限检查短路
+
+`server/core/auth.js:224-227`：
+
+```js
+checkAccess(user, permissions = [], page = false) {
+  const userPermissions = user.permissions ? user.permissions : user.getGlobalPermissions()
+
+  // System Admin
+  if (_.includes(userPermissions, 'manage:system')) {
+    return true
+  }
+  // ... 后续全局权限检查和页面规则检查全部跳过
+}
+```
+
+**影响范围**：所有调用 `checkAccess` 的地方，包括：
+- 页面浏览（`common.js:298`）
+- 页面树过滤（`page.js:286`）
+- 搜索结果过滤（`page.js:58`）
+- `getEffectivePermissions`（`auth.js:496-520`）
+- 标签、链接、资源访问等所有可见性判断
+
+**效果**：超级管理员**完全跳过页面规则检查**，无论什么路径、什么语言、什么标签，一律通过。
+
+### 18.3 挂载点 2：`@auth` GraphQL 指令 — 查询级权限检查
+
+`server/graph/directives/auth.js:46`：
+
+```js
+if (!_.some(context.req.user.permissions, pm => _.includes(requiredScopes, pm))) {
+  throw new Error('Forbidden')
+}
+```
+
+**这里没有 `manage:system` 短路！** `@auth` 指令用的是**精确匹配**：只要用户的任一权限在 `requiredScopes` 列表中就通过。
+
+但**实际上 `manage:system` 能通过所有 `@auth` 检查**，因为 GraphQL schema 中几乎所有 `@auth` 指令都把 `manage:system` 列为允许的权限之一：
+
+```graphql
+# group.graphql
+list: ... @auth(requires: ["write:users", "manage:users", "write:groups", "manage:groups", "manage:system"])
+create: ... @auth(requires: ["write:groups", "manage:groups", "manage:system"])
+update: ... @auth(requires: ["write:groups", "manage:groups", "manage:system"])
+delete: ... @auth(requires: ["write:groups", "manage:groups", "manage:system"])
+
+# page.graphql
+search: ... @auth(requires: ["manage:system", "read:pages"])
+list: ... @auth(requires: ["manage:system", "read:pages"])
+single: ... @auth(requires: ["read:pages", "manage:system"])
+```
+
+**关键理解**：`@auth` 层的 `manage:system` 绕过是**声明式的**（在 schema 中显式列出），不是代码中的硬编码短路。如果有人添加了一个新的 GraphQL 字段但忘记在 `@auth` 的 `requires` 中加入 `manage:system`，超级管理员也会被拒绝。
+
+### 18.4 挂载点 3：`checkExclusiveAccess` — 权限提升检查短路
+
+`server/core/auth.js:304-318`：
+
+```js
+checkExclusiveAccess(user, includePermissions = [], excludePermissions = []) {
+  const userPermissions = user.permissions ? user.permissions : user.getGlobalPermissions()
+
+  if (_.intersection(userPermissions, includePermissions).length < 1) {
+    return false
+  }
+  if (_.intersection(userPermissions, excludePermissions).length > 0) {
+    return false
+  }
+  return true
+}
+```
+
+这个函数本身**没有** `manage:system` 短路。但调用它的代码通过**将 `manage:system` 放入 excludePermissions 参数**来实现等效效果：
+
+```js
+// group.js:50 — assignUser 中的权限提升检查
+WIKI.auth.checkExclusiveAccess(req.user, ['manage:users', 'write:groups'], ['manage:groups', 'manage:system'])
+```
+
+**逻辑**：`checkExclusiveAccess(用户, ['manage:users'], ['manage:system'])` 的含义是——"用户是否**有** `manage:users` 但**没有** `manage:system`？"
+
+- 超级管理员有 `manage:system` → 在 excludePermissions 中命中 → 返回 `false` → 跳过限制
+- 非 `manage:system` 的 `manage:users` 用户 → 不在 excludePermissions 中 → 返回 `true` → 受到限制
+
+**这是一个反向绕过机制**：不是"有 `manage:system` 就放行"，而是"有 `manage:system` 就不受限制"。
+
+### 18.5 挂载点 4：`checkAssignUserToGroupAccess` — 组分配权限短路
+
+`server/core/auth.js:327-361`：
+
+```js
+async checkAssignUserToGroupAccess(requester, groupIds = []) {
+  const requesterPermissions = requester.permissions ? requester.permissions : requester.getGlobalPermissions()
+
+  // System Admin
+  if (requesterPermissions.includes('manage:system')) {
+    return true   // ← 超级管理员可以直接分配用户到任何组
+  }
+
+  // 非 manage:system 的后续检查...
+  // - 基本权限检查
+  // - 组内 manage:system 权限检查（非超管不能分配用户到有 manage:system 的组）
+  // - 组内管理权限检查（非 manage:groups 不能分配用户到有管理权限的组）
+}
+```
+
+**调用位置**：
+- `user.js:67` — 创建用户时
+- `user.js:103` — 更新用户时
+
+**效果**：只有超级管理员能分配用户到拥有 `manage:system` 权限的组，其他管理员（`manage:users` / `manage:groups`）都不能。
+
+### 18.6 挂载点 5：`getRootUser` — 内部操作的硬编码超管
+
+`server/models/users.js:891-898`：
+
+```js
+static async getRootUser () {
+  let user = await WIKI.models.users.query().findById(1)
+  user.permissions = ['manage:system']  // ← 硬编码，不读组
+  return user
+}
+```
+
+**用途**：系统内部操作（如定时任务、搜索索引重建等需要绕过权限的场景）使用 `getRootUser()` 获取一个不受任何限制的身份。
+
+**特点**：
+- 不通过 `getGlobalPermissions()` 计算权限，直接硬编码 `['manage:system']`
+- 只读 id=1 的用户，不关心该用户实际属于什么组
+- 不是 HTTP 请求路径，是服务端内部调用
+
+### 18.7 挂载点 6：API Token 的权限来源
+
+`server/core/auth.js:179-204`：
+
+```js
+if (_.has(user, 'api')) {
+  // ...
+  req.user = {
+    id: 1,
+    permissions: _.get(WIKI.auth.groups, `${user.grp}.permissions`, []),
+    groups: [user.grp],
+    // ...
+  }
+}
+```
+
+API Token 的权限来自创建时指定的组（`user.grp`）。如果 API Token 绑定的组拥有 `manage:system`，则 API 请求也拥有超级管理员权限。
+
+### 18.8 超级管理员绕过链路全景图
+
+```
+请求到达
+  │
+  ▼
+┌─────────────────────────────────────────────────────┐
+│  层1：GraphQL @auth 指令                              │
+│  auth.js:46                                          │
+│  manage:system 在 schema 的 requires 列表中 → 通过    │
+│  （声明式，不是代码短路）                               │
+└─────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─────────────────────────────────────────────────────┐
+│  层2：Resolver 内的权限提升检查                        │
+│                                                      │
+│  2a. checkExclusiveAccess                            │
+│      manage:system 在 excludePermissions 中          │
+│      → 返回 false → 跳过限制                         │
+│      （group.js:50, 61, 175, 186）                   │
+│                                                      │
+│  2b. checkAssignUserToGroupAccess                    │
+│      manage:system → 直接 return true                │
+│      （auth.js:335）                                  │
+└─────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─────────────────────────────────────────────────────┐
+│  层3：checkAccess 运行时权限检查                       │
+│  auth.js:225-227                                     │
+│  manage:system → 直接 return true                    │
+│  （跳过全局权限检查 + 页面规则检查）                    │
+└─────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─────────────────────────────────────────────────────┐
+│  层4：getEffectivePermissions                        │
+│  auth.js:496-520                                     │
+│  内部调用 checkAccess → 同样被 manage:system 短路     │
+│  → 所有权限维度（read/write/manage/delete）全为 true  │
+└─────────────────────────────────────────────────────┘
+```
+
+### 18.9 各层绕过方式的差异
+
+| 层级 | 绕过方式 | 是否硬编码 | 漏洞风险 |
+|---|---|---|---|
+| **@auth 指令** | 声明式（schema 中列出 `manage:system`） | 否 | 新增字段时可能遗漏 |
+| **checkExclusiveAccess** | 反向排除（`manage:system` 在 exclude 中使检查返回 false） | 半硬编码 | 调用方需正确传参 |
+| **checkAssignUserToGroupAccess** | 硬编码短路（`includes('manage:system') → return true`） | 是 | 无 |
+| **checkAccess** | 硬编码短路（`includes('manage:system') → return true`） | 是 | 无 |
+| **getRootUser** | 硬编码覆盖（`permissions = ['manage:system']`） | 是 | 无 |
+
+### 18.10 `manage:system` 的权限提升保护
+
+系统防止非 `manage:system` 用户自行获取 `manage:system`，有三道防线：
+
+**防线 1：@auth 指令**（`group.graphql:43`）
+```graphql
+update: ... @auth(requires: ["write:groups", "manage:groups", "manage:system"])
+```
+只有 `write:groups` / `manage:groups` / `manage:system` 才能调用组更新接口。
+
+**防线 2：checkExclusiveAccess**（`group.js:184-190`）
+```js
+if (
+  WIKI.auth.checkExclusiveAccess(req.user, ['manage:groups'], ['manage:system']) &&
+  args.permissions.some(p => _.last(p.split(':')) === 'system')
+) {
+  throw new gql.GraphQLError('...')
+}
+```
+有 `manage:groups` 但没有 `manage:system` 的用户，不能给组添加 `manage:system` 权限。
+
+**防线 3：checkAssignUserToGroupAccess**（`auth.js:347-348`）
+```js
+if (grp.permissions.includes('manage:system')) {
+  return false
+}
+```
+非 `manage:system` 用户不能把其他用户分配到拥有 `manage:system` 的组。
+
+**三层防线的关系**：
+- 防线 1 阻止无权限者调用接口
+- 防线 2 阻止有组管理权限者给自己添加 `manage:system`
+- 防线 3 阻止有用户管理权限者把他人放入 `manage:system` 组
+
+**只有已经是 `manage:system` 的用户才能分配 `manage:system` 权限**——形成闭环保护。
