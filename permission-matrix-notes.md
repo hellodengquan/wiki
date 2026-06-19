@@ -1987,3 +1987,566 @@ if (grp.permissions.includes('manage:system')) {
 - 防线 3 阻止有用户管理权限者把他人放入 `manage:system` 组
 
 **只有已经是 `manage:system` 的用户才能分配 `manage:system` 权限**——形成闭环保护。
+
+---
+
+## 19. 权限审计记录的导出路径
+
+### 19.1 概述：没有专门的"权限审计"功能
+
+Wiki.js 2.x **没有独立的权限审计日志系统**（没有 `auditLog` / `permissionLog` 表，也没有操作日志记录谁在什么时候改了什么权限）。
+
+所谓"权限审计"只能通过以下三个间接路径获得：
+
+1. **系统导出（System Export）**：把组、用户、设置等完整数据导出为 JSON 文件，用于离线审计
+2. **组 / 用户 GraphQL 查询接口**：管理员通过 UI 或 API 实时读取权限快照
+3. **页面历史 + 评论导出**：间接查看页面内容变更（但不含权限变更记录）
+
+### 19.2 系统导出：GraphQL 入口
+
+`server/graph/schemas/system.graphql:52-56`：
+
+```graphql
+export(
+  entities: [String]!    # 要导出的实体类型
+  path: String!          # 服务器本地目录（相对 WIKI.ROOTPATH）
+): DefaultResponse @auth(requires: ["manage:system"])
+```
+
+**唯一权限**：`manage:system`。只有超级管理员能触发导出。
+
+### 19.3 系统导出：Resolver 触发层
+
+`server/graph/resolvers/system.js:277-307`：
+
+```js
+async export (obj, args, context) {
+  // ① 安全检查
+  //    - 已有导出在运行？防止并发
+  //    - entities 数组非空？
+  //    - 目标目录存在且为空？
+
+  // ② 触发异步导出（不阻塞响应）
+  WIKI.system.export({
+    entities: args.entities,  // 如 ['groups', 'users', 'pages', 'settings', ...]
+    path: desiredPath
+  })
+
+  // ③ 立即返回 "已启动" 响应
+  return graphHelper.generateSuccess('Export started successfully.')
+}
+```
+
+**关键特征**：`WIKI.system.export()` 是**异步 fire-and-forget**，GraphQL 响应返回时导出可能才刚开始。客户端需要轮询 `exportStatus` 查询进度。
+
+### 19.4 导出进度查询
+
+`server/graph/resolvers/system.js:46-53`：
+
+```js
+async exportStatus () {
+  return {
+    status: WIKI.system.exportStatus.status,      // 'notrunning' | 'running' | 'success' | 'error'
+    progress: Math.ceil(WIKI.system.exportStatus.progress), // 0-100
+    message: WIKI.system.exportStatus.message,
+    startedAt: WIKI.system.exportStatus.startedAt
+  }
+}
+```
+
+同样需要 `manage:system` 权限（`system.graphql:21`）。
+
+### 19.5 系统导出：核心实现层
+
+`server/core/system.js:93-460`，按 `entities` 参数逐个处理。
+
+以下是**与权限相关的实体导出**路径：
+
+#### 19.5.1 Groups 导出
+
+`server/core/system.js:204-212`：
+
+```js
+case 'groups': {
+  WIKI.logger.info('Exporting groups...')
+  const outputPath = path.join(opts.path, 'groups.json')
+  const groups = await WIKI.models.groups.query()   // 读所有组
+  await fs.outputJSON(outputPath, groups, { spaces: 2 })
+  // groups 每条记录包含：
+  //   - id, name, isSystem, redirectOnLogin
+  //   - permissions (JSON string)   ← 全局权限数组
+  //   - pageRules (JSON string)     ← 页面规则数组
+  this.exportStatus.progress += progressMultiplier * 100
+  break
+}
+```
+
+输出 `groups.json`，包含完整的 `permissions` 和 `pageRules`，可用于离线审计"每个组有什么权限"。
+
+#### 19.5.2 Users 导出
+
+`server/core/system.js:391-450`：
+
+```js
+case 'users': {
+  const rs = Readable({ objectMode: true })
+  // ...
+  const fetchUsersBatch = async (offset) => {
+    const users = await WIKI.models.users.query()
+      .offset(offset).limit(50)
+      .withGraphJoined({
+        groups: true,      // ← 关联 userGroups → 组的 id + name
+        provider: true     // ← 关联 authentication → 登录方式
+      })
+    // 逐条流式推送
+  }
+  // Gzip 压缩输出 users.json.gz
+}
+```
+
+输出 `users.json.gz`，每条用户记录包含：
+- `id, name, email, providerId, providerKey, isActive, isSystem, ...`
+- `groups: [{ id, name }]` ← 用户所属组（ID + 名称，不含组的权限）
+- `provider: { key, strategyKey, displayName }` ← 认证策略信息
+
+**注意**：导出的用户记录**不包含其实际权限数组**（只含所属组）。要审计用户实际权限，需要结合 `groups.json` 中的 `permissions` / `pageRules` 自行计算。
+
+#### 19.5.3 Settings 导出（含认证配置）
+
+`server/core/system.js:364-386`：
+
+```js
+case 'settings': {
+  const config = {
+    ...WIKI.config,           // 当前配置
+    modules: {
+      analytics: await WIKI.models.analytics.query(),
+      authentication: (await WIKI.models.authentication.query()).map(a => ({
+        ...a,
+        domainWhitelist: _.get(a, 'domainWhitelist.v', []),
+        autoEnrollGroups: _.get(a, 'autoEnrollGroups.v', [])  // ← 自动加入的组
+      })),
+      commentProviders: ...,
+      renderers: ...,
+      searchEngines: ...,
+      storage: ...
+    },
+    apiKeys: await WIKI.models.apiKeys.query().where('isRevoked', false)
+  }
+}
+```
+
+输出 `settings.json`，其中与权限审计相关的字段：
+- `authentication[*].autoEnrollGroups`：新用户自动加入的组（权限来源之一）
+- `authentication[*].domainWhitelist`：域名白名单
+- `apiKeys[*]`：未撤销的 API Key（含 `grp` 字段 → 对应的组 ID）
+
+#### 19.5.4 Navigation 导出
+
+`server/core/system.js:282-293`：
+
+```js
+case 'navigation': {
+  const navigationRaw = await WIKI.models.navigation.query()
+  const navigation = navigationRaw.reduce((obj, cur) => {
+    obj[cur.key] = cur.config  // config 中包含 visibilityGroups 等可见性配置
+    return obj
+  }, {})
+  await fs.outputJSON(outputPath, navigation, { spaces: 2 })
+}
+```
+
+输出 `navigation.json`，其中每个导航项的 `visibilityMode` 和 `visibilityGroups` 是审计"导航可见性"的关键。
+
+#### 19.5.5 其他实体（与权限间接相关）
+
+| 实体 | 输出文件 | 权限相关内容 |
+|---|---|---|
+| **pages** | `pages.json.gz` | 不含权限，只有 path/locale/title/content |
+| **history** | `pages-history.json.gz` | 页面变更历史（不含权限变更） |
+| **assets** | `assets/` 目录 | 资源文件（不含权限） |
+| **comments** | `comments.json.gz` | 评论（含作者信息） |
+
+### 19.6 权限审计导出的完整文件清单
+
+一次完整的审计导出（`entities = ['groups','users','settings','navigation']`）会生成：
+
+```
+目标目录/
+├── groups.json          ← 所有组的 permissions + pageRules
+├── users.json.gz        ← 所有用户 + 所属组关系
+├── settings.json        ← 认证策略 + 自动入组 + API Keys
+└── navigation.json      ← 导航可见性配置
+```
+
+**审计数据链**：
+```
+users.json.gz → 用户所属组 ID
+                    │
+                    ▼
+          groups.json → 组的 permissions + pageRules
+                    │
+                    ▼
+          可重建出每个用户的实际有效权限
+```
+
+### 19.7 导出的安全边界
+
+| 安全控制 | 位置 | 说明 |
+|---|---|---|
+| **入口权限** | `system.graphql:55` | `@auth(requires: ["manage:system"])` |
+| **并发控制** | `system.js:284` | 同时只能有一个导出在运行（内存标记 `exportStatus.status`） |
+| **目录空检查** | `system.js:294` | 目标目录必须为空 |
+| **敏感信息** | `system.js:367-383` | `settings.json` 中包含认证配置的敏感字段（密钥等） |
+| **不含密码** | `users` 导出 | 通过 Objection.js model 的 `$hidden` 排除了 `password` 字段 |
+
+### 19.8 权限审计的能力边界（缺失项）
+
+Wiki.js 2.x 导出功能**不能**直接提供以下审计信息：
+
+1. ❌ **谁在什么时候改了权限**：没有操作日志（audit trail）
+2. ❌ **权限变更的 diff**：只能导出当前快照，无法导出变更历史
+3. ❌ **用户实际权限的预计算**：需要手工结合 users + groups 推导
+4. ❌ **页面级权限覆盖记录**：导出的 pages 不包含规则（规则在 groups 中）
+5. ❌ **Guest 用户访问日志**：没有访问日志（需靠 Web 服务器 log 弥补）
+
+这些缺失意味着：Wiki.js 的"导出"更像是**数据备份**，而非合规意义上的**权限审计**。
+
+---
+
+## 20. 跨实例（HA）同步时的权限继承与缓存失效挂载点
+
+### 20.1 HA 架构总览
+
+Wiki.js 2.x 通过 **PostgreSQL LISTEN/NOTIFY**（`pg-pubsub` 模块）实现多实例间的事件传播。不支持其他数据库的 HA 同步。
+
+`server/core/db.js:231-264`：
+
+```js
+async subscribeToNotifications () {
+  // 前置条件：
+  //   ① WIKI.config.ha === true
+  //   ② 数据库类型 === 'postgres'
+  //   任一不满足则不启用 HA
+  // ...
+
+  const PGPubSub = require('pg-pubsub')
+  this.listener = new PGPubSub(this.knex.client.connectionSettings)
+
+  // 接收 DB NOTIFY → 分发到 inbound 事件总线
+  this.listener.addChannel('wiki', payload => {
+    if (payload.source !== WIKI.INSTANCE_ID) {   // 忽略自己发的事件
+      WIKI.events.inbound.emit(payload.event, payload.value)
+    }
+  })
+
+  // 把所有 outbound 事件广播到 DB NOTIFY
+  WIKI.events.outbound.onAny(this.notifyViaDB)
+
+  // 注册订阅者：三类权限相关
+  WIKI.auth.subscribeToEvents()    // 组、API Key、认证策略、撤销
+  WIKI.configSvc.subscribeToEvents() // 配置变更
+  WIKI.models.pages.subscribeToEvents() // 页面缓存
+}
+```
+
+**事件流向**：
+
+```
+节点 A 执行操作
+  │
+  ▼
+outbound.emit('eventName', payload)
+  │
+  ▼
+notifyViaDB() → PostgreSQL NOTIFY 'wiki' (source=A, event=..., value=...)
+  │
+  ▼
+PostgreSQL 推送至所有 LISTEN 连接
+  │
+  ▼
+节点 B 的 listener 收到
+  │
+  ├─ payload.source === B? → 忽略（自己发的）
+  └─ payload.source !== B? → WIKI.events.inbound.emit(event, value)
+       │
+       ▼
+     subscribeToEvents 中注册的处理器执行
+```
+
+### 20.2 三类事件总线与订阅者总览
+
+```
+WIKI.events
+  │
+  ├── outbound: 本实例主动发出的事件 → 经 DB NOTIFY 广播
+  │
+  └── inbound: 从其他实例接收的事件 → 触发本地缓存失效
+       │
+       ├── auth.subscribeToEvents()   ← 权限相关（核心）
+       ├── configSvc.subscribeToEvents() ← 配置相关
+       └── pages.subscribeToEvents()     ← 页面缓存相关
+```
+
+### 20.3 权限相关的 HA 同步挂载点（auth）
+
+`server/core/auth.js:478-491`：
+
+```js
+subscribeToEvents() {
+  // ── 挂载点 1：组缓存刷新 ──
+  WIKI.events.inbound.on('reloadGroups', () => {
+    WIKI.auth.reloadGroups()
+    // → 重新从 DB 读取所有组
+    // → 同时令 Guest 缓存过期（cacheExpiration = 一天前）
+  })
+
+  // ── 挂载点 2：API Key 缓存刷新 ──
+  WIKI.events.inbound.on('reloadApiKeys', () => {
+    WIKI.auth.reloadApiKeys()
+    // → 重新从 DB 读取未撤销的 API Key
+  })
+
+  // ── 挂载点 3：认证策略激活 ──
+  WIKI.events.inbound.on('reloadAuthStrategies', () => {
+    WIKI.auth.activateStrategies()
+    // → 重新初始化 Passport 策略
+    // → 域名白名单、自动入组配置实时生效
+  })
+
+  // ── 挂载点 4：Token 撤销 ──
+  WIKI.events.inbound.on('addAuthRevoke', (args) => {
+    WIKI.auth.revokeUserTokens(args)
+    // → args = { id, kind: 'u'|'g' }
+    // → 写入本地 revocationList[key] = 时间戳
+    // → 下一次请求时 mustRevalidate = true
+  })
+}
+```
+
+### 20.4 权限相关事件的完整触发链
+
+#### 20.4.1 组更新（create / update / delete）
+
+```
+节点 A：graph/resolvers/group.js
+  │
+  ├─ ① DB 写入（insert/patch/delete）
+  │
+  ├─ ② WIKI.auth.revokeUserTokens({ id, kind: 'g' })
+  │     ← 写入本地 revocationList
+  │
+  ├─ ③ WIKI.events.outbound.emit('addAuthRevoke', { id, kind: 'g' })
+  │     ← 发往 PostgreSQL NOTIFY
+  │
+  ├─ ④ await WIKI.auth.reloadGroups()
+  │     ← 本地组缓存刷新（同步等待）
+  │
+  └─ ⑤ WIKI.events.outbound.emit('reloadGroups')
+        ← 发往 PostgreSQL NOTIFY
+```
+
+节点 B 接收：
+```
+┌─ inbound.on('addAuthRevoke', args) → revokeUserTokens(args)
+└─ inbound.on('reloadGroups') → reloadGroups()
+```
+
+**顺序依赖**：`addAuthRevoke` 先于 `reloadGroups` 广播。这样即使节点 B 在 `reloadGroups` 前有请求进来，`revocationList` 也已写入，能强制 token 重验证。
+
+#### 20.4.2 用户组关系变更（assignUser / unassignUser）
+
+```
+节点 A：graph/resolvers/group.js
+  │
+  ├─ ① userGroups 关联变更
+  │
+  ├─ ② WIKI.auth.revokeUserTokens({ id: userId, kind: 'u' })
+  │
+  └─ ③ WIKI.events.outbound.emit('addAuthRevoke', { id: userId, kind: 'u' })
+```
+
+节点 B 接收：
+```
+inbound.on('addAuthRevoke', args) → revokeUserTokens(args)
+```
+
+**不需要 `reloadGroups`**：组定义没变，只是单个用户的 token 需要失效。用户下一次请求时会重验证并从 DB 拉最新的组关系。
+
+#### 20.4.3 用户删除 / 停用
+
+```
+节点 A：graph/resolvers/user.js
+  │
+  ├─ ① users 表 delete / patch isActive=false
+  │
+  ├─ ② WIKI.auth.revokeUserTokens({ id, kind: 'u' })
+  │
+  └─ ③ WIKI.events.outbound.emit('addAuthRevoke', { id, kind: 'u' })
+```
+
+与 20.4.2 完全一致的传播路径。
+
+#### 20.4.4 V1 用户导入
+
+`server/graph/resolvers/system.js:225-227`：
+
+```js
+if (args.groupMode !== `NONE`) {
+  await WIKI.auth.reloadGroups()           // 本地刷新
+  WIKI.events.outbound.emit('reloadGroups') // 广播
+}
+```
+
+导入后只广播 `reloadGroups`（因为新建的组没有用户，不需要撤销 token）。
+
+### 20.5 配置相关的 HA 同步（影响权限策略）
+
+`server/core/config.js:130-134`：
+
+```js
+subscribeToEvents() {
+  WIKI.events.inbound.on('reloadConfig', async () => {
+    await WIKI.configSvc.loadFromDb()
+    await WIKI.configSvc.applyFlags()
+  })
+}
+```
+
+`reloadConfig` 由设置变更时触发。与权限间接相关的配置项：
+- 认证策略的域名白名单
+- 认证策略的自动入组配置
+- 功能开关（如评论功能 → 影响 `read:comments` / `write:comments` 的实际可用性）
+
+### 20.6 页面缓存的 HA 同步
+
+`server/models/pages.js:1166-1172`：
+
+```js
+static subscribeToEvents() {
+  WIKI.events.inbound.on('deletePageFromCache', hash => {
+    WIKI.models.pages.deletePageFromCache(hash)
+  })
+  WIKI.events.inbound.on('flushCache', () => {
+    WIKI.models.pages.flushCache()
+  })
+}
+```
+
+**与权限的间接关系**：页面渲染缓存不包含权限判定，但如果因为权限变更导致某个页面的渲染内容需要调整（如编辑器看到不同的按钮），缓存清除保证下次渲染时权限判定重新执行。
+
+实际的权限检查在渲染前（`common.js:298`）执行，与缓存无关。
+
+### 20.7 事件广播的底层实现
+
+`server/core/db.js:282-288`：
+
+```js
+notifyViaDB (event, value) {
+  WIKI.models.listener.publish('wiki', {
+    source: WIKI.INSTANCE_ID,  // 实例唯一标识，用于过滤自己发的事件
+    event,                     // 事件名：'reloadGroups' / 'addAuthRevoke' / ...
+    value                      // 事件载荷
+  })
+}
+```
+
+通过 `pg-pubsub` 的 `publish('wiki', payload)` 发送 PostgreSQL NOTIFY。
+
+### 20.8 HA 同步的能力边界
+
+| 特性 | 支持情况 | 说明 |
+|---|---|---|
+| **组缓存同步** | ✅ 支持 | `reloadGroups` |
+| **Token 撤销同步** | ✅ 支持 | `addAuthRevoke`（用户级 + 组级） |
+| **API Key 同步** | ✅ 支持 | `reloadApiKeys` |
+| **认证策略同步** | ✅ 支持 | `reloadAuthStrategies` |
+| **导航缓存同步** | ❌ 缺失 | 导航有 300 秒 LRU 缓存，过期自动失效 |
+| **Guest 缓存同步** | ⚠️ 间接支持 | 通过 `reloadGroups` 中间接置为过期，不单独广播 |
+| **数据库直写旁路** | ❌ 不支持 | 直接改 DB 不触发同步，需重启实例或手动触发 |
+| **非 PostgreSQL DB** | ❌ 不支持 | HA 同步依赖 PostgreSQL LISTEN/NOTIFY |
+| **事务一致性** | ❌ 最终一致 | 事件异步传播，有短暂不一致窗口 |
+| **事件丢失恢复** | ❌ 无重试 | 网络瞬断可能丢事件，需重启实例恢复 |
+
+### 20.9 权限继承在跨实例间的时序一致性
+
+```
+T0: 管理员在节点 A 上更新 Group(id=3) 权限
+     │
+     ▼
+T1: 节点 A
+      ├─ DB commit（全局一致，所有节点从同一 DB 读取）
+      ├─ revocationList['g3'] = T1
+      ├─ 广播 addAuthRevoke(g3)
+      ├─ reloadGroups()（从 DB 读最新组）
+      └─ 广播 reloadGroups
+     │
+     ▼
+T2: 节点 B 收到 addAuthRevoke(g3)
+     → 写入本地 revocationList['g3'] = T1
+     │
+     ▼
+T3: 节点 B 收到 reloadGroups
+     → reloadGroups() → 从 DB 读最新组
+     │
+     ▼
+T4: 用户请求到达节点 B（携带 JWT，iat = T0_5，groups: [3]）
+     → auth.js:134 检查 revocationList['g3']
+     → T0_5 < T1 → mustRevalidate = true
+     → 从 DB 重新读取用户+组信息 → 签发新 token
+     │
+     ▼
+T5: 用户在节点 B 获得最新权限
+```
+
+**一致性保证**：即使 `reloadGroups` 延迟到达（T3 > T4），`addAuthRevoke`（T2）写入的撤销记录也能确保请求被强制重验证，从 DB 直接读取最新数据。这就是 **撤销事件必须先于刷新事件广播** 的设计原因。
+
+### 20.10 HA 故障场景分析
+
+**场景 1：节点 B 网络瞬断，丢失 `addAuthRevoke` 事件**
+
+```
+节点 B revocationList 中没有 'g3' 记录
+  → 用户请求到达，JWT iat 正常
+  → mustRevalidate = false → 使用旧权限
+  → 直到 JWT 自然过期（30 分钟）后才刷新
+  窗口：最多 30 分钟权限不一致
+```
+
+**场景 2：节点 B 网络瞬断，丢失 `reloadGroups` 事件**
+
+```
+节点 B WIKI.auth.groups 仍是旧的 pageRules
+  → 用户 token 被重验证（addAuthRevoke 收到了）
+  → getGlobalPermissions() 从旧的 groups 缓存读
+  → 权限仍是旧的
+  → 直到下一次组变更触发 reloadGroups
+  窗口：永久不一致（除非重启或手动改组）
+```
+
+**场景 3：直接在 DB 中修改 groups 表（不通过 GraphQL 接口）**
+
+```
+所有实例的 groups 缓存都不刷新
+所有实例的 revocationList 都不添加
+  → 旧 token 一直有效（30 分钟）
+  → token 刷新时从 DB 读，但 groups 内存缓存仍是旧的
+  → 即使 reloadGroups，也从 DB 读到了最新的，但需要手动触发
+  窗口：永久不一致（除非重启实例）
+```
+
+**场景 4：服务重启**
+
+```
+WIKI.startedAt = 当前时间
+  → 所有旧 token 的 iat <= startedAt
+  → mustRevalidate = true（auth.js:131-132）
+  → 所有用户下一次请求强制刷新权限
+  → reloadGroups 在启动时自动执行（setup.js）
+  窗口：重启后第一次请求立即生效
+```
+
+**关键结论**：
+- **addAuthRevoke 是"软防线"**：丢了最多不一致 30 分钟
+- **reloadGroups 是"硬防线"**：丢了会导致**永久不一致**，直到下一次组变更
+- **重启是终极同步机制**：一次性清除所有不一致状态
