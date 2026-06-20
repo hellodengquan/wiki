@@ -859,21 +859,447 @@ beforeDestroy() {
 
 ---
 
-## 八、关键文件索引
+## 八、主题上传与磁盘扫描机制
+
+### 8.1 当前状态：主题上传与扫描功能未实现
+
+Wiki.js 目前**没有实现**自定义主题的上传、安装、磁盘扫描机制。以下是代码中的证据：
+
+#### 证据一：管理后台 UI 被注释掉
+
+**文件**: `client/components/admin/admin-theme.vue:69-93`
+
+```pug
+//- v-card.animated.fadeInUp.wait-p2s
+//-   v-toolbar(color='teal', dark, dense, flat)
+//-     v-toolbar-title.subtitle-1 {{$t('admin:theme.downloadThemes')}}
+//-     v-spacer
+//-     v-chip(label, color='white', small).teal--text coming soon
+//-   v-data-table(
+//-     :headers='headers',
+//-     :items='themes',
+//-     hide-default-footer,
+//-     item-key='value',
+//-     :items-per-page='1000'
+//-   )
+```
+
+整个"下载/安装主题"卡片被 `//-` Pug 注释，标记为 **coming soon**。前端 UI 预留了 `isDownloading` / `isInstalled` / `installDate` / `updatedAt` 等字段，但无实际逻辑。
+
+#### 证据二：前端主题列表硬编码
+
+**文件**: `client/components/admin/admin-theme.vue:142-144`
+
+```js
+themes: [
+  { text: 'Default', author: 'requarks.io', value: 'default', isInstalled: true, installDate: '', updatedAt: '' }
+]
+```
+
+主题列表不是动态从后端读取，而是写死一个 default 条目。
+
+#### 证据三：后端 `theming.themes` resolver 硬编码
+
+**文件**: `server/graph/resolvers/theming.js:30-33`
+
+```js
+themes() {
+  return [
+    { author: 'requarks.io', isCompatible: true, isInstalled: true, name: 'Default', title: 'Default', userInput: '' }
+  ]
+}
+```
+
+`Query.theming.themes` 直接返回写死的单元素数组，不扫描磁盘，不读 DB。
+
+#### 证据四：没有 `refreshThemesFromDisk` 对应的模型文件
+
+`server/core/kernel.js:71-87` 的 `postBootMaster()` 中，所有可插拔模块都有 `refreshXxxFromDisk()` 调用：
+
+```
+await WIKI.models.analytics.refreshProvidersFromDisk()
+await WIKI.models.authentication.refreshStrategiesFromDisk()
+await WIKI.models.commentProviders.refreshProvidersFromDisk()
+await WIKI.models.editors.refreshEditorsFromDisk()        ← editors 模型有
+await WIKI.models.loggers.refreshLoggersFromDisk()
+await WIKI.models.renderers.refreshRenderersFromDisk()
+await WIKI.models.searchEngines.refreshSearchEnginesFromDisk()
+await WIKI.models.storage.refreshTargetsFromDisk()
+                                                    ← 没有 WIKI.models.themes.refreshThemesFromDisk()
+```
+
+editors 模块的 `refreshEditorsFromDisk()`（`server/models/editors.js:37-95`）展示了标准扫描模式，但主题**没有对应的模型**和对应的调用。
+
+#### 证据五：sideloader 也不处理主题
+
+**文件**: `server/core/sideloader.js:1-78`
+
+离线 sideload 机制只处理 `importLocales()`，不处理主题包导入。sideload 目录结构中没有 themes 相关的扫描逻辑。
+
+### 8.2 标准模块的扫描模式（供主题参考）
+
+以 editors 模块为参照，标准 `refreshFromDisk` 流程如下：
+
+**文件**: `server/models/editors.js:37-95`
+
+```
+1. 从 DB 查询已注册的 editors
+2. fs.readdir(server/modules/editor/) 读取磁盘目录
+3. 逐个读 definition.yml，yaml.safeLoad 解析
+4. 存入 WIKI.data.editors（内存缓存）
+5. 对比 DB 与磁盘：
+   - DB 中没有 → 加入 newEditors 列表
+   - DB 中已有 → patch config 补充新增 prop 的默认值
+6. 启动 Objection transaction
+7. 批量 insert newEditors
+8. commit / rollback
+```
+
+标准模块的目录结构（对照主题如果实现应类似）：
+```
+server/modules/editor/{editor-key}/definition.yml   ← 模块元数据+props定义
+server/modules/editor/{editor-key}/editor.js        ← 模块实现代码
+client/themes/{theme-name}/theme.yml                ← 目前只有 theme.yml，无 definition.yml
+server/themes/{theme-name}/theme.yml                ← 服务端也只有 theme.yml，无 definition.yml
+```
+
+### 8.3 假设主题上传功能实现时应有的代码路径
+
+根据 coming soon UI 和现有模式，推测应包含：
+
+1. **服务端扫描模型**：新建 `server/models/themes.js`，实现 `refreshThemesFromDisk()`
+2. **上传 API**：GraphQL Mutation 接收 tarball/zip，校验 theme.yml，解压到 `server/themes/` 和 `client/themes/`
+3. **Resolver**：`Query.theming.themes` 改为调用模型动态返回
+4. **前端**：解除 admin-theme.vue 注释，调用 download/install mutation
+5. **构建触发**：上传成功后需触发 webpack 重建客户端（因为 client 端主题代码在构建时被打包），这是架构上的难题——当前主题名是构建时通过 `import('./themes/' + siteConfig.theme + '/...')` 固定路径打入 chunk 的
+
+### 8.4 主题上传/扫描相关的结论
+
+| 功能 | 状态 | 代码位置 |
+|------|------|----------|
+| 主题列表从磁盘扫描 | **未实现** | resolver 硬编码 `server/graph/resolvers/theming.js:30-33` |
+| 主题上传/安装 | **未实现** | UI 注释 `client/components/admin/admin-theme.vue:69-93` |
+| 服务端主题模型 | **不存在** | 没有 `server/models/themes.js` 文件 |
+| Sideload 离线导入主题 | **未实现** | `server/core/sideloader.js` 只处理 locales |
+| 构建时动态打包主题 | **部分支持** | webpack 的动态 import 会扫描 `client/themes/*/` 下所有匹配文件，只要目录存在就会打包 |
+
+---
+
+## 九、主题变量覆盖的优先级与生效顺序
+
+Wiki.js 不采用 CSS 自定义属性（CSS Variables）体系，主题变量是三层"硬编码"机制。**不存在 `entity` 级的主题变量覆盖**（entity 在此语境中没有实现），实际的样式覆盖链如下：
+
+### 9.1 第一层：SCSS 全局变量（构建时）
+
+**文件**: `client/scss/global.scss:6-32`
+
+```scss
+$tablet: 769px !default;
+$desktop: 980px !default;
+$widescreen: 1180px !default;
+
+$grid-breakpoints: (
+  'xs': 0,
+  'sm': 600px,
+  'md': 960px,
+  'lg': 1280px - 16px,
+  'xl': 1920px - 16px
+) !default;
+
+$display-breakpoints: (...) !default;
+```
+
+- 使用 `!default` 声明，允许被更早加载的同名变量覆盖
+- 通过 `sass-resources-loader`（`dev/webpack/webpack.prod.js:124-128`）注入到**每个** `.scss` 文件中，主题 SCSS 可以直接使用
+- Vuetify 的 material color 函数 `mc('grey', '800')` 也来自此基础变量层（`base/material`、`base/mixins` import）
+
+### 9.2 第二层：Vuetify 主题系统（运行时，JS 驱动）
+
+**文件**: `client/client-app.js:211-216`
+
+```js
+vuetify: new Vuetify({
+  rtl: siteConfig.rtl,
+  theme: {
+    dark: darkModeEnabled   // 仅此一项，不自定义 primary/secondary 等色板
+  }
+})
+```
+
+Wiki.js **没有自定义 Vuetify 的色板**（primary、secondary、accent、error、info、success、warning），完全使用 Vuetify 默认配色。主题开发者只能通过覆写 CSS 类名来改变颜色。
+
+运行时变更方式：
+- 组件内通过 `this.$vuetify.theme.dark = newValue` 切换（Vue 响应式）
+- 例如 `admin-theme.vue:195` 在切换开关时实时预览
+- 例如 `profile/profile.vue:690-692` 用户保存 appearance 后即时切换
+
+组件内消费方式：
+- **模板内直接取值**: `v-app(:dark='$vuetify.theme.dark')`（page.vue:2）
+- **三元表达式驱动 class**: `:class='$vuetify.theme.dark ? `grey darken-4-d4` : `primary`'`（page.vue:6）
+- **三元表达式驱动 icon**: `{{ $vuetify.rtl ? `mdi-chevron-left` : `mdi-chevron-right` }}`（page.vue:100）
+- **Script 中取**: `if (this.$vuetify.theme.dark) { ... }`（page.vue:609）
+
+### 9.3 第三层：主题 SCSS（运行时，异步 chunk 加载）
+
+**文件**: `client/themes/default/scss/app.scss:1-1300`
+
+主题 SCSS 处理三类覆盖：
+- **Vuetify 通用组件样式覆写**：直接写 CSS 选择器覆盖 Vuetify class
+- **`.contents` 内容区域样式**：Markdown 渲染后的标题、链接、blockquote、表格等
+- **暗色模式适配**：大量使用 `@at-root .theme--dark &` 选择器，当 `<body>` 上存在 `.theme--dark` class 时生效
+
+典型的暗色模式 SCSS 写法：
+```scss
+blockquote.is-info {
+  background-color: mc('blue', '50');
+  @at-root .theme--dark & {
+    background-color: mc('blue', '900');  // 暗色模式下覆盖
+  }
+}
+```
+
+典型的 RTL 适配：
+```scss
+@at-root .is-rtl & {
+  margin-left: 0;
+  margin-right: ($n / 12 * 100) * 1%;
+}
+```
+
+### 9.4 第四层：全局 injectCSS + 页面级 CSS（运行时，HTML 内联）
+
+**文件**: `server/views/page.pug:4-5`
+
+```pug
+block head
+  if injectCode.css
+    style(type='text/css')!= injectCode.css
+```
+
+`injectCode.css = 站点 injectCSS + 页面 page.extra.css`，内联在 HTML 的 `<head>` 中，以 `<style>` 块输出。
+
+**优先级分析**（结合 CSS 源顺序与特异性）：
+
+```
+特异性相同的情况下，后加载的优先级更高：
+
+1. Vuetify 基础样式 + global.scss（主 CSS bundle，head 中 <link>）
+       ↓ 后加载
+2. 主题 SCSS 样式（theme chunk CSS，异步加载）
+       ↓ 后加载 + 位置在 head 末尾（最高优先级的 <link>）
+3. injectCode.css（HTML 内联 <style>，在最后）
+```
+
+injectCode.css 由于内联在 HTML，且在 theme chunk 之后，特异性相同时**最高优先级**。
+
+页面级 `page.extra.css` 追加在站点 `injectCSS` 之后，所以**页面级 > 站点级**（CSS 层叠顺序规则）。
+
+### 9.5 完整优先级链总结
+
+```
+构建时（不可动态改变）                    运行时（可动态改变）
+─────────────────────────                 ─────────────────────────
+
+SCSS !default 变量
+    ↓ 低
+Vuetify 暗色模式（$vuetify.theme.dark）
+    ↓
+主题 SCSS 覆写（theme chunk CSS）         ← 可通过切换主题替换
+    ↓
+站点级 injectCSS（settings.theming）       ← 管理后台随时改
+    ↓
+页面级 page.extra.css（pages.extra）      ← 编辑页面时改
+    ↓ 高
+```
+
+### 9.6 关于 "entity 级覆盖" 的说明
+
+代码中**不存在**"entity（实体）级主题变量覆盖"这一层级，原因：
+- Wiki.js 不使用 CSS custom properties（`--theme-primary: xxx`）运行时变量体系
+- Vuetify 的色板（primary/secondary 等）没有被自定义或暴露给管理员
+- theme.yml 中的 `props`（sdPosition/showTOC/showTags 等）只是元数据声明，**从未被代码读取和使用**（搜索整个代码库找不到消费 `theme.yml props` 的逻辑）
+
+theme.yml `props` 的现状：定义了 sdPosition、showTOC 等 7 个可配置项，但它们只影响管理后台表单的生成，实际渲染逻辑没有从这些 props 取值——布局用的是硬编码的 Vuex getter `site/tocPosition` 和 template 中的 `v-if`。如果要真正实现主题级 props，需要在渲染组件时读取 `theming.themeProps[siteConfig.theme]` 并作为参数传入。
+
+---
+
+## 十、配置写回数据库的事务与并发处理
+
+### 10.1 saveToDb 核心实现
+
+**文件**: `server/core/config.js:98-119`
+
+```js
+async saveToDb(keys, propagate = true) {
+  try {
+    for (let key of keys) {
+      let value = _.get(WIKI.config, key, null)
+      if (!_.isPlainObject(value)) {
+        value = { v: value }
+      }
+      let affectedRows = await WIKI.models.settings.query().patch({ value }).where('key', key)
+      if (affectedRows === 0 && value) {
+        await WIKI.models.settings.query().insert({ key, value })
+      }
+    }
+    if (propagate) {
+      WIKI.events.outbound.emit('reloadConfig')
+    }
+  } catch (err) {
+    WIKI.logger.error(`Failed to save configuration to DB: ${err.message}`)
+    return false
+  }
+  return true
+}
+```
+
+### 10.2 事务分析：**没有事务保护**
+
+关键发现：`saveToDb` **不使用数据库事务**。
+
+与 editors 模块对比：
+
+| 模块 | 是否有事务 | 代码位置 |
+|------|-----------|----------|
+| settings (saveToDb) | **❌ 无事务** | `server/core/config.js:98-119` |
+| editors refresh | ✅ 有事务 | `server/models/editors.js:79` `trx = await Objection.transaction.start(...)` |
+| storage refresh | ✅ 有事务 | `server/models/storage.js:88` |
+| searchEngines refresh | ✅ 有事务 | `server/models/searchEngines.js:80` |
+| renderers refresh | ✅ 有事务 | `server/models/renderers.js:84` |
+| loggers refresh | ✅ 有事务 | `server/models/loggers.js:81` |
+
+editors 事务模式示例：
+```js
+trx = await WIKI.models.Objection.transaction.start(WIKI.models.knex)
+for (let editor of newEditors) {
+  await WIKI.models.editors.query(trx).insert(editor)  // ← 传 trx
+}
+await trx.commit()
+// catch 中 trx.rollback()
+```
+
+`saveToDb` 的 `patch` 和 `insert` 每个 key 都是独立语句，如果中途出错（如第 3 个 key 写入失败）：
+- 前 2 个 key 已提交，不会回滚
+- 第 3 个及之后的 key 没有写入
+- 结果是 **部分成功、部分失败**，DB 处于不一致状态
+
+### 10.3 Upsert 机制：patch + insert 两步（非原子）
+
+每个配置 key 的写入是两步操作：
+1. `patch({ value }).where('key', key)` —— 尝试更新
+2. 若 `affectedRows === 0` 说明 key 不存在 → 再 `insert({ key, value })`
+
+**问题**：这两步之间存在**竞态条件**。两个并发请求同时为同一个新 key 执行 upsert：
+- 请求 A patch → 0 行受影响
+- 请求 B patch → 0 行受影响
+- 请求 A insert → 成功
+- 请求 B insert → **主键冲突异常**（settings 表 `key` 是主键）
+
+代码中没有捕获这个冲突并重试 patch，insert 失败会进入 catch，整个 saveToDb 返回 false。
+
+**对比 Objection 提供的原子 upsert**：
+Objection.js 支持 `.onConflict(key).merge()` 的原子 upsert，但此代码使用的是旧版 API，没有采用。标准做法应为：
+```js
+await WIKI.models.settings.query().insert({ key, value }).onConflict('key').merge()
+```
+
+### 10.4 串行化保障：JavaScript 单线程 + 异步队列
+
+Node.js 是单线程 event loop，这提供了一定程度的隐式串行：
+- 同一个 Node.js 实例中，多个 resolver 调用 saveToDb **不会并行执行**到数据库
+- 但在 `await` 让出 CPU 后，后续语句可能与其他请求交错
+- 所以两步 upsert 在单实例中**依然存在竞态窗口**（await patch 返回后，await insert 之前，另一个请求可以插入）
+
+### 10.5 HA 多实例并发：reloadConfig 事件传播
+
+在 Wiki.js HA（高可用）集群部署中，配置变更的一致性通过事件总线实现：
+
+**文件**: `server/core/kernel.js:39-42`
+
+```js
+WIKI.events = {
+  inbound: new EventEmitter(),
+  outbound: new EventEmitter()
+}
+```
+
+- **outbound**：本实例发出的事件，需通过外部消息中间件广播到其他实例
+- **inbound**：接收其他实例发来的事件
+
+**文件**: `server/core/config.js:110-111` 和 `130-135`
+
+```js
+// 写入方：发出事件
+if (propagate) {
+  WIKI.events.outbound.emit('reloadConfig')
+}
+
+// 接收方：处理事件
+subscribeToEvents() {
+  WIKI.events.inbound.on('reloadConfig', async () => {
+    await WIKI.configSvc.loadFromDb()     // 从 DB 重新拉取配置
+    await WIKI.configSvc.applyFlags()
+  })
+}
+```
+
+注意：EventEmitter2 是**进程内**事件，不是分布式消息。实际的跨实例广播依赖于 `server/servers/` 中的消息中间件（如 Redis Pub/Sub、MQTT 等），它们负责将 outbound 事件路由到所有实例的 inbound。
+
+**HA 并发一致性问题**：
+- 两个实例上的管理员**同时**修改不同配置（例如 A 改主题，B 改邮件），可能会覆盖彼此的设置
+- 原因：`saveToDb` 写的是 `_.get(WIKI.config, key)`，而 `loadFromDb()` 使用的是 `defaultsDeep`，不会清除已被删除的 key
+- 但由于 key 是独立的（`theming` 与 `mail` 是 settings 表不同行），**不同 key 的并发写入互相独立，不会冲突**
+- 同一 key 的并发写入，由数据库的**行级锁**保证最终一致性——后提交者覆盖先提交者（last write wins）
+
+### 10.6 设置模型的 Hook 时间戳
+
+**文件**: `server/models/settings.js:30-35`
+
+```js
+$beforeUpdate() {
+  this.updatedAt = new Date().toISOString()
+}
+$beforeInsert() {
+  this.updatedAt = new Date().toISOString()
+}
+```
+
+`updatedAt` 由 Objection hook 自动设置，但 `createdAt` **没有 hook**，也没有设置默认值。第一次插入时 `createdAt` 为 `NULL`。
+
+### 10.7 并发与事务问题总结
+
+| 问题 | 严重程度 | 现状 | 建议 |
+|------|---------|------|------|
+| saveToDb 无事务 | 中 | 多 key 写入部分成功后无法回滚 | 包一层 Objection.transaction，所有 patch/insert 在同一事务中 |
+| Upsert 非原子 | 低（罕见场景） | patch→insert 两步竞态 | 用 `onConflict('key').merge()` 原子 upsert |
+| 同一 key 并发写入 | 低 | 数据库行锁，Last-Write-Wins | 通常可接受；如需更强一致，加乐观锁 version 列 |
+| HA 实例 reloadConfig 延迟 | 低 | 事件广播有毫秒级延迟 | 通常可接受 |
+| createdAt 未设置 | 极低 | 新插入行 createdAt 为 NULL | 在 `$beforeInsert` 中设置 `this.createdAt = new Date().toISOString()` |
+
+---
+
+## 十一、关键文件索引
 
 | 层级 | 文件 | 职责 |
 |------|------|------|
-| 配置核心 | `server/core/config.js` | 磁盘/DB 配置加载与持久化 |
+| 配置核心 | `server/core/config.js` | 磁盘/DB 配置加载与持久化（saveToDb 无事务） |
 | 配置辅助 | `server/helpers/config.js` | 环境变量替换 |
-| 配置数据模型 | `server/models/settings.js` | settings 表读写 |
+| 配置数据模型 | `server/models/settings.js` | settings 表读写（upsert、getConfig） |
 | 默认配置 | `server/app/data.yml` | 所有配置项默认值 |
+| 模块扫描参考实现 | `server/models/editors.js` | refreshFromDisk 事务模式参考 |
+| 事件总线 & 启动流程 | `server/core/kernel.js` | inbound/outbound EventEmitter、postBoot 扫描顺序 |
+| HA 离线导入 | `server/core/sideloader.js` | 仅支持 locales，不处理主题 |
 | Express 初始化 | `server/master.js` | locals 设置、中间件、路由 |
 | 页面控制器 | `server/controllers/common.js` | 构建 injectCode、调用 res.render |
-| 主题 GraphQL | `server/graph/resolvers/theming.js` | 主题配置读写 API |
+| 主题 GraphQL | `server/graph/resolvers/theming.js` | 主题配置读写 API（themes 列表硬编码） |
+| 主题后台 UI | `client/components/admin/admin-theme.vue` | 主题下载安装 UI 被注释（coming soon） |
 | 基础模板 | `dev/templates/master.pug` | 注入 siteConfig JS 变量、图标 CSS |
 | 页面模板 | `server/views/page.pug` | 注入主题代码、挂载 Vue 组件 |
+| 全局 SCSS 变量 | `client/scss/global.scss` | 断点、mixins、mc() 颜色函数 |
+| Vuetify 主题初始化 | `client/client-app.js` | dark/rtl 设置，Vue 响应式切换 |
 | 客户端入口 | `client/index-app.js` | 动态加载主题 SCSS/JS |
-| Vue 初始化 | `client/client-app.js` | 动态注册主题组件、Vuetify 暗色/RTL |
 | Site Store | `client/store/site.js` | 前端配置状态（dark、tocPosition 等） |
 | User Store | `client/store/user.js` | 用户偏好（appearance 暗色模式） |
+| 主题 SCSS 覆写 | `client/themes/default/scss/app.scss` | 内容样式 + 暗色适配 + RTL 适配 |
 | 主题页面组件 | `client/themes/default/components/page.vue` | 消费 tocPosition、dark、rtl 进行布局 |
+| 用户 profile 暗色切换 | `client/components/profile/profile.vue` | 用户保存 appearance 后即时切换 $vuetify.theme.dark |
