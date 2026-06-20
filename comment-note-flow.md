@@ -30,6 +30,11 @@ comments.vue                        GraphQL Schema (comment.graphql)
   │                                   ▼
   │                                 DB INSERT (Objection.js → comments 表)
   │
+  │     ⚠️  以下功能均未实现：
+  │     ❌ 无 event emit → 无通知 / Activity log / Webhook
+  │     ❌ 无点赞 / 收藏表 → 无社交互动数据
+  │     ❌ 无 @mention 解析 → 仅纯文本，无自动补全
+  │
   ├─ Apollo query/list ─────────────▶ Resolver.list()
   │                                   │  查 pages 表 → checkAccess → 查 comments 表
   │                                   ▼
@@ -437,6 +442,132 @@ comments: {
 
 ---
 
+## 2.11 评论通知、Activity log、点赞收藏、@mention：功能状态与未实现分析
+
+通过全代码库搜索，这四处特性均处于**未实现或部分规划**状态。以下是逐点的代码证据分析。
+
+### 2.11.1 评论通知与 Activity log 的协同触发：不存在
+
+**代码库中不存在评论事件的 event emit 逻辑**。
+
+**事件系统架构**（`server/core/kernel.js:39-41`）：
+```js
+WIKI.events = {
+  inbound: new EventEmitter(),
+  outbound: new EventEmitter()
+}
+```
+
+`db.js:248-256` 的事件总线仅用于跨实例的 HA 缓存失效：
+```js
+WIKI.events.outbound.onAny(this.notifyViaDB)  // 所有 outbound 事件都转发到 PG NOTIFY
+```
+
+**唯一被 emit 的 outbound 事件是 `deletePageFromCache`**（`models/pages.js` 中多处），用于页面变更时的缓存失效。
+
+**全代码库搜索结果**：
+- `WIKI.events.outbound.emit` 仅在 `pages.js` 中出现，参数固定为 `'deletePageFromCache'`
+- 无任何 emit `commentCreated`、`commentUpdated`、`commentDeleted` 等评论相关事件
+- 无 `activityLog`、`activity_log` 或 `commentNotification` 相关表或 Model
+- `client/components/profile/profile.vue:344` 中 `commentsPosted` 硬编码为 `0`（注释功能从未对接）
+- `client/components/profile/comments.vue` 是空白模板（无具体实现）
+
+**Webhooks 系统**（`admin-webhooks.vue`）：
+- 页面仅为框架代码，`save()` 按钮被 `disabled` 硬编码禁用
+- Apollo query/mutation 引用的是 `mail-query-config` 和 `mail-mutation-save-config`（邮件配置）
+- 实际上是**误用了邮件配置的 GraphQL 操作**，评论 webhook 从未实现
+
+**结论**：
+- 评论创建/更新/删除后，**不会**触发任何通知、Activity log 记录或 webhook
+- 事件系统架构为 HA 缓存同步而设计，未用于评论通知
+- Webhooks 管理页是半成品，不能实际使用
+
+### 2.11.2 评论点赞 / 收藏：数据库和代码均未实现
+
+**数据库层面**：
+- `comments` 表（`migrations/2.0.0.js:63-69`）仅有字段：`id, content, createdAt, updatedAt`
+- `migrations/2.4.36.js` 新增：`render, name, email, ip`
+- `migrations/2.4.61.js` 新增：`replyTo`
+- **没有** `likesCount`、`favoritesCount`、`likedBy` 等字段
+- **没有** `commentLikes`、`commentFavorites`、`commentReactions` 等关联表
+
+**GraphQL Schema 层面**（`comment.graphql`）：
+- `CommentPost` type 仅有：`id, content, render, authorId, authorName, authorEmail, authorIP, createdAt, updatedAt`
+- **没有** `like`、`unlike`、`favorite`、`unfavorite` 等 mutation
+- **没有** `likes`、`likedByCurrentUser` 等字段
+
+**前端 UI 层面**：
+- `comments.vue` 无点赞按钮、收藏按钮、数字计数器
+- 全代码库搜索 `mdi-heart`、`mdi-thumb-up`、`mdi-star`、`mdi-like` 等图标，仅在 `admin-contribute.vue` 和 `admin.vue` 中出现，与评论无关
+- `page.vue:134-142` 中 `commentsCount` 被注释掉（半成品代码）
+
+**全代码库搜索结果**：
+- 无 `comment.*like`、`like.*comment`、`comment.*vote`、`comment.*favorite` 相关代码
+- 无 `commentLikes`、`commentReactions` 等表定义
+
+**结论**：
+- 评论点赞/收藏功能**完全未实现**
+- 数据库没有预留字段，GraphQL 没有定义，前端没有 UI
+
+### 2.11.3 评论 @mention：仅在 CKEditor 中有 TODO 注释，无实际实现
+
+**最接近的代码证据**在 `client/components/editor/editor-ckeditor.vue:72-82`：
+```js
+// TODO: Mention autocomplete
+//
+// mention: {
+//   feeds: [
+//     {
+//       marker: '@',
+//       feed: [ '@Barney', '@Lily', '@Marshall', '@Robin', '@Ted' ],
+//       minimumCharacters: 1
+//     }
+//   ]
+// },
+```
+
+这段是**页面编辑器**的 CKEditor 配置中的 TODO 注释，与评论功能无关。而且 feed 数据是硬编码的示例数组（《老爸老妈的浪漫史》角色名），从未对接实际用户搜索。
+
+**评论组件层面**（`comments.vue`）：
+- 输入框是 `<v-textarea>`（纯文本），**不支持 CKEditor**
+- 没有 mention 自动补全
+- 没有 `@` 字符的事件监听
+- 没有用户搜索弹窗（`user-search.vue` 组件存在但从未在评论模块中被引用）
+
+**后端层面**：
+- 无 `parseMentions()`、`extractMentions()`、`notifyMentionedUsers()` 等函数
+- 无 `mention` 相关的权限校验
+- 无评论内容中 `@username` 模式的正则匹配
+- 无通知发送逻辑（站内信、邮件等）
+
+**GraphQL Schema 层面**：
+- 无 `sendMentionNotification`、`resolveMention` 等 mutation
+- 无 `mentionedUsers` 字段
+
+**结论**：
+- 评论 @mention 功能**完全未实现**
+- 仅在页面编辑器的 CKEditor 配置中有一个占位 TODO，且是示例代码
+- 评论输入是纯文本 textarea，没有富文本编辑能力，无法实现 mention 自动补全
+- 后端无 mention 解析、权限校验、通知触发的任何代码
+
+### 2.11.4 三项功能的总体现状总结
+
+| 功能 | 数据库 | GraphQL Schema | 后端逻辑 | 前端 UI | 状态 |
+|------|--------|----------------|----------|---------|------|
+| 评论通知 / Activity log | 无相关表 | 无相关字段 | 无 event emit | 仅空白模板 `profile/comments.vue` | ❌ 未实现 |
+| 评论点赞 / 收藏 | 无字段无表 | 无 mutation/字段 | 无逻辑 | 无按钮无计数 | ❌ 未实现 |
+| 评论 @mention | 无相关表 | 无相关字段 | 无解析无通知 | 仅 textarea，无补全 | ❌ 未实现 |
+| Webhooks 评论事件 | 无相关表 | 无相关 mutation | 无逻辑 | 管理页半成品，按钮禁用 | ❌ 未实现 |
+
+**唯一的半成品残留**：
+1. `editor-ckeditor.vue:72-82` 中页面编辑器的 mention TODO 注释（与评论无关）
+2. `page.vue:134-142` 中 `commentsCount` 显示代码被注释掉
+3. `profile.vue:344` 中 `commentsPosted` 硬编码为 `0`
+4. `profile/comments.vue` 空白组件骨架
+5. `admin-webhooks.vue` 误用邮件配置的半成品页面
+
+---
+
 ## 4. 页面呈现链路
 
 ### 4.1 SSR 阶段：页面请求 → 服务端渲染
@@ -595,13 +726,20 @@ page(
 | `server/db/migrations/2.0.0.js` | comments 表初始建表（id, content, createdAt, updatedAt） |
 | `server/db/migrations/2.4.36.js` | comments 表新增 render, name, email, ip 字段 |
 | `server/db/migrations/2.4.61.js` | comments 表新增 replyTo 字段 |
+| `server/core/kernel.js` | 事件系统初始化（inbound/outbound EventEmitter） |
+| `server/core/db.js` | High-Availability 事件总线（仅用于缓存失效） |
 | `server/core/auth.js` | `checkAccess()` 页面级权限引擎、`getEffectivePermissions()` |
 | `server/controllers/common.js` | SSR 控制器，计算 effectivePermissions + 注入评论模板 |
 | `server/views/page.pug` | SSR 模板，传递 comments 变量到 Vue 组件 |
 | `client/themes/default/components/page.vue` | 主题页面组件，条件渲染评论区 |
 | `client/store/page.js` | Vuex Store，存储 effectivePermissions |
 | `client/components/comments.vue` | 评论交互组件，所有 CRUD 操作 |
+| `client/components/common/user-search.vue` | 用户搜索组件（未在评论模块使用） |
+| `client/components/profile/profile.vue` | 个人主页 Activity 卡片（commentsPosted 硬编码为 0） |
+| `client/components/profile/comments.vue` | 我的评论列表（空白模板，未实现） |
 | `client/components/admin/admin-comments.vue` | 管理后台评论 Provider 配置 |
+| `client/components/admin/admin-webhooks.vue` | Webhooks 管理（半成品，按钮禁用，误用邮件配置） |
+| `client/components/editor/editor-ckeditor.vue` | 页面编辑器（含 mention TODO 注释，与评论无关） |
 
 ---
 
@@ -680,6 +818,11 @@ page(
   │    │    └─ 已登录 → 独立计数器
   │    └─ 5. 写入 DB：content(原始) + render(HTML)
   │
+  │    ⚠️  以下功能均未实现：
+  │    ├─ ❌ 评论通知 / Activity log（无 event emit）
+  │    ├─ ❌ 点赞 / 收藏（无数据表、无 mutation）
+  │    └─ ❌ @mention 解析与通知（仅页面编辑器 TODO 注释）
+  │
   └─ 前端 UI 门控
        effectivePermissions.comments.{read,write,manage}
        ├─ read → 是否显示评论区
@@ -692,4 +835,6 @@ page(
   - featurePageComments 全局开关关闭 → 所有评论权限为 false
   - 编辑/删除无状态机：更新直接覆盖，删除物理删除，无版本历史
   - 无 WYSIWYG：仅纯 Markdown 文本输入，使用独立的轻量级渲染管道
+  - 无通知系统：评论事件无 event emit，Webhooks 管理页是半成品
+  - 无社交互动：点赞、收藏、@mention 均未实现
 ```
