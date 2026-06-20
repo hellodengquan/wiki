@@ -1278,23 +1278,529 @@ $beforeInsert() {
 
 ---
 
-## 十一、关键文件索引
+## 十一、页面布局编辑器与主题变量的双向绑定
+
+Wiki.js **没有可视化拖拽的布局编辑器**。所谓"双向绑定"是通过三层机制实现的：Vuex pathify 自动 mutations + Vuetify `v-model` + watcher 实时预览。
+
+### 11.1 双向绑定的基础：Vuex-pathify 自动 mutations
+
+**文件**: `client/store/page.js:59`
+
+```js
+import { make } from 'vuex-pathify'
+
+export default {
+  namespaced: true,
+  state,
+  mutations: make.mutations(state)  // ← 自动为每个 state 字段生成 SET_xxx mutation
+}
+```
+
+`vuex-pathify` 自动为 `title`、`description`、`path`、`scriptJs`、`scriptCss` 等所有 state 字段生成 mutations，使得 `sync('page/scriptCss')` 可以直接作为 Vue 计算属性使用，支持 `v-model` 双向绑定。
+
+### 11.2 页面属性编辑器的双向绑定（页面级 CSS/JS）
+
+**文件**: `client/components/editor/editor-modal-properties.vue`
+
+#### 数据绑定层（v-model → Vuex）
+
+```pug
+// 基本信息 Tab
+v-text-field(v-model='title' ...)
+v-text-field(v-model='description' ...)
+v-select(v-model='locale' ...)
+v-text-field(v-model='path' ...)
+v-combobox(v-model='newTag' ...)
+
+// 脚本 Tab (权限：pages.script)
+textarea(ref='codejs')   ← CodeMirror 接管的原始 textarea
+
+// 样式 Tab (权限：pages.style)
+textarea(ref='codecss')  ← CodeMirror 接管的原始 textarea
+```
+
+#### 计算属性层（sync 与 get）
+
+```js
+// 完全双向绑定
+title: sync('page/title'),
+description: sync('page/description'),
+path: sync('page/path'),
+tags: sync('page/tags'),
+scriptJs: sync('page/scriptJs'),
+scriptCss: sync('page/scriptCss'),
+
+// 只读
+mode: get('editor/mode'),
+hasScriptPermission: get('page/effectivePermissions@pages.script'),
+hasStylePermission: get('page/effectivePermissions@pages.style'),
+```
+
+#### CodeMirror 编辑器的双向绑定
+
+由于 CodeMirror 不直接支持 `v-model`，通过手动事件监听桥接：
+
+**文件**: `editor-modal-properties.vue:360-394`
+
+```js
+loadEditor(ref, mode) {
+  this.cm = CodeMirror.fromTextArea(ref, {
+    tabSize: 2,
+    mode: `text/${mode}`,
+    theme: 'wikijs-dark',  // ← 编辑器自身主题硬编码为 wikijs-dark
+    lineNumbers: true,
+    lineWrapping: true,
+    // ...
+  })
+  switch (mode) {
+    case 'html':
+      this.cm.setValue(this.scriptJs)  // 从 Vuex 读
+      this.cm.on('change', c => {
+        this.scriptJs = c.getValue()   // 写入 Vuex（触发 sync 自动 mutation）
+      })
+      break
+    case 'css':
+      this.cm.setValue(this.scriptCss) // 从 Vuex 读
+      this.cm.on('change', c => {
+        this.scriptCss = c.getValue()  // 写入 Vuex
+      })
+      break
+  }
+}
+```
+
+**Tab 切换时的 CodeMirror 销毁与重建**：
+```js
+watch: {
+  currentTab (newValue, oldValue) {
+    if (this.cm) {
+      this.cm.toTextArea()  // ← 切 Tab 时销毁 CodeMirror，将内容写回原始 textarea
+    }
+    if (newValue === 2) {   // 脚本 Tab
+      this.$nextTick(() => setTimeout(() => this.loadEditor(this.$refs.codejs, 'html'), 100))
+    } else if (newValue === 3) { // 样式 Tab
+      this.$nextTick(() => setTimeout(() => this.loadEditor(this.$refs.codecss, 'css'), 100))
+    }
+  }
+}
+```
+
+### 11.3 主题设置页的双向绑定（站点级主题变量）
+
+**文件**: `client/components/admin/admin-theme.vue`
+
+#### 表单字段绑定
+
+```pug
+v-select(v-model='config.theme' ...)       // 主题下拉
+v-select(v-model='config.iconset' ...)     // 图标集下拉
+v-switch(v-model='darkMode' ...)           // 暗色模式开关
+v-select(v-model='config.tocPosition' ...) // TOC 位置下拉
+v-textarea(v-model='config.injectCSS' ...) // 自定义 CSS
+v-textarea(v-model='config.injectHead' ...)// 自定义 Head
+v-textarea(v-model='config.injectBody' ...)// 自定义 Body
+```
+
+#### 计算属性与 watcher 实时预览
+
+```js
+computed: {
+  darkMode: sync('site/dark'),   // ← 与 Vuex site/dark 双向绑定
+},
+watch: {
+  'darkMode' (newValue, oldValue) {
+    this.$vuetify.theme.dark = newValue  // ← ★ watcher 实时推给 Vuetify
+  }
+},
+mounted() {
+  this.darkModeInitial = this.darkMode   // ← 保存初始值，用于离开时回退
+},
+beforeDestroy() {
+  this.darkMode = this.darkModeInitial   // ← 未保存就离开时，恢复原始值
+  this.$vuetify.theme.dark = this.darkModeInitial
+}
+```
+
+**实时预览工作流**：
+```
+管理员拖动暗色模式开关
+    ↓
+v-model 触发 darkMode 计算属性 setter
+    ↓
+sync('site/dark') 自动调用 SET_DARK mutation
+    ↓
+Vuex state.site.dark 更新
+    ↓
+watch.darkMode 被触发
+    ↓
+this.$vuetify.theme.dark = newValue （即时生效，全站点变暗色）
+    ↓
+所有组件的 :class='$vuetify.theme.dark ? ... : ...' 响应式更新
+```
+
+**保存确认流**：
+```
+管理员点击 "Apply" 保存按钮
+    ↓
+调用 theming.setConfig GraphQL mutation
+    ↓
+参数包括 darkMode（当前 Vuex 值，可能≠DB 值）
+    ↓
+服务端更新 WIKI.config.theming.darkMode → saveToDb
+    ↓
+this.darkModeInitial = this.darkMode （更新初始值，防止离开时回退）
+```
+
+#### Apollo 数据绑定（config 整体）
+
+```js
+apollo: {
+  config: {
+    query: themeConfigQuery,
+    fetchPolicy: 'network-only',
+    update: (data) => data.theming.config,  // ← GraphQL 返回值 → this.config
+  }
+}
+```
+
+`this.config.theme/iconset/tocPosition/injectCSS/injectHead/injectBody` 由 Apollo 初始化，`v-model` 直接修改这些属性，保存时作为 mutation 变量提交。
+
+### 11.4 页面内容编辑器与主题的绑定
+
+**文件**: `client/components/editor/editor-markdown.vue:735-745`
+
+```js
+// 代码块主题随站点主题切换
+codeBlockSettings: {
+  theme: this.$vuetify.theme.dark ? `dark` : `default`
+}
+// inline code 主题固定为 wikijs-dark
+inlineCodeSettings: {
+  theme: 'wikijs-dark'
+}
+```
+
+编辑器内部的代码高亮主题（Prism）会跟随 `$vuetify.theme.dark` 变化，但**没有反向绑定**——修改代码块主题不会影响全局主题。
+
+### 11.5 双向绑定总结
+
+| 场景 | 绑定方式 | 代码位置 |
+|------|----------|----------|
+| 页面标题/描述/路径 | `sync('page/xxx')` + `v-model` | `editor-modal-properties.vue:292-297` |
+| 页面 JS/CSS | CodeMirror `on('change')` → `sync('page/scriptJs/scriptCss')` | `editor-modal-properties.vue:373-385` |
+| 站点主题/Toc 位置 | Apollo `this.config` + `v-model` | `admin-theme.vue:25,40,63` |
+| 站点暗色模式 | `sync('site/dark')` + watch 推送 `$vuetify.theme.dark` | `admin-theme.vue:163,194-196` |
+| 代码块主题 | 读取 `$vuetify.theme.dark`（单向） | `editor-markdown.vue:737` |
+
+---
+
+## 十二、自定义 CSS 注入的安全过滤和转义路径
+
+Wiki.js 的自定义 CSS/HTML 注入**没有 XSS 内容过滤**，只有三层防护机制：权限控制 + CleanCSS 语法压缩 + Pug 不转义输出。
+
+### 12.1 四层防护链
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  1. 权限层（Permission Guard）                           │
+│  - 站点级注入：manage:theme / manage:system 权限          │
+│  - 页面级 CSS：pages.style 权限                          │
+│  - 页面级 JS：pages.script 权限                          │
+└──────────────────────────┬───────────────────────────────┘
+                           ↓
+┌──────────────────────────┴───────────────────────────────┐
+│  2. 语法压缩层（CleanCSS 压缩）                          │
+│  - 仅作用于 CSS，不作用于 HTML/JS                        │
+│  - 语法错误的 CSS 规则被静默丢弃，不报错                 │
+└──────────────────────────┬───────────────────────────────┘
+                           ↓
+┌──────────────────────────┴───────────────────────────────┐
+│  3. 内容安全层（DOMPurify 过滤）                         │
+│  - 仅作用于 Markdown 渲染后的页面内容（.contents）        │
+│  - ❌ 不作用于 injectCode（CSS/Head/Body）               │
+└──────────────────────────┬───────────────────────────────┘
+                           ↓
+┌──────────────────────────┴───────────────────────────────┐
+│  4. 模板输出层（Pug 不转义）                             │
+│  - 使用 != 而非 = 输出 injectCode                        │
+│  - 内容原样输出到 HTML，不做任何 HTML 转义               │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 12.2 第一层：权限控制
+
+**GraphQL 权限指令**: `server/graph/schemas/theming.graphql:36`
+
+```graphql
+setConfig(...): DefaultResponse
+  @auth(requires: ["manage:theme", "manage:system"])
+```
+
+`@auth` directive 实现：`server/graph/directives/auth.js:5-54`
+- 检查用户 JWT 中的 permissions 字段
+- 任一权限满足即可通过
+- 无权限时抛出 `Forbidden` 错误
+
+**页面级权限检查**: `server/models/pages.js:278-296`
+
+```js
+if (_.has(input, 'extra') && input.extra !== null) {
+  if (!WIKI.auth.checkAction(context.user, 'write:styles', pageArgs)) {
+    input.extra.css = ogPage.extra ? ogPage.extra.css : ''
+  }
+  if (!WIKI.auth.checkAction(context.user, 'write:scripts', pageArgs)) {
+    input.extra.js = ogPage.extra ? ogPage.extra.js : ''
+  }
+}
+```
+
+- 创建/更新页面时，若用户无 `write:styles` 权限，则 `input.extra.css` 被强制替换为原值
+- 若无 `write:scripts` 权限，则 `input.extra.js` 被强制替换为原值
+- 这是**静默的权限降级**，不报错，只丢弃未授权的修改
+
+### 12.3 第二层：CleanCSS 语法压缩
+
+**写入时压缩**: `server/graph/resolvers/theming.js:37-41`
+
+```js
+if (!_.isEmpty(args.injectCSS)) {
+  args.injectCSS = new CleanCSS({
+    inline: false   // ← 禁止 @import 内联，避免 SSRF 加载外部资源
+  }).minify(args.injectCSS).styles
+}
+```
+
+**读取时美化**: `server/graph/resolvers/theming.js:28`
+
+```js
+injectCSS: new CleanCSS({ format: 'beautify' }).minify(WIKI.config.theming.injectCSS).styles
+```
+
+**CleanCSS 的安全作用**（有限）：
+- `inline: false` 防止 `@import url('http://evil.com/xss.css')` 被展开
+- 语法无效的 CSS 选择器/规则会被**静默丢弃**，不会抛异常
+- 但 `<style>` 标签内的 CSS 仍然可以包含 `expression()`（老IE）、`url(javascript:...)` 等历史攻击向量
+
+**页面级 CSS 不经过 CleanCSS**：`page.extra.css` 直接存入 DB，没有压缩步骤。
+
+### 12.4 第三层：DOMPurify（不作用于注入代码）
+
+**文件**: `server/modules/rendering/html-security/renderer.js:1-42`
+
+```js
+if (config.safeHTML) {
+  const window = new JSDOM('').window
+  const DOMPurify = createDOMPurify(window)
+
+  // 白名单扩展
+  const allowedAttrs = ['v-pre', 'v-slot:tabs', 'v-slot:content', 'target']
+  const allowedTags = ['tabset', 'template']
+
+  input = DOMPurify.sanitize(input, {
+    ADD_ATTR: allowedAttrs,
+    ADD_TAGS: allowedTags,
+    HTML_INTEGRATION_POINTS: { foreignobject: true }
+  })
+}
+```
+
+**关键**：这个渲染器只处理 `page.render`（Markdown → HTML 后的页面内容），不处理 `injectCSS/injectHead/injectBody`。所以注入代码可以包含任意 `<script>`、`<iframe>`、`<style>`。
+
+### 12.5 第四层：Pug 不转义输出
+
+**文件**: `server/views/page.pug:4-7, 39-40`
+
+```pug
+block head
+  if injectCode.css
+    style(type='text/css')!= injectCode.css  // ← != 不转义输出
+  if injectCode.head
+    != injectCode.head                       // ← != 不转义输出
+
+block body
+  ...
+
+  if injectCode.body
+    != injectCode.body                        // ← != 不转义输出
+```
+
+Pug 中 `=` 会转义 HTML 特殊字符（`<>&"` ），而 `!=` **原样输出**。Wiki.js 对所有注入代码都使用 `!=`。
+
+### 12.6 完整注入路径一览
+
+```
+用户在 admin-theme.vue 输入 injectCSS
+    ↓ v-model
+this.config.injectCSS
+    ↓ GraphQL mutation
+args.injectCSS
+    ↓ CleanCSS 压缩（server/graph/resolvers/theming.js:37-41）
+WIKI.config.theming.injectCSS = args.injectCSS
+    ↓ saveToDb('theming')
+settings 表 key='theming' 的 value.json.injectCSS
+    ↓ HTTP 请求到达
+WIKI.config.theming.injectCSS (从 DB 读取到内存)
+    ↓ server/controllers/common.js:493
+injectCode.css = WIKI.config.theming.injectCSS
+    ↓ 追加页面级
+injectCode.css += '\n' + page.extra.css
+    ↓ res.render('page', { injectCode })
+    ↓ page.pug:5
+style(type='text/css')!= injectCode.css
+    ↓
+用户浏览器看到 <style>/* 原始内容 */</style>
+```
+
+### 12.7 安全风险总结
+
+| 注入类型 | 权限要求 | CleanCSS | DOMPurify | Pug 输出 | 风险 |
+|----------|---------|----------|-----------|----------|------|
+| 站点 injectCSS | manage:theme | ✅ 压缩 | ❌ 不过滤 | != 原样 | 中（可注入任意 CSS） |
+| 站点 injectHead | manage:theme | ❌ 不处理 | ❌ 不过滤 | != 原样 | 高（可注入 `<script>`） |
+| 站点 injectBody | manage:theme | ❌ 不处理 | ❌ 不过滤 | != 原样 | 高（可注入 `<script>`） |
+| 页面 page.extra.css | pages.style | ❌ 不处理 | ❌ 不过滤 | != 原样 | 中（可注入任意 CSS） |
+| 页面 page.extra.js | pages.script | ❌ 不处理 | ❌ 不过滤 | != 原样 | 高（可注入 `<script>`） |
+
+---
+
+## 十三、主题切换的灰度发布与预览模式
+
+Wiki.js **没有**灰度发布、canary 发布、按用户组/百分比逐步放量的主题切换机制。仅有的"预览"能力是管理后台暗色模式的实时开关预览。
+
+### 13.1 管理后台暗色模式预览（唯一的预览机制）
+
+**文件**: `client/components/admin/admin-theme.vue:193-204`
+
+```js
+watch: {
+  'darkMode' (newValue, oldValue) {
+    this.$vuetify.theme.dark = newValue   // ← 实时生效
+  }
+},
+mounted() {
+  this.darkModeInitial = this.darkMode    // ← 记录原始值
+},
+beforeDestroy() {
+  this.darkMode = this.darkModeInitial    // ← 未保存则回退
+  this.$vuetify.theme.dark = this.darkModeInitial
+}
+```
+
+**预览工作流**：
+1. 管理员进入主题设置页，当前 darkMode 值存入 `darkModeInitial`
+2. 管理员切换暗色模式开关，watcher 立即推送至 `$vuetify.theme.dark`
+3. 整个管理后台实时变为暗色/亮色，管理员可以预览效果
+4. 场景 A：管理员点击 "Apply" 保存 → `darkModeInitial` 更新为当前值 → 离开时不回退
+5. 场景 B：管理员不保存，直接跳转到其他页面 → `beforeDestroy` 钩子 → 恢复 `darkModeInitial` → 整个站点恢复之前的主题
+
+### 13.2 不存在的灰度发布能力
+
+经代码全量搜索，以下能力均**未实现**：
+
+#### ❌ 按百分比放量（Canary Release）
+没有 `canary: true` / `percentage: 10%` / `rollout` 等配置。搜索 `canary|percentage|rollout|variant` 等关键词仅命中：
+- `server/core/system.js:14` `channel: 'BETA'` — 这是 Wiki.js 自身版本更新的通道（beta/stable），不是主题灰度
+- `server/db/beta/` — 这是 beta 版本 DB 迁移脚本，不是功能开关
+
+#### ❌ 按用户组灰度（Group-based Rollout）
+没有 `groups: ['beta-testers']` 或 `roles: ['admin']` 限定主题可见范围的代码。
+
+#### ❌ A/B 测试（A/B Testing）
+没有 `variant` / `experiment` / `split` 相关的主题实验框架。
+
+#### ❌ 按 locale / namespace 灰度
+没有按语言或路径前缀应用不同主题的逻辑。所有 locale 共享同一套 `WIKI.config.theming`。
+
+#### ❌ 主题预览专用 URL 参数
+没有 `?theme=xxx&preview=true` 或 `?darkMode=toggle` 等临时预览参数。
+
+### 13.3 功能标志系统（未用于主题）
+
+**文件**: `server/app/data.yml:82-96`
+
+Wiki.js 有 `features` 功能标志配置：
+```yaml
+features:
+  featurePageComments: false
+  featurePageRatings: false
+  featurePageLikes: false
+  featurePersonalWiki: false
+```
+
+这些是布尔型功能开关，**不用于主题灰度**。它们控制整个站点级功能的开启/关闭，不是渐进式放量。
+
+### 13.4 主题切换的实际生效路径（全量立即生效）
+
+```
+管理员在 admin-theme.vue 点击 "Apply"
+    ↓
+GraphQL Mutation theming.setConfig
+    ↓
+服务端更新 WIKI.config.theming
+    ↓
+saveToDb(['theming'], propagate=true)
+    ↓
+WIKI.events.outbound.emit('reloadConfig')
+    ↓
+所有 HA 实例通过 inbound 收到事件 → loadFromDb() → applyFlags()
+    ↓
+⚠️  用户浏览器不自动刷新，需手动刷新页面才能加载新主题资源
+    ↓
+用户刷新 → client/index-app.js import(themeName) 加载新主题 chunk
+```
+
+**注意**：主题变更不会自动推送给在线用户。由于主题 SCSS/JS 被打包在独立 chunk 中，必须刷新页面才能重新加载。
+
+### 13.5 用户级暗色模式的"灰度"效果（误打误撞）
+
+虽然没有真正的灰度发布，但用户级 `appearance` 偏好（`client/store/user.js`）客观上形成了"部分用户先看到暗色模式"的效果：
+
+```
+管理员开启全局 darkMode = false（默认亮色）
+    ↓
+部分用户主动在 Profile 设置 appearance = 'dark'
+    ↓
+这部分用户看到暗色模式，其他用户看到亮色模式
+    ↓
+这相当于"自愿灰度"，但不是按百分比放量的受控灰度
+```
+
+### 13.6 主题切换预览/灰度能力总结
+
+| 能力 | 状态 | 代码位置 |
+|------|------|----------|
+| 管理后台暗色模式实时预览 | ✅ 实现 | `admin-theme.vue:193-204` watcher + beforeDestroy |
+| 管理后台注入 CSS 实时预览 | ❌ 未实现 | injectCSS 保存后需刷新页面才生效 |
+| 切换主题名实时预览 | ❌ 未实现 | 切换 theme 下拉不触发 chunk 重新加载 |
+| 按百分比灰度发布 | ❌ 未实现 | 无相关代码 |
+| 按用户组灰度发布 | ❌ 未实现 | 无相关代码 |
+| 按 locale 灰度发布 | ❌ 未实现 | 所有 locale 共享同一配置 |
+| URL 参数临时预览主题 | ❌ 未实现 | 无 preview 查询参数处理 |
+| 用户自愿切换暗色模式 | ✅ 实现 | `profile/profile.vue:690-692` appearance 设置 |
+
+---
+
+## 十四、关键文件索引
 
 | 层级 | 文件 | 职责 |
 |------|------|------|
 | 配置核心 | `server/core/config.js` | 磁盘/DB 配置加载与持久化（saveToDb 无事务） |
 | 配置辅助 | `server/helpers/config.js` | 环境变量替换 |
 | 配置数据模型 | `server/models/settings.js` | settings 表读写（upsert、getConfig） |
-| 默认配置 | `server/app/data.yml` | 所有配置项默认值 |
+| 默认配置 | `server/app/data.yml` | 所有配置项默认值（含 features 功能标志） |
 | 模块扫描参考实现 | `server/models/editors.js` | refreshFromDisk 事务模式参考 |
 | 事件总线 & 启动流程 | `server/core/kernel.js` | inbound/outbound EventEmitter、postBoot 扫描顺序 |
 | HA 离线导入 | `server/core/sideloader.js` | 仅支持 locales，不处理主题 |
+| HTML 安全过滤 | `server/modules/rendering/html-security/renderer.js` | DOMPurify 过滤页面内容（不作用于 injectCode） |
+| GraphQL 权限指令 | `server/graph/directives/auth.js` | @auth 权限检查（write:styles/script 等） |
 | Express 初始化 | `server/master.js` | locals 设置、中间件、路由 |
 | 页面控制器 | `server/controllers/common.js` | 构建 injectCode、调用 res.render |
-| 主题 GraphQL | `server/graph/resolvers/theming.js` | 主题配置读写 API（themes 列表硬编码） |
-| 主题后台 UI | `client/components/admin/admin-theme.vue` | 主题下载安装 UI 被注释（coming soon） |
+| 主题 GraphQL | `server/graph/resolvers/theming.js` | 主题配置读写（CleanCSS 压缩） |
+| 主题后台 UI | `client/components/admin/admin-theme.vue` | 主题表单、watcher 实时预览、beforeDestroy 回退 |
+| 页面属性编辑器 | `client/components/editor/editor-modal-properties.vue` | 页面级 JS/CSS 编辑、CodeMirror 双向绑定 |
+| 页面 Store | `client/store/page.js` | vuex-pathify 自动 mutations、scriptJs/scriptCss 状态 |
 | 基础模板 | `dev/templates/master.pug` | 注入 siteConfig JS 变量、图标 CSS |
-| 页面模板 | `server/views/page.pug` | 注入主题代码、挂载 Vue 组件 |
+| 页面模板 | `server/views/page.pug` | != 不转义输出 injectCode、挂载 Vue 组件 |
 | 全局 SCSS 变量 | `client/scss/global.scss` | 断点、mixins、mc() 颜色函数 |
 | Vuetify 主题初始化 | `client/client-app.js` | dark/rtl 设置，Vue 响应式切换 |
 | 客户端入口 | `client/index-app.js` | 动态加载主题 SCSS/JS |
@@ -1303,3 +1809,4 @@ $beforeInsert() {
 | 主题 SCSS 覆写 | `client/themes/default/scss/app.scss` | 内容样式 + 暗色适配 + RTL 适配 |
 | 主题页面组件 | `client/themes/default/components/page.vue` | 消费 tocPosition、dark、rtl 进行布局 |
 | 用户 profile 暗色切换 | `client/components/profile/profile.vue` | 用户保存 appearance 后即时切换 $vuetify.theme.dark |
+| Markdown 编辑器 | `client/components/editor/editor-markdown.vue` | 代码块主题随 $vuetify.theme.dark 变化 |
