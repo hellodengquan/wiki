@@ -1780,7 +1780,503 @@ WIKI.events.outbound.emit('reloadConfig')
 
 ---
 
-## 十四、关键文件索引
+## 十四、移动端响应式主题适配的断点与样式切换
+
+Wiki.js 采用**双层断点系统**：Vuetify 内置断点（JS 驱动响应式）+ 自定义 SCSS 断点 mixins（CSS 驱动响应式），两者独立但协同工作。
+
+### 14.1 断点定义
+
+#### SCSS 全局断点（全局变量层）
+
+**文件**: `client/scss/global.scss:6-31`
+
+```scss
+$tablet: 769px !default;
+$desktop: 980px !default;
+$widescreen: 1180px !default;
+
+$grid-breakpoints: (
+  'xs': 0,
+  'sm': 600px,
+  'md': 960px,
+  'lg': 1280px - 16px,
+  'xl': 1920px - 16px
+) !default;
+
+$display-breakpoints: (
+  'xs-only': 'only screen and (max-width: 599px)',
+  'sm-only': 'only screen and (min-width: 600px) and (max-width: 959px)',
+  'sm-and-down': 'only screen and (max-width: 959px)',
+  'sm-and-up': 'only screen and (min-width: 600px)',
+  'md-only': 'only screen and (min-width: 960px) and (max-width: 1263px)',
+  'md-and-down': 'only screen and (max-width: 1263px)',
+  'md-and-up': 'only screen and (min-width: 960px)',
+  'lg-only': 'only screen and (min-width: 1264px) and (max-width: 1903px)',
+  'lg-and-down': 'only screen and (max-width: 1903px)',
+  'lg-and-up': 'only screen and (min-width: 1264px)',
+  'xl-only': 'only screen and (min-width: 1904px)'
+) !default;
+```
+
+**注意**：有两套定义，前者是 wiki 自定义的 `$tablet/desktop/widescreen`，后者是 Vuetify 风格的 `$grid-breakpoints/$display-breakpoints`。两者的值不同：
+
+| 断点 | 自定义 ($tablet 系列) | Vuetify 风格 ($grid-breakpoints) |
+|------|----------------------|---------------------------------|
+| sm | —— | 600px |
+| md/tabet | 769px | 960px |
+| lg/desktop | 980px | 1264px |
+| xl/widescreen | 1180px | 1904px |
+
+#### SCSS Mixin 层（语义化断点）
+
+**文件**: `client/scss/base/mixins.scss:77-129`
+
+```scss
+@mixin from($device) {
+  @media screen and (min-width: $device) { @content; }
+}
+@mixin until($device) {
+  @media screen and (max-width: $device - 1px) { @content; }
+}
+@mixin mobile {
+  @media screen and (max-width: $tablet - 1px) { @content; }   // <769px
+}
+@mixin tablet {
+  @media screen and (min-width: $tablet) { @content; }          // ≥769px
+}
+@mixin tablet-only {
+  @media screen and (min-width: $tablet) and (max-width: $desktop - 1px) { @content; }  // 769-979px
+}
+@mixin touch {
+  @media screen and (max-width: $desktop - 1px) { @content; }   // <980px
+}
+@mixin desktop {
+  @media screen and (min-width: $desktop) { @content; }         // ≥980px
+}
+@mixin desktop-only {
+  @media screen and (min-width: $desktop) and (max-width: $widescreen - 1px) { @content; }  // 980-1179px
+}
+@mixin widescreen {
+  @media screen and (min-width: $widescreen) { @content; }      // ≥1180px
+}
+```
+
+这些 mixin 使用 wiki 自定义的 `$tablet/desktop/widescreen` 值，而非 Vuetify 的值。
+
+#### Vuetify JS 断点层（Vue 响应式）
+
+Vuetify 内置的 `$vuetify.breakpoint` 对象使用自身的断点体系：
+- `xs`: < 600px
+- `sm`: 600-959px
+- `md`: 960-1263px
+- `lg`: 1264-1903px
+- `xl`: ≥ 1904px
+
+### 14.2 样式切换的两种触发方式
+
+#### 方式 A — Vue 模板响应式（JS 驱动，基于 Vuetify 断点）
+
+**文件**: `client/themes/default/components/page.vue`
+
+在模板中直接使用 `$vuetify.breakpoint.xxx` 条件渲染：
+
+```pug
+// 导航抽屉：smAndDown (<960px) 时用临时抽屉（点击遮罩关闭），lgAndUp 时用永久抽屉
+v-navigation-drawer(
+  app,
+  mobile-breakpoint='600',
+  :temporary='$vuetify.breakpoint.smAndDown'  // ← 断点驱动 drawer 模式
+  ...
+)
+
+// 子导航栏：仅 mdAndDown (<1264px) 显示
+v-toolbar-items(v-if='$vuetify.breakpoint.mdAndDown')
+
+// 顶部工具栏：仅 smAndUp (≥600px) 显示
+v-toolbar(v-if='$vuetify.breakpoint.smAndUp')
+
+// TOC 侧栏：仅 lgAndUp (≥1264px) 显示，且 tocPosition 不为 'off'
+v-sheet(tile, :color='$vuetify.theme.dark ? `grey darken-4-d4` : `grey lighten-4`', v-if='tocPosition !== `off` && $vuetify.breakpoint.lgAndUp')
+```
+
+在 script 中监听断点切换：
+```js
+watch: {
+  '$vuetify.breakpoint.lgAndUp' (newVal) {
+    if (newVal) {
+      // 从移动端切到桌面端，重新同步 TOC 位置
+      this.toc = this.$refs.toc
+    }
+  }
+}
+```
+
+#### 方式 B — SCSS Mixin 响应式（CSS 驱动，基于 wiki 自定义断点）
+
+**文件**: `client/themes/default/scss/app.scss`
+
+在主题 SCSS 中使用 `@include mobile`、`@include desktop` 等 mixin：
+
+```scss
+.v-application .text-h1 {
+  @include mobile {
+    font-size: 2.75rem !important;  // 移动端 h1 缩小
+  }
+  @include tablet {
+    font-size: 3.5rem !important;   // 平板端 h1 适中
+  }
+  @include desktop {
+    font-size: 4rem !important;     // 桌面端 h1 最大
+  }
+}
+
+.v-toolbar__content {
+  @include mobile {
+    padding: 0 8px;  // 移动端工具栏 padding 缩小
+  }
+}
+```
+
+### 14.3 关键布局响应式细节
+
+#### 导航抽屉的移动断点
+
+**文件**: `client/themes/default/components/page.vue:10-11`
+
+```pug
+v-navigation-drawer(
+  mobile-breakpoint='600',
+  :temporary='$vuetify.breakpoint.smAndDown'
+)
+```
+
+`mobile-breakpoint='600'` 是 Vuetify 组件自身的属性，指定宽度小于 600px 时进入"移动端模式"，抽屉会全屏宽度。`:temporary` 则指定 smAndDown (<960px) 时使用临时抽屉（点击外部关闭）。
+
+#### TOC 的响应式
+
+- `lgAndUp` (≥1264px): TOC 显示在右侧侧栏（固定宽度 260px）
+- `mdAndDown` (<1264px): TOC 不显示侧栏，但可以在页面内容顶部显示为下拉菜单（如果配置 `tocPosition !== 'off'`）
+
+#### 子导航栏的响应式
+
+- `mdAndDown` (<1264px): 显示在顶部工具栏下方，包含页面标题、面包屑、操作按钮
+- `lgAndUp` (≥1264px): 子导航栏隐藏，标题和操作按钮移到主工具栏
+
+### 14.4 移动端与桌面端布局对比
+
+| 屏幕尺寸 | 断点 | 导航抽屉 | 子导航栏 | TOC 侧栏 |
+|----------|------|---------|---------|---------|
+| 手机 < 600px | xs | 临时抽屉（全屏宽，点击关闭） | 显示 | 隐藏 |
+| 平板 600-959px | sm | 临时抽屉（固定宽度，点击关闭） | 显示 | 隐藏 |
+| 小桌面 960-1263px | md | 永久抽屉（常驻） | 显示 | 隐藏 |
+| 桌面 ≥ 1264px | lg/xl | 永久抽屉（常驻） | 隐藏 | 显示 |
+
+### 14.5 两套断点不一致的问题
+
+`page.vue` 模板中使用 Vuetify 断点（lg=1264px），而 SCSS mixin 使用 wiki 自定义断点（desktop=980px），这意味着：
+
+- 屏幕宽度 980px~1263px 时，Vue 模板认为是 `mdAndDown`（平板模式），但 SCSS 认为是 `desktop`（桌面模式）
+- 可能出现"模板已切换为平板布局但 CSS 还在应用桌面样式"的不一致
+- 实际影响有限，因为模板的 `v-if` 会直接移除 DOM 元素，CSS 样式即使应用也不生效
+
+---
+
+## 十五、主题资源 CDN / 本地化静态资源加载策略
+
+Wiki.js 的静态资源加载是**本地化为主、CDN 为辅**的混合模式，主题资源（SCSS/JS/Vue 组件）完全本地化，仅图标字体和第三方库可选 CDN。
+
+### 15.1 webpack publicPath 配置
+
+**文件**: `dev/webpack/webpack.prod.js:38` / `webpack.dev.js:33`
+
+```js
+output: {
+  publicPath: '/_assets/',
+  // ...
+}
+```
+
+所有 webpack 构建产物（JS/CSS chunk、图片、字体）的 URL 前缀都硬编码为 `/_assets/`，**不支持运行时配置 CDN 域名**。没有 `WIKI.config.cdnUrl` 或类似的配置项。
+
+### 15.2 静态资源的三条加载路径
+
+#### 路径 A — webpack 构建产物（本地化）
+
+构建后的资源通过 `HtmlWebpackPlugin` 注入到 `master.pug`：
+
+**文件**: `dev/templates/master.pug:59-63, 77-81`
+
+```pug
+link(
+  v-for='(chunkCss, index) in htmlWebpackPlugin.files.css'
+  rel='stylesheet'
+  type='text/css'
+  href='<%= chunkCss %>'  // ← 输出为 /_assets/app.abc123.css
+  integrity=config.security.securitySRI ? '<%= htmlWebpackPlugin.files.cssIntegrity[index] %>' : false
+  crossorigin='<%= webpackConfig.output.crossOriginLoading %>'
+)
+
+script(
+  v-for='(chunkJs, index) in htmlWebpackPlugin.files.js'
+  type='text/javascript'
+  src='<%= chunkJs %>'  // ← 输出为 /_assets/runtime.abc123.js 等
+  integrity=config.security.securitySRI ? '<%= htmlWebpackPlugin.files.jsIntegrity[index] %>' : false
+  crossorigin='<%= webpackConfig.output.crossOriginLoading %>'
+)
+```
+
+chunk 文件名带 hash（`app.abc123.js`），支持永久缓存。
+
+#### 路径 B — 静态资源目录（本地化）
+
+**文件**: `server/master.js:63-66`
+
+```js
+app.use('/_assets', express.static(path.join(WIKI.ROOTPATH, 'assets'), {
+  index: false,
+  maxAge: '7d'  // 缓存 7 天
+}))
+```
+
+`/assets/` 目录下的文件通过 `/_assets/` 路径提供服务，包括：
+- favicon 图标 (`assets/favicons/`)
+- logo 图片 (`assets/svg/logo-wikijs.svg`)
+- 上传的附件 (`assets/uploads/`)
+- PWA manifest (`assets/manifest.json`)
+
+#### 路径 C — 图标字体 CDN / 本地化
+
+**文件**: `server/views/page.pug:2-7`
+
+```pug
+block head
+  case iconset
+    when 'mdi'
+      link(rel='stylesheet', type='text/css', href='https://cdn.jsdelivr.net/npm/@mdi/font@4.9.95/css/materialdesignicons.min.css')
+    when 'mdi-svg'
+      //- SVG icon set bundled in the theme
+    when 'fa'
+      link(rel='stylesheet', type='text/css', href='https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css')
+    when 'fa4'
+      link(rel='stylesheet', type='text/css', href='https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css')
+    when 'fa5'
+      link(rel='stylesheet', type='text/css', href='https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@5.14.0/css/all.min.css')
+    default
+      link(rel='stylesheet', type='text/css', href='https://cdn.jsdelivr.net/npm/@mdi/font@4.9.95/css/materialdesignicons.min.css')
+```
+
+图标字体的 CDN 加载策略：
+- **mdi-svg** 是本地化方式：图标通过 `client/themes/default/js/app.js` 中 import 的 `@mdi/js` 包嵌入到 theme chunk 中，不额外发请求
+- **其他所有 iconset** (mdi, fa, fa4, fa5) 都通过 CDN 加载，URL 硬编码在 `page.pug` 中，无法配置镜像源或自定义 URL
+
+#### 路径 D — Twemoji emoji 本地化
+
+**文件**: `server/master.js:56-62`
+
+```js
+app.use('/_assets/svg/twemoji', async (req, res, next) => {
+  try {
+    WIKI.asar.serve('twemoji', req, res, next)  // ← 从 asar 打包的 twemoji 资源中读取
+  } catch (err) {
+    res.sendStatus(404)
+  }
+})
+```
+
+Twemoji 表情符号图片打包在 asar 文件中，完全本地化，不请求 CDN。
+
+### 15.3 SRI 子资源完整性校验
+
+**文件**: `dev/templates/master.pug:61,79`
+
+```pug
+integrity=config.security.securitySRI ? '<%= htmlWebpackPlugin.files.cssIntegrity[index] %>' : false
+integrity=config.security.securitySRI ? '<%= htmlWebpackPlugin.files.jsIntegrity[index] %>' : false
+```
+
+当 `WIKI.config.security.securitySRI = true` 时，webpack 生成的 CSS/JS 文件会附带 SHA-384 哈希的 `integrity` 属性，浏览器会验证文件完整性。
+
+但注意：
+- SRI 校验只作用于 webpack 构建的静态资源（主 JS/CSS bundle）
+- 图标字体 CDN 资源**没有** `integrity` 属性（硬编码 URL，未计算 hash）
+- `crossOriginLoading` 默认为 `'anonymous'`，CDN 资源支持 CORS
+
+### 15.4 主题资源的加载特性
+
+| 资源类型 | 来源 | 配置项 | 缓存 | SRI |
+|---------|------|-------|------|-----|
+| 主题 SCSS | webpack chunk（`theme.js`） | `theming.theme` | hash 永久缓存 | ✅（如启用） |
+| 主题 JS | webpack chunk（`theme.js`） | `theming.theme` | hash 永久缓存 | ✅（如启用） |
+| 主题 Vue 组件 | webpack chunk（`theme.js`） | `theming.theme` | hash 永久缓存 | ✅（如启用） |
+| 图标字体（CDN） | jsdelivr CDN | `theming.iconset` | 浏览器默认 | ❌ |
+| 图标字体（mdi-svg） | webpack theme chunk | `theming.iconset=mdi-svg` | hash 永久缓存 | ✅ |
+| Twemoji 表情 | 本地 asar 包 | —— | 7 天 | ❌ |
+| 上传附件 | 本地 `assets/` 目录 | —— | 7 天 | ❌ |
+| 站点 logo | 本地 `assets/` 目录 | `branding.logo` | 7 天 | ❌ |
+
+### 15.5 CDN 配置的局限性
+
+目前的 CDN 支持**不完整**：
+- ❌ 无法配置自定义 CDN 域名（`publicPath` 硬编码为 `/_assets/`）
+- ❌ 图标字体 CDN URL 硬编码，无法换国内镜像
+- ❌ 构建时才能改 publicPath，运行时无法切换
+- ✅ SRI 完整性校验支持（webpack 构建资源）
+- ✅ CORS `crossorigin='anonymous'` 支持
+
+如果要支持自定义 CDN，需要修改：
+1. `dev/webpack/webpack.prod.js:38` — 把 `publicPath` 改为可配置
+2. `server/views/page.pug:2-7` — 把图标 CDN URL 改为从配置读取
+3. `server/master.js:63` — 增加 CDN 域名重写中间件或反向代理支持
+
+---
+
+## 十六、主题导出与跨实例迁移
+
+Wiki.js 的导出功能支持包含 `settings` entity，其中**包含主题配置**，但**不包含主题代码文件**。导入功能尚未实现。
+
+### 16.1 导出入口
+
+**GraphQL Mutation**: `system.export` (`server/graph/resolvers/system.js:280-308`)
+
+参数：
+```graphql
+systemExport(
+  path: String!     # 导出目标目录（必须为空）
+  entities: [String]!  # 可选值：pages, assets, users, settings, groups, comments, pageshistory
+): DefaultResponse
+```
+
+前端入口在管理后台的 **Utilities → Export** 页面（非主题设置页面）。
+
+### 16.2 settings entity 导出内容
+
+**文件**: `server/core/system.js:364-386`
+
+```js
+case 'settings': {
+  WIKI.logger.info('Exporting settings...')
+  const outputPath = path.join(opts.path, 'settings.json')
+  const config = {
+    ...WIKI.config,  // ← 包含 theming 配置！
+    modules: {
+      analytics: await WIKI.models.analytics.query(),
+      authentication: (await WIKI.models.authentication.query()).map(a => ({
+        ...a,
+        domainWhitelist: _.get(a, 'domainWhitelist.v', []),
+        autoEnrollGroups: _.get(a, 'autoEnrollGroups.v', [])
+      })),
+      commentProviders: await WIKI.models.commentProviders.query(),
+      renderers: await WIKI.models.renderers.query(),
+      searchEngines: await WIKI.models.searchEngines.query(),
+      storage: await WIKI.models.storage.query()
+    },
+    apiKeys: await WIKI.models.apiKeys.query().where('isRevoked', false)
+  }
+  await fs.outputJSON(outputPath, config, { spaces: 2 })
+  // ...
+}
+```
+
+`...WIKI.config` 展开整个配置对象，`theming` 字段包含：
+```json
+{
+  "theming": {
+    "theme": "default",
+    "iconset": "mdi",
+    "darkMode": false,
+    "tocPosition": "left",
+    "injectCSS": "/* 自定义 CSS */",
+    "injectHead": "<!-- 自定义 head -->",
+    "injectBody": "<!-- 自定义 body -->"
+  }
+}
+```
+
+**注意**：还会导出 `branding`（logo、title、description）、`seo`、`security`、`features` 等其他配置。
+
+### 16.3 导出的内容 vs 缺失的内容
+
+| 主题相关内容 | 是否导出 | 说明 |
+|-------------|---------|------|
+| `theming.theme`（主题名） | ✅ 导出 | `settings.json` 中 |
+| `theming.iconset`（图标集） | ✅ 导出 | `settings.json` 中 |
+| `theming.darkMode`（暗色模式） | ✅ 导出 | `settings.json` 中 |
+| `theming.tocPosition`（TOC 位置） | ✅ 导出 | `settings.json` 中 |
+| `theming.injectCSS`（自定义 CSS） | ✅ 导出 | `settings.json` 中 |
+| `theming.injectHead`（自定义 Head） | ✅ 导出 | `settings.json` 中 |
+| `theming.injectBody`（自定义 Body） | ✅ 导出 | `settings.json` 中 |
+| `branding.logo`（站点 logo） | ✅ 导出 | `settings.json` 中 |
+| 主题代码文件（theme.yml、app.scss、app.js、*.vue） | ❌ 不导出 | 需要手动复制 `client/themes/{theme-name}/` 和 `server/themes/{theme-name}/` |
+| 页面级 `page.extra.css/js` | ✅ 导出 | 在 `pages.json` 中（如果导出 pages entity） |
+| 用户 `appearance` 偏好 | ✅ 导出 | 在 `users.json` 中（如果导出 users entity） |
+| webpack 构建产物 | ❌ 不导出 | 需在目标实例重新构建 |
+
+### 16.4 跨实例迁移的完整步骤（需手动操作）
+
+由于缺少导入功能，完整的主题迁移需要手动操作：
+
+```
+源实例 A                          目标实例 B
+───────────                       ───────────
+1. 导出 settings.json
+   (system.export entities: settings)
+
+2. 导出 pages.json（含 page.extra.css/js）
+   (system.export entities: pages)
+
+3. 复制主题目录
+   cp -r client/themes/mytheme/  →  B/client/themes/mytheme/
+   cp -r server/themes/mytheme/  →  B/server/themes/mytheme/
+
+4. 重新构建 B 的前端
+   npm run build -- --theme=mytheme
+
+5. 导入设置到 B
+   方式 A：手动从 settings.json 复制 theming 字段
+            到 B 的管理后台 Theme 设置页面
+   方式 B：直接写入 B 的 settings 表
+            key='theming', value=JSON({...})
+
+6. 重启 B 实例
+   loadFromDb() 读取新配置
+
+7. 用户刷新浏览器
+   重新加载 theme chunk
+```
+
+### 16.5 导入功能的缺失
+
+**全代码库搜索确认**：没有 `system.import` / `restoreSettings` / `importSettings` 等 GraphQL mutation。也没有读取 `settings.json` 并导入的代码。
+
+导出是**单向**的，只能备份，不能自动恢复。用户必须手动解析 JSON 并在目标实例的管理后台重新设置。
+
+### 16.6 导出的并发控制
+
+**文件**: `server/graph/resolvers/system.js:284-286`
+
+```js
+if (WIKI.system.exportStatus.status === 'running') {
+  throw new Error('Another export is already running.')
+}
+```
+
+同一时间只能有一个导出任务在运行。`WIKI.system.exportStatus` 是内存中的状态对象（`server/core/system.js:20-32`），HA 多实例部署时每个实例独立检查，可能出现多个实例同时导出。
+
+### 16.7 主题相关 entity 导出总结
+
+| 功能 | 状态 | 代码位置 |
+|------|------|----------|
+| 导出 settings（含 theming） | ✅ 实现 | `server/core/system.js:364-386` |
+| 导出 pages（含 page.extra.css/js） | ✅ 实现 | `server/core/system.js:304-333` |
+| 导出主题代码文件 | ❌ 未实现 | 需手动复制文件系统 |
+| 导入 settings | ❌ 未实现 | 无相关代码 |
+| 导入主题代码 | ❌ 未实现 | 需手动复制 + 重建 |
+| 导出并发控制 | ✅ 单实例 | `server/graph/resolvers/system.js:284` |
+| HA 跨实例导出并发 | ❌ 未实现 | 内存状态不共享 |
+
+---
+
+## 十七、关键文件索引
 
 | 层级 | 文件 | 职责 |
 |------|------|------|
