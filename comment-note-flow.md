@@ -913,8 +913,491 @@ DOMPurify 会对最终生成的 `<img>` 标签做白名单检查，但这是**�
 | 评论病毒扫描 | — | — | ❌ 无 ClamAV/扫描器 | — | ❌ 未实现 |
 | 资产系统对接评论 | ❌ 无 comment-fk | ❌ 无关联字段 | ❌ 无关联逻辑 | ❌ 无评论媒体按钮 | ❌ 未实现 |
 | 页面 Asset 系统 | ✅ `assets` 表 | ✅ `asset.graphql` | ✅ 上传/文件夹逻辑 | ✅ `editor-modal-media.vue` | ✅ 独立存在（仅供页面编辑器） |
+| **批量删除 / 批量改状态** | ❌ 无状态字段 | ❌ 无 bulk mutation | ❌ 无 whereIn().delete() | ❌ 无全选/批量菜单 | ❌ 未实现 |
+| **批量导入** | — | ❌ 无 import mutation | ❌ 无导入逻辑 | ❌ 无 UI | ❌ 未实现 |
+| **全量 JSON 导出** | — | ✅ `system.export` | ✅ 流式 50 条/批 + Gzip | ✅ System 模块 | ✅ 已实现（全量） |
+| **API Key 按组鉴权** | ✅ `apiKeys` 表 | ✅ `authentication.createApiKey` | ✅ JWT RS256 + grp 映射 | ✅ `admin-api.vue` | ✅ 完整实现 |
+| **Schema 自动迁移** | ✅ `migrations` 表 | — | ✅ Knex migrate.latest() + semver 排序 | — | ✅ 完整实现 |
+| **V1→V2 评论迁移** | — | — | ❌ 仅迁移用户，评论被丢弃 | — | ❌ 未实现 |
+| **跨实例增量同步** | — | — | ❌ 无队列/消息机制 | — | ❌ 未实现 |
 
-**结论**：评论不能上传任何文件或图片附件。用户只能通过 Markdown 的 `![alt](url)` 引用**外部**图片 URL，但图片内容不会经过病毒扫描。
+**结论**：评论不能上传任何文件或图片附件。用户只能通过 Markdown 的 `![alt](url)` 引用**外部**图片 URL，但图片内容不会经过病毒扫描。批量操作、批量导入、跨实例增量同步均未实现，仅 System Export 支持全量 Gzip JSON 导出。
+
+---
+
+## 2.15 评论批量操作：仅单个删除，无批量操作
+
+### 2.15.1 代码库中无批量操作 API
+
+`comment.graphql` Mutation 中仅定义了**单条操作**：
+
+```graphql
+type CommentMutation {
+  updateProviders(...)           # 管理后台：配置 Provider
+  create(pageId, replyTo, content, guestName, guestEmail)  # 单条创建
+  update(id, content)            # 单条更新
+  delete(id)                     # 单条删除（按 ID）
+}
+```
+
+**没有**以下批量操作 API：
+- ❌ `bulkDelete(ids: [Int!]!)` — 批量删除
+- ❌ `bulkUpdate(ids: [Int!]!, status/action)` — 批量改状态
+- ❌ `bulkExport` / `exportCommentsByPage` — 导出特定页面评论
+- ❌ `bulkImport` — 从 JSON 批量导入
+
+### 2.15.2 Resolver 仅实现单条操作
+
+`server/graph/resolvers/comment.js` 的四个方法全是单条粒度：
+```js
+Mutation: {
+  async comments() { return {} }
+},
+CommentMutation: {
+  async updateProviders(...) { ... },
+  async create(obj, args, context) {
+    return WIKI.models.comments.postNewComment({ ...args, ... })  // 单条
+  },
+  async update(obj, args, context) {
+    return WIKI.models.comments.updateComment({ ...args, ... })    // 单条
+  },
+  async delete(obj, args, context) {
+    await WIKI.data.commentProvider.remove({ id: args.id, ... })   // 按 ID 单条删除
+    return { responseResult: graphHelper.generateSuccess('...') }
+  }
+}
+```
+
+Provider 层的 `remove()` 也是单条：
+```js
+// default/comment.js:137-139
+async remove ({ id, user }) {
+  return WIKI.models.comments.query().findById(id).delete()  // DELETE WHERE id = ?
+}
+```
+
+**没有** `deleteMany().whereIn('id', ids)` 或 `patch().whereIn(...)` 的批量 SQL。
+
+### 2.15.3 前端 UI 仅单条操作按钮
+
+`client/components/comments.vue:68-87` 中每条评论下方仅显示**单条**操作按钮：
+```pug
+span.ml-2(v-if='permissions.manage')
+  v-tooltip(top, color='grey')
+    template(v-slot:activator='{ on }')
+      v-btn.animated.fadeInLeft(icon, x-small, @click='edit(comment)')
+        v-icon(color='primary', small) mdi-pencil
+  v-tooltip(top, color='grey')
+    template(v-slot:activator='{ on }')
+      v-btn.animated.fadeInLeft.wait-p1s(icon, x-small, @click='remove(comment)')
+        v-icon(color='error', small) mdi-delete
+```
+
+- 无"全选"复选框
+- 无"批量操作"下拉菜单
+- 管理后台 `admin-comments.vue` 仅配置 Provider 参数，**不管理评论内容**
+
+### 2.15.4 唯一的导出路径：System Export（全量）
+
+评论数据的唯一"批量"操作是系统导出功能，但这是**全量导出所有评论**，不能按条件筛选：
+
+GraphQL 入口（`system.graphql:52-55`）：
+```graphql
+export(entities: [String]!, path: String!): DefaultResponse @auth(requires: ["manage:system"])
+```
+
+Resolver（`resolver/system.js:280-300`）：
+```js
+async export (obj, args, context) {
+  // ... 校验目录为空、不重复运行
+  WIKI.system.export({
+    entities: args.entities,   // 如 ['comments', 'pages', ...]
+    path: desiredPath
+  })
+  // 异步启动，立即返回
+  return { responseResult: graphHelper.generateSuccess('Export started...') }
+}
+```
+
+导出执行细节（`core/system.js:141-198`）见 **2.17 节**。
+
+### 2.15.5 批量操作总结
+
+| 批量功能 | GraphQL API | 后端实现 | 前端 UI | 状态 |
+|----------|-------------|----------|---------|------|
+| 批量删除 | ❌ 无 `bulkDelete` | ❌ 无 `whereIn().delete()` | ❌ 无全选/批量菜单 | ❌ 未实现 |
+| 批量改状态 | ❌ 无 mutation | ❌ 无 status 字段 | ❌ 无此功能 | ❌ 未实现 |
+| 按条件导出 | ❌ 无参数 | ❌ 仅全量导出 | ❌ 仅 System Export 页 | ❌ 未实现 |
+| 批量导入 | ❌ 无 import mutation | ❌ 无导入逻辑 | ❌ 无 UI | ❌ 未实现 |
+| 全量导出 | ✅ `system.export` | ✅ 流式 + Gzip | ✅ 管理后台（System 模块） | ✅ 已实现（全量） |
+| 单条 CRUD | ✅ 齐全 | ✅ 齐全 | ✅ 齐全 | ✅ 已实现 |
+
+---
+
+## 2.16 评论与 API 鉴权策略、第三方插件读评论的权限边界
+
+评论功能与 REST/GraphQL API 的鉴权使用**同一套 JWT 体系**，API Key 支持"按组分配权限"的粒度，评论权限边界完全由现有三层权限系统控制。
+
+### 2.16.1 API Key 创建机制
+
+`server/models/apiKeys.js:43-70` 创建 API Key：
+
+```js
+static async createNewKey ({ name, expiration, fullAccess, group }) {
+  const entry = await WIKI.models.apiKeys.query().insert({
+    name,
+    key: 'pending',
+    expiration: moment.utc().add(ms(expiration), 'ms').toISO(),
+    isRevoked: true   // 先标记为 revoked
+  })
+
+  const key = jwt.sign({
+    api: entry.id,          // ← 标识这是 API Key 请求
+    grp: fullAccess ? 1 : group  // ← fullAccess=1(Admin组)，否则指定组
+  }, {
+    key: WIKI.config.certs.private,
+    passphrase: WIKI.config.sessionSecret
+  }, {
+    algorithm: 'RS256',
+    expiresIn: expiration,
+    audience: WIKI.config.auth.audience,
+    issuer: 'urn:wiki.js'
+  })
+
+  await WIKI.models.apiKeys.query().findById(entry.id).patch({
+    key,
+    isRevoked: false        // JWT 签发后启用
+  })
+  return key
+}
+```
+
+**关键点**：
+- API Key 本质是**带特殊载荷的 RS256 JWT**，`payload.api` 是 apiKey ID，`payload.grp` 是组 ID
+- `fullAccess=true` 映射到组 `1`（Administrators，拥有 `manage:system` 权限）
+- 否则绑定到一个指定的用户组（group），**API 请求会完全使用该组的 permissions + pageRules**
+
+### 2.16.2 API Key 的请求生命周期
+
+`server/core/auth.js:113-212` 的 `authenticate()` 中间件处理流程：
+
+```
+请求到达
+  │
+  ▼
+passport-jwt 策略验证（RS256 + audience/issuer 校验）
+  │
+  ├─ JWT 含 payload.api → 进入 "Process API tokens" 分支（:179-204）
+  │    │
+  │    ├─ 检查全局开关 WIKI.config.api.isEnabled → 关闭则报错
+  │    ├─ 检查 api.id 是否在 WIKI.auth.validApiKeys 中
+  │    │    └─ validApiKeys 由 reloadApiKeys() 从 DB 加载（:402-404）：
+  │    │       「WHERE isRevoked=false AND expiration > NOW()」
+  │    │
+  │    ▼
+  │    构造一个假的 user 对象（:184-199）：
+  │    req.user = {
+  │      id: 1,                              // ← 硬编码为用户 ID 1
+  │      email: 'api@localhost',             // ← 虚拟邮箱
+  │      name: 'API',
+  │      permissions: WIKI.auth.groups[user.grp].permissions,  // ← 从绑定组继承
+  │      groups: [user.grp],                 // ← 绑定组
+  │      getGlobalPermissions() { ... },
+  │      getGroups() { ... }
+  │    }
+  │    ↓ 注入到请求上下文，继续后续 GraphQL 处理
+  │
+  └─ JWT 含 payload.id → 正常用户登录（:206-210）
+```
+
+### 2.16.3 评论权限边界的具体推导
+
+当第三方插件用 API Key 请求评论时，权限链完全复用现有三层机制：
+
+| 请求场景 | API Key 绑定组 A（仅 `read:comments`） | API Key 绑定组 B（`read:comments` + `write:comments`） | API Key `fullAccess=true`（组 1） |
+|----------|--------------------------------------|-----------------------------------------------------|-----------------------------------|
+| **GraphQL 第一层：@auth 指令** | | | |
+| `comments.list(locale, path)` | ✅ 通过（需要 `read:comments`） | ✅ 通过 | ✅ 通过 |
+| `comments.single(id)` | ✅ 通过 | ✅ 通过 | ✅ 通过 |
+| `comments.create(...)` | ❌ 拒绝（需要 `write:comments`） | ✅ 通过 | ✅ 通过 |
+| `comments.update(id, content)` | ❌ 拒绝（需要 `manage:comments`/`manage:system`） | ❌ 拒绝（缺 manage） | ✅ 通过（`manage:system`） |
+| `comments.delete(id)` | ❌ 拒绝 | ❌ 拒绝 | ✅ 通过 |
+| | | | |
+| **Model 第二层：checkAccess 页面级** | | | |
+| 目标页面路径在组 A pageRules 中 deny | ❌ 拒绝（即使全局有 read） | ❌ 拒绝 | ✅ 跳过（manage:system 豁免） |
+| 目标页面路径匹配 START 且 allow | ✅ 通过 | ✅ 通过 | ✅ 跳过 |
+| Guest 组 (id=2) 无 write 规则 | — | ❌ 拒绝（即使全局有 write，页面级不匹配） | ✅ 跳过 |
+| | | | |
+| **第三层：字段级 @auth（CommentPost）** | | | |
+| `authorEmail` 字段 | ❌ 拒绝（需要 `manage:system`） | ❌ 拒绝 | ✅ 通过 |
+| `authorIP` 字段 | ❌ 拒绝（需要 `manage:system`） | ❌ 拒绝 | ✅ 通过 |
+| `content` 字段（含 @auth） | ❌ 拒绝（需要 write/manage 权限） | ✅ 通过 | ✅ 通过 |
+| `render` 字段 | ✅ 无条件返回 | ✅ 无条件返回 | ✅ 无条件返回 |
+
+**关键洞察**：
+1. 评论 Schema 中 `authorEmail` 和 `authorIP` 字段必须有 `manage:system` 才能访问，**普通 API Key 即使绑定了有 read 权限的组也看不到邮箱和 IP**
+2. `content` 原始 Markdown 字段被 `@auth(requires: ["write:comments", "manage:comments", "manage:system"])` 保护，仅读权限的 API 只能拿到 `render`（渲染后的 HTML），拿不到原始 Markdown
+3. `@rateLimit(limit: 1, duration: 15)` 以 IP 为 key，API Key 请求也受此限制
+4. API 全局开关 `api.isEnabled` 关闭时，**所有 API Key 请求被拒绝**（即使 JWT 本身合法）
+
+### 2.16.4 API Key 的性能与生命周期
+
+**validApiKeys 列表的刷新时机**（`auth.js:402-404`）：
+```js
+async reloadApiKeys () {
+  const keys = await WIKI.models.apiKeys.query().select('id')
+    .where('isRevoked', false)
+    .andWhere('expiration', '>', DateTime.utc().toISO())
+  this.validApiKeys = _.map(keys, 'id')
+}
+```
+
+这个 `reloadApiKeys()` 在以下场景被调用：
+- 内核启动时（`init()` 流程中）
+- 创建 / 撤销 API Key 时
+- 跨实例通过 PG NOTIFY 通知（`core/db.js` 的事件总线）同步
+
+### 2.16.5 API 鉴权边界总览图
+
+```
+第三方插件 / 外部系统
+         │
+         │ HTTP POST /graphql
+         │ Authorization: Bearer <API Key JWT>
+         ▼
+ ┌─ passport-jwt（RS256 验签 + audience/issuer 校验）
+ │
+ ├─ payload 含 api → API Key 分支
+ │    ├─ 检查 WIKI.config.api.isEnabled（全局开关）
+ │    ├─ 检查 api.id ∈ validApiKeys（DB + 过期时间）
+ │    ├─ 根据 payload.grp 从 WIKI.auth.groups[] 获取 permissions + pageRules
+ │    └─ 构造假 user 对象（id=1, name='API'），继承组的权限
+ │
+ └─ 后续处理（完全等同于正常登录用户）
+      ├─ @auth 指令（全局 permissions 校验）
+      ├─ checkAccess()（页面级规则匹配）
+      ├─ @rateLimit（IP 级限流，API Key 也受限制）
+      └─ 字段级 @auth（authorEmail/authorIP/content 受限）
+```
+
+---
+
+## 2.17 评论数据的备份、跨实例迁移和数据库迁移脚本
+
+评论数据的备份 / 迁移能力分为**三层**：DB Schema 自动迁移、全量 JSON 导出、以及 V1→V2 用户导入（不含评论）。评论**没有专用的跨实例增量同步机制**。
+
+### 2.17.1 数据库 Schema 迁移系统
+
+Wiki.js 使用 **Knex.js 的 `migrate.latest()`** 自动管理 Schema 版本：
+
+启动入口（`server/core/db.js:197-202`）：
+```js
+async syncSchemas () {
+  return self.knex.migrate.latest({
+    tableName: 'migrations',
+    migrationSource   // 自定义源，按 semver 排序
+  })
+}
+```
+
+自定义迁移源（`core/db.js:177-195`）：
+```js
+const baseMigrationPath = path.join(WIKI.SERVERPATH,
+  (WIKI.config.db.type !== 'sqlite') ? 'db/migrations' : 'db/migrations-sqlite')
+const migrationSource = {
+  async getMigrations() {
+    const migrationFiles = await fs.readdir(baseMigrationPath)
+    return migrationFiles.sort(semver.compare).map(m => ({ ... }))  // 按语义版本排序
+  },
+  getMigrationName(migration) { return migration.file },
+  async getMigration(migration) { return require(path.join(baseMigrationPath, migration.file)) }
+}
+```
+
+**机制**：
+- `migrations` 表记录已执行的文件名（如 `"2.4.36.js"`）
+- 启动时按 `semver.compare` 排序，找到未执行的迁移
+- 评论相关的迁移（3次）按版本号顺序执行
+
+### 2.17.2 评论相关的 3 次 Schema 迁移
+
+| 迁移文件 | 版本 | 操作 | 关键代码 |
+|----------|------|------|---------|
+| `2.0.0.js:62-69` | 2.0.0 | **CREATE TABLE comments** | `table.increments('id').primary(); table.text('content')...` |
+| `2.0.0.js:285-288` | 2.0.0 | **添加外键** | `table.integer('pageId').unsigned().references('id').inTable('pages');` <br> `table.integer('authorId').unsigned().references('id').inTable('users');` |
+| `2.4.14.js:8-19` | 2.4.14 | **CREATE TABLE commentProviders** | Provider 配置表（`key`, `isEnabled`, `config`） |
+| `2.4.36.js:3-10` | 2.4.36 | **ALTER TABLE comments 新增列** | `render`, `name`, `email`, `ip` |
+| `2.4.61.js:3-5` | 2.4.61 | **ALTER TABLE comments 新增列** | `replyTo`（回复父评论 ID，默认 0） |
+
+**外键级联行为**：
+- `pageId` → `pages.id`，`authorId` → `users.id`
+- 迁移脚本中使用 `references().inTable()`，但**没有指定 `onDelete('CASCADE')`**
+- 意味着：删除页面时，若该页面有评论，DB 级外键会**阻止删除**（依赖于数据库默认 FK 行为）
+
+### 2.17.3 评论 Model 的关联映射（Objection.js relationMappings）
+
+`server/models/comments.js:31-50` 定义了两个 BelongsToOne 关系：
+
+```js
+static get relationMappings() {
+  return {
+    author: {
+      relation: Model.BelongsToOneRelation,
+      modelClass: require('./users'),
+      join: { from: 'comments.authorId', to: 'users.id' }
+    },
+    page: {
+      relation: Model.BelongsToOneRelation,
+      modelClass: require('./pages'),
+      join: { from: 'comments.pageId', to: 'pages.id' }
+    }
+  }
+}
+```
+
+**在导出时使用**（见下节），让评论 JSON 中内嵌 author 和 page 的部分信息。
+
+### 2.17.4 全量 JSON 导出（System Export）
+
+评论是可选的导出实体之一。GraphQL 入口调用 `WIKI.system.export({ entities: ['comments', 'pages', ...] })`。
+
+评论导出的完整实现（`core/system.js:141-198`）：
+
+```js
+case 'comments': {
+  WIKI.logger.info('Exporting comments...')
+  const outputPath = path.join(opts.path, 'comments.json.gz')
+
+  // 1. 统计总数
+  const commentsCountRaw = await WIKI.models.comments.query().count('* as total').first()
+  const commentsCount = parseInt(commentsCountRaw.total)
+  if (commentsCount < 1) { break }  // 无评论则跳过
+
+  // 2. 分批次流式拉取（50条一批，避免内存爆炸）
+  const commentsProgressMultiplier = progressMultiplier / Math.ceil(commentsCount / 50)
+  const rs = Readable({ objectMode: true })
+  rs._read = () => {}
+
+  const fetchCommentsBatch = async (offset) => {
+    const comments = await WIKI.models.comments.query()
+      .offset(offset).limit(50)
+      .withGraphJoined({    // ← 同时 JOIN 作者和页面信息
+        author: true,
+        page: true
+      })
+      .modifyGraph('author', builder => {
+        builder.select('users.id', 'users.name', 'users.email', 'users.providerKey')
+      })
+      .modifyGraph('page', builder => {
+        builder.select('pages.id', 'pages.path', 'pages.localeCode', 'pages.title')
+      })
+    if (comments.length > 0) {
+      for (const cmt of comments) { rs.push(cmt) }   // 推入 Readable 流
+      fetchCommentsBatch(offset + 50)                 // 递归取下一批
+    } else {
+      rs.push(null)    // 流结束标记
+    }
+    this.exportStatus.progress += commentsProgressMultiplier * 100
+  }
+  fetchCommentsBatch(0)   // 启动递归
+
+  // 3. 流式写入 JSON → Gzip → 文件
+  let marker = 0
+  await pipeline(
+    rs,          // Objection.js 查询结果流（对象模式）
+    new Transform({
+      objectMode: true,
+      transform(chunk, encoding, callback) {
+        marker++
+        let outputStr = marker === 1 ? '[\n' : ''
+        outputStr += JSON.stringify(chunk, null, 2)
+        if (marker < commentsCount) { outputStr += ',\n' }
+        callback(null, outputStr)
+      },
+      flush(callback) {
+        callback(null, '\n]\n')   // 补闭合括号
+      }
+    }),
+    zlib.createGzip(),                    // 压缩
+    fs.createWriteStream(outputPath)      // 写入 comments.json.gz
+  )
+}
+```
+
+**导出文件格式**（`comments.json.gz` 解压后）：
+```json
+[
+  {
+    "id": 1,
+    "content": "原始 Markdown",
+    "render": "<p>渲染后的 HTML</p>",
+    "name": "",
+    "email": "",
+    "ip": "192.168.1.100",
+    "createdAt": "2024-01-01T00:00:00.000Z",
+    "updatedAt": "...",
+    "replyTo": 0,
+    "pageId": 42,
+    "authorId": 5,
+    "author": {           // ← 来自 withGraphJoined
+      "id": 5,
+      "name": "张三",
+      "email": "zhangsan@example.com",
+      "providerKey": "local"
+    },
+    "page": {             // ← 来自 withGraphJoined
+      "id": 42,
+      "path": "docs/intro",
+      "localeCode": "zh-cn",
+      "title": "介绍"
+    }
+  },
+  ...
+]
+```
+
+**注意**：导出文件包含 **IP 地址**、**用户邮箱**等敏感字段，没有脱敏处理。
+
+### 2.17.5 不存在的功能：评论导入 / 跨实例增量同步
+
+**导入能力分析**：
+- `system.graphql` 中 **无** `import` mutation（除 `importUsersFromV1`，仅用于 V1 MongoDB → V2 用户迁移）
+- `core/system.js` 中 **无** 评论导入的 case（仅 export）
+- 全代码库搜索 `importComments` / `comments.*json.gz` / `restoreComment` → **零匹配**
+- System Export UI（若存在）中也一定**无"Import 评论"按钮**
+
+**V1→V2 用户迁移**（`resolver/system.js:112-242`）：
+`importUsersFromV1` 实现了从 MongoDB 导入用户和构建组规则：
+```js
+// V1 用户权限映射到 V2 组（:167-170）
+let roles = ['read:pages', 'read:assets', 'read:comments', 'write:comments']
+if (r.role === `write`) {
+  roles = _.concat(roles, ['write:pages', 'manage:pages', ...])
+}
+```
+但这段代码**只导入用户和组，不导入任何评论**。V1 的评论数据（如果存在）在迁移中被完全丢弃。
+
+### 2.17.6 外键约束对迁移的影响
+
+由于 `pageId` 和 `authorId` 有外键：
+- **导入评论前必须先导入 pages 和 users**（否则 FK 约束失败）
+- 若用户 ID 映射关系变了（新实例重新分配了 ID），导入时必须**重映射 authorId**
+- pageId 同理（页面路径相同但 ID 不同）
+- `replyTo` 字段（引用评论自身 ID）也需要重映射（自引用）
+
+**评论 JSON 导出**中的 author/page 信息仅作为**人类可读元数据**存在，导入时（若未来实现）需要通过 `page.path+locale`、`author.email+providerKey` 等业务字段查找新 ID，不能直接用旧 ID。
+
+### 2.17.7 备份与迁移方案总结
+
+| 能力 | 实现 | 说明 |
+|------|------|------|
+| Schema 自动迁移 | ✅ Knex migrate.latest() | 启动时按 semver 排序执行，评论 3 次迁移 |
+| 评论全量导出 | ✅ System Entity Export | 流式 JSON + Gzip，含 author/page 元数据，含明文 IP/邮箱 |
+| 评论增量备份 | ❌ 未实现 | 无 WAL 归档、无 binlog 导出封装 |
+| 评论导入 | ❌ 未实现 | 无 import mutation，无导入逻辑 |
+| 跨实例评论同步 | ❌ 未实现 | 无双向/单向同步，无队列/消息机制 |
+| V1 MongoDB → V2 迁移 | ⚠️ 仅用户 | V1→V2 用户导入，评论未迁移（被丢弃） |
+| 外键级联删除 | ⚠️ 无 onDelete | 删除 page/user 时可能因 FK 失败（依赖数据库配置） |
 
 ---
 
@@ -1066,20 +1549,26 @@ page(
 |------|------|
 | `server/graph/schemas/comment.graphql` | GraphQL 类型与权限定义 |
 | `server/graph/resolvers/comment.js` | GraphQL 解析器，串联权限与 Model |
+| `server/graph/schemas/system.graphql` | System Export 入口（`export` mutation） |
+| `server/graph/resolvers/system.js` | System Export Resolver + V1 用户导入 |
+| `server/graph/schemas/authentication.graphql` | API Key 创建/撤销/开关定义 |
 | `server/graph/directives/auth.js` | @auth 指令，全局权限拦截 |
 | `server/graph/directives/rate-limit.js` | @rateLimit 指令，IP 级频率限制（`IP:父类型.字段名` 为 key） |
 | `server/models/comments.js` | Comment Model，核心业务逻辑 + 页面级权限校验 |
-| `server/models/users.js` | Guest 用户定义（id=2）、getGuestUser() |
+| `server/models/users.js` | Guest 用户定义（id=2）、getGuestUser()、refreshToken |
+| `server/models/apiKeys.js` | API Key Model：RS256 JWT 签发、payload.grp 组映射 |
 | `server/models/commentProviders.js` | Provider 注册、初始化、磁盘扫描 |
 | `server/modules/comments/default/comment.js` | 内置 Provider：Markdown渲染、Akismet、入库 |
 | `server/modules/comments/default/definition.yml` | 内置 Provider 配置（akismet, minDelay 参数） |
-| `server/db/migrations/2.0.0.js` | comments 表初始建表（id, content, createdAt, updatedAt） |
+| `server/db/migrations/2.0.0.js` | comments 表初始建表 + FK（pageId, authorId） |
+| `server/db/migrations/2.4.14.js` | commentProviders 配置表建表 |
 | `server/db/migrations/2.4.36.js` | comments 表新增 render, name, email, ip 字段 |
 | `server/db/migrations/2.4.61.js` | comments 表新增 replyTo 字段 |
 | `server/graph/schemas/asset.graphql` | 资产上传 Schema（独立于评论系统） |
-| `server/core/kernel.js` | 事件系统初始化（inbound/outbound EventEmitter） |
-| `server/core/db.js` | High-Availability 事件总线（仅用于缓存失效） |
-| `server/core/auth.js` | `checkAccess()` 页面级权限引擎、`getEffectivePermissions()` |
+| `server/core/kernel.js` | 事件系统初始化（inbound/outbound EventEmitter） + DB init |
+| `server/core/db.js` | High-Availability 事件总线 + Knex migrate.latest() + PG NOTIFY |
+| `server/core/system.js` | System Export 全量实现（50 条/批 + stream + Gzip） |
+| `server/core/auth.js` | `authenticate()` 中间件、API Key 处理、`checkAccess()` 引擎、`getEffectivePermissions()`、reloadGroups()、reloadApiKeys() |
 | `server/controllers/common.js` | SSR 控制器，计算 effectivePermissions + 注入评论模板 |
 | `server/views/page.pug` | SSR 模板，传递 comments 变量到 Vue 组件 |
 | `client/themes/default/components/page.vue` | 主题页面组件，条件渲染评论区 |
@@ -1090,6 +1579,7 @@ page(
 | `client/components/profile/comments.vue` | 我的评论列表（空白模板，未实现） |
 | `client/components/admin/admin-comments.vue` | 管理后台评论 Provider 配置 |
 | `client/components/admin/admin-webhooks.vue` | Webhooks 管理（半成品，按钮禁用，误用邮件配置） |
+| `client/components/admin/admin-api.vue` | API Key 管理（创建/撤销/开关） |
 | `client/components/editor/editor-ckeditor.vue` | 页面编辑器（含 mention TODO 注释，与评论无关） |
 
 ---
@@ -1119,7 +1609,7 @@ page(
 - **无状态机**：没有 `status` 字段，评论只有"存在/不存在"两种状态
 - **无作者权限**：作者本人不能编辑/删除自己的评论，需要 `manage:comments` 权限
 
-### 7.3 反垃圾与限流关键参数
+### 7.3 反垃圾、限流、批量操作、API 鉴权关键参数
 
 | 组件 | 参数 | 值 | 目的 |
 |------|------|----|------|
@@ -1132,6 +1622,10 @@ page(
 | @rateLimit | `1/15s per IP` | IP 级限流 | 防刷屏 |
 | minDelay | 默认 30s | 用户级限流（Guest 全局共享 id=2） | 防刷屏 |
 | users.isActive | true/false | 全局账号封禁 | 防恶意用户 |
+| API Key JWT | `RS256` + `payload.api + payload.grp` | API Key 按组授权 | 第三方集成 |
+| API Key 校验 | `WIKI.auth.validApiKeys` | DB 白名单 + 过期时间 | 撤销/过期生效 |
+| System Export | `50/batch + stream + Gzip` | 批量流式导出 | 备份迁移 |
+| Schema 迁移 | `semver.sort` + Knex migrate.latest() | 启动时自动升级 | 版本兼容性 |
 
 ### 7.4 渲染与安全管道关键参数（已并入上一表，此节保留为空用于未来扩展）
 
@@ -1180,7 +1674,15 @@ page(
   │    ├─ ❌ @mention 解析与通知（仅页面编辑器 TODO 注释）
   │    ├─ ❌ 审核状态机（Akismet 要么拒绝要么直接入库，无待审）
   │    ├─ ❌ IP 黑名单（仅有 users.isActive 账号级封禁）
-  │    └─ ❌ 附件上传与病毒扫描（仅可引用外部图片 URL）
+  │    ├─ ❌ 附件上传与病毒扫描（仅可引用外部图片 URL）
+  │    ├─ ❌ 批量删除 / 批量改状态（仅单条 CRUD，无 whereIn 批量 SQL）
+  │    ├─ ❌ 评论导入（无 import mutation，无 JSON 还原逻辑）
+  │    └─ ❌ 跨实例增量同步（无队列/消息机制）
+  │
+  │    ✅ 已实现的旁路：
+  │    ├─ ✅ API Key 鉴权（payload.grp 绑定组，继承 permissions + pageRules）
+  │    ├─ ✅ System Export（50 条/批，流式 JSON + Gzip）
+  │    └─ ✅ Schema 迁移（Knex migrate.latest()，按 semver 排序）
   │
   └─ 前端 UI 门控
        effectivePermissions.comments.{read,write,manage}
@@ -1200,4 +1702,9 @@ page(
   - 无 IP 黑名单：仅账号级 `users.isActive` 全局封禁
   - 反垃圾 Bug：Akismet 参数名拼写错误（`user.agentagent`），user-agent 永远为空
   - 无附件上传：仅能引用外部图片 URL，无病毒扫描
+  - 无批量操作：仅单条 CRUD，无 bulk mutation、无 whereIn 批量 SQL
+  - 无评论导入：export 单向，comments.json.gz 无法反向还原
+  - 外键安全：`pageId/authorId` FK 无 onDelete，删除页面/用户可能因 FK 约束失败
+  - API 全局开关：api.isEnabled 关闭时所有 API Key 请求即使 JWT 合法也被拒绝
+  - API 字段保护：authorEmail/authorIP 仅 manage:system 可见；content 原始 Markdown 仅 write/manage 可见
 ```
