@@ -34,6 +34,9 @@ comments.vue                        GraphQL Schema (comment.graphql)
   │     ❌ 无 event emit → 无通知 / Activity log / Webhook
   │     ❌ 无点赞 / 收藏表 → 无社交互动数据
   │     ❌ 无 @mention 解析 → 仅纯文本，无自动补全
+  │     ❌ 无审核状态机 → Akismet 要么拒绝要么直接入库（无待审）
+  │     ❌ 无 IP 黑名单 → 仅有账号级 isActive 封禁
+  │     ❌ 无附件上传 → 仅能引用外部图片 URL（无病毒扫描）
   │
   ├─ Apollo query/list ─────────────▶ Resolver.list()
   │                                   │  查 pages 表 → checkAccess → 查 comments 表
@@ -558,6 +561,10 @@ WIKI.events.outbound.onAny(this.notifyViaDB)  // 所有 outbound 事件都转发
 | 评论点赞 / 收藏 | 无字段无表 | 无 mutation/字段 | 无逻辑 | 无按钮无计数 | ❌ 未实现 |
 | 评论 @mention | 无相关表 | 无相关字段 | 无解析无通知 | 仅 textarea，无补全 | ❌ 未实现 |
 | Webhooks 评论事件 | 无相关表 | 无相关 mutation | 无逻辑 | 管理页半成品，按钮禁用 | ❌ 未实现 |
+| 评论审核 / 待审 | 无 status 字段 | 无 approve/reject mutation | 无状态机 | 无审核 UI | ❌ 未实现 |
+| 评论 IP 黑名单 | 无 IP 封禁表 | 无相关 mutation | 无封禁逻辑 | 无管理 UI | ❌ 未实现 |
+| 评论附件上传 | 无 commentAttachments 表 | 无 upload mutation | 无上传逻辑 | 无上传控件 | ❌ 未实现 |
+| 评论病毒扫描 | — | — | 无 ClamAV/扫描器 | — | ❌ 未实现 |
 
 **唯一的半成品残留**：
 1. `editor-ckeditor.vue:72-82` 中页面编辑器的 mention TODO 注释（与评论无关）
@@ -565,6 +572,349 @@ WIKI.events.outbound.onAny(this.notifyViaDB)  // 所有 outbound 事件都转发
 3. `profile.vue:344` 中 `commentsPosted` 硬编码为 `0`
 4. `profile/comments.vue` 空白组件骨架
 5. `admin-webhooks.vue` 误用邮件配置的半成品页面
+
+---
+
+## 2.12 评论审核 / 待审状态机：完全未实现
+
+### 2.12.1 数据库结构分析
+
+`comments` 表的字段演进（三次迁移）：
+
+| 迁移版本 | 新增字段 |
+|----------|---------|
+| `2.0.0.js:63-69` | `id, content, createdAt, updatedAt` |
+| `2.4.36.js` | `render, name, email, ip` |
+| `2.4.61.js` | `replyTo` |
+
+**没有任何状态字段**：
+- 无 `status` / `state` 字段
+- 无 `isApproved` / `approvedAt` / `approvedBy`
+- 无 `isPending` / `pendingReason`
+- 无 `isSpam` / `spamScore`
+- 无 `moderatedAt` / `moderatedBy`
+- 无 `commentReview` / `commentModerations` 关联表
+
+### 2.12.2 GraphQL Schema 分析（`comment.graphql`）
+
+```graphql
+type CommentPost {
+  id: Int!
+  content: String! @auth(requires: [...])
+  render: String!
+  authorId: Int!
+  authorName: String!
+  authorEmail: String! @auth(requires: ["manage:system"])
+  authorIP: String! @auth(requires: ["manage:system"])
+  createdAt: Date!
+  updatedAt: Date!
+}
+```
+
+**没有** `status` / `isApproved` / `isPending` 等状态字段。
+
+Mutation 中**没有**：
+- `approveComment` / `rejectComment`
+- `setCommentStatus`
+- `submitForReview`
+- `bulkModerateComments`
+
+Query 中**没有**按状态筛选的参数（如 `list(status: PENDING)`）。
+
+### 2.12.3 后端逻辑分析
+
+`Resolver.list()`（`resolver/comment.js:50`）：
+```js
+const comments = await WIKI.models.comments.query()
+  .where('pageId', page.id)
+  .orderBy('createdAt')
+```
+
+**没有** `where('status', 'APPROVED')` 这样的过滤条件，**所有评论一创建就直接显示**。
+
+`Provider.create()`（`default/comment.js:118`）：
+```js
+const newComment = await WIKI.models.comments.query().insert(...)
+return newComment.id
+```
+
+创建后直接 `insert` 入库，**没有待审队列，没有审核流程**。
+
+### 2.12.4 Akismet 反垃圾的唯一处理
+
+**Akismet 标记为 spam 的评论是直接拒绝，不是进入待审队列**：
+
+```js
+// default/comment.js:104-106
+if (isSpam) {
+  throw new Error('Comment was rejected because it is marked as spam.')
+}
+```
+
+- `isSpam = true` → 直接 `throw`，评论**不入库**，前端显示错误信息
+- `isSpam = false` → 直接 `insert`，立即显示
+- **没有中间状态**（如 `PENDING` / `REVIEW`）
+
+### 2.12.5 前端 UI 分析
+
+`comments.vue` 中：
+- 没有"待审核"状态徽章或提示
+- 没有审核队列管理界面
+- 没有"批准/拒绝"操作按钮
+- `admin-comments.vue` 仅配置 Provider 参数（Akismet Key、minDelay），**不管理评论内容**
+
+### 2.12.6 审核状态机总结
+
+| 设计要素 | 状态 | 代码证据 |
+|----------|------|---------|
+| 状态字段 | ❌ 未实现 | 数据库无 `status`/`isApproved` 等字段 |
+| 审核队列表 | ❌ 未实现 | 无 `commentModerations` 等关联表 |
+| 按状态过滤查询 | ❌ 未实现 | Resolver.list() 无 status filter |
+| 审核 mutation | ❌ 未实现 | Schema 无 approve/reject mutation |
+| 待审 UI 提示 | ❌ 未实现 | 前端无 PENDING 状态显示 |
+| 审核管理界面 | ❌ 未实现 | admin-comments 仅配置参数 |
+| Akismet spam 处理 | ⚠️ 直接拒绝 | 不进入待审，直接 throw 错误 |
+
+**结论**：评论审核功能完全未实现。Akismet 只做"二进制判定"——要么直接入库，要么直接拒绝，没有中间审核流程。
+
+---
+
+## 2.13 评论 IP 限流、反垃圾和黑名单：已有反垃圾与限流的完整分析
+
+评论的反垃圾和限流策略分为**四层防线**，全部在 `default/comment.js` 和 GraphQL 指令中实现。但**IP 黑名单功能不存在**，只有用户级（isActive）封禁。
+
+### 2.13.1 第一层：IP 级频率限制（GraphQL 指令）
+
+`server/graph/schemas/comment.graphql:45`：
+```graphql
+create(...) @rateLimit(limit: 1, duration: 15)
+```
+
+`server/graph/directives/rate-limit.js:1-5` 实现：
+```js
+const { createRateLimitDirective } = require('graphql-rate-limit-directive')
+
+module.exports = createRateLimitDirective({
+  keyGenerator: (directiveArgs, source, args, context, info) =>
+    `${context.req.ip}:${info.parentType}.${info.fieldName}`
+})
+```
+
+**机制**：
+- 以 `IP:父类型.字段名` 为 key（如 `192.168.1.1:CommentMutation.create`）
+- 同一 IP 对 `comments.create` mutation 每 15 秒只能调用 1 次
+- 使用 `graphql-rate-limit-directive` 库（基于内存的滑动窗口）
+- **注意**：多实例部署时是**每实例独立计数**，不是全局共享
+
+### 2.13.2 第二层：用户级最小发言间隔（Provider 配置）
+
+`definition.yml:17-23` 配置 `minDelay`（默认 30 秒）：
+```js
+// default/comment.js:110-120
+if (WIKI.data.commentProvider.config.minDelay > 0) {
+  const lastComment = await WIKI.models.comments.query()
+    .select('updatedAt')
+    .findOne('authorId', user.id)   // ← 按 authorId 过滤
+    .orderBy('updatedAt', 'desc')
+  if (lastComment) {
+    const timeDiff = Date.now() - new Date(lastComment.updatedAt).getTime()
+    if (timeDiff < (WIKI.data.commentProvider.config.minDelay * 1000)) {
+      throw new Error('Minimum delay between comments not elapsed.')
+    }
+  }
+}
+```
+
+**关键细节**：
+- 按 `authorId` 查询，**所有 Guest 用户共享 id=2**，即全站点匿名用户共用一个计数器
+- 用 `updatedAt`（不是 `createdAt`），意味着编辑评论也会重置计时器
+- 配置值 `0` 表示禁用此限制
+- 与 IP 限流的区别：IP 限流是 15s（不可配置），用户级是 minDelay 秒（可配置，默认 30s）
+
+### 2.13.3 第三层：Akismet 反垃圾检测
+
+`default/comment.js:75-107` 完整实现：
+
+```js
+if (!_.isEmpty(WIKI.data.commentProvider.config.akismet)) {
+  const akismetClient = new AkismetClient({
+    apiKey: WIKI.data.commentProvider.config.akismet,
+    blog: WIKI.config.host,
+    debug: _.get(WIKI.data.commentProvider.config, 'debugAkismet', false)
+  })
+
+  let userRole = 'user'
+  if (user.groups.indexOf(1) >= 0) {
+    userRole = 'administrator'
+  } else if (user.groups.indexOf(2) >= 0) {
+    userRole = 'guest'          // ← Guest 组用户标记为 guest，评分更严格
+  }
+
+  let isSpam = false
+  try {
+    isSpam = await akismetClient.checkSpam({
+      ip: user.ip,
+      useragent: user.agentagent,   // ⚠️ BUG: 应为 user.userAgent（多了一个 agent）
+      content,
+      name: user.name,
+      email: user.email,
+      role: userRole
+    })
+  } catch (err) {
+    WIKI.logger.warn('Akismet Comment Validation: [ FAILED ]')
+    WIKI.logger.warn(err)
+  }
+
+  if (isSpam) {
+    throw new Error('Comment was rejected because it is marked as spam.')
+  }
+}
+```
+
+**已知 Bug**（`default/comment.js:90`）：
+```js
+useragent: user.agentagent,   // 应该是 user.userAgent
+```
+参数名拼写错误，`user` 对象中没有 `agentagent` 字段，Akismet 实际上**永远收不到 user-agent**，可能降低 spam 检测准确率。
+
+### 2.13.4 第四层：用户账号级封禁
+
+系统有 `users.isActive` 字段（`models/users.js:36`），但这是**全局账号封禁**，不是评论专属黑名单：
+
+- 登录时检查（`users.js:230-232`）：
+  ```js
+  if (!user.isActive) {
+    throw new WIKI.Error.AuthAccountBanned()
+  }
+  ```
+- Token 刷新时检查（`users.js:427-430`）
+- API Key 验证时检查（`users.js:502-504`）
+
+**封禁效果**：用户完全无法登录，自然也无法发表评论。这是最严格的封禁级别，但**不支持"仅禁止评论"的细粒度封禁**。
+
+### 2.13.5 不存在的功能：IP 黑名单
+
+全代码库搜索结果：
+- 无 `blocklist` / `blacklist` / `denylist` 相关配置
+- 无 IP 封禁表（如 `ipBans` / `blockedIps`）
+- 无 Akismet 命中后自动封禁 IP 的逻辑
+- 无手动封禁某个 IP 的管理功能
+
+`admin-security.vue`（安全管理页面）中也没有 IP 黑名单相关 UI。
+
+### 2.13.6 限流与反垃圾总览
+
+| 防线 | 实现位置 | 类型 | 作用范围 | 可配置？ |
+|------|---------|------|---------|---------|
+| 第一 | `@rateLimit(1, 15s)` | IP 级限流 | 创建评论 | ❌ 硬编码 |
+| 第二 | `minDelay`（默认 30s） | 用户级限流 | 创建评论 | ✅ Provider 配置 |
+| 第三 | Akismet `checkSpam()` | 内容级反垃圾 | 文本内容 + 用户角色 | ✅ API Key 配置 |
+| 第四 | `users.isActive` | 账号级封禁 | 全站登录 | ✅ 用户管理 |
+| — | IP 黑名单 | IP 级封禁 | — | ❌ 未实现 |
+| — | 待审状态机 | 人工审核流程 | — | ❌ 未实现 |
+
+---
+
+## 2.14 评论附件上传与安全过滤、病毒扫描：完全未实现
+
+### 2.14.1 评论 Schema 中无上传相关定义
+
+`comment.graphql` 中：
+- 无 `commentAttachments` / `uploadCommentAttachment` mutation
+- 无 `CommentAttachment` type
+- `CommentPost` 中无 `attachments` 字段
+
+### 2.14.2 评论组件无上传 UI
+
+`client/components/comments.vue` 完整模板分析：
+- 输入框是 `<v-textarea>` 纯文本（:3-16）
+- **无文件选择按钮**（`<input type="file">` 或类似 UI）
+- **无图片拖拽上传区域**
+- **无附件列表显示**
+- 工具栏只有 Post/Cancel 按钮，无媒体选择器
+
+### 2.14.3 资产（Asset）系统的独立存在
+
+Wiki.js 有独立的资产上传系统，但**与评论功能完全隔离**：
+
+**Asset Schema**（`asset.graphql`）：
+```graphql
+type AssetItem {
+  id: Int!
+  filename: String!
+  ext: String!
+  kind: AssetKind!         // 'binary' | 'image'
+  mime: String!
+  fileSize: Int!
+  metadata: String
+  createdAt: Date!
+  updatedAt: Date!
+}
+
+type AssetMutation {
+  createFolder(...)
+  renameAsset(...)
+  flushTempUploads
+}
+```
+
+**Asset 表结构**（`migrations/2.0.0.js:23-32`）：
+```js
+.createTable('assets', table => {
+  table.string('filename').notNullable()
+  table.string('hash').notNullable()
+  table.string('ext').notNullable()
+  table.enum('kind', ['binary', 'image']).notNullable()
+  table.string('mime').notNullable().defaultTo('application/octet-stream')
+  table.integer('fileSize').unsigned().comment('In kilobytes')
+  table.json('metadata')
+  table.string('createdAt').notNullable()
+  table.string('updatedAt').notNullable()
+  table.integer('folderId').unsigned().references('id').inTable('assetFolders')
+  table.integer('authorId').unsigned().references('id').inTable('users')
+})
+```
+
+Asset 系统仅用于**页面编辑器**中的图片和附件（通过 `editor-modal-media.vue` 管理），评论模块完全不使用它。
+
+### 2.14.4 全代码库无病毒扫描实现
+
+全代码库搜索：
+- 无 `clamav` / `clamd` / `clamscan`
+- 无 `antivirus` / `malware`
+- 无 `virus.*scan` / `infected` / `cleanFile`
+- 无 MIME 类型白名单校验（在评论上传上下文中）
+- 无文件扩展名黑名单（在评论上传上下文中）
+
+`StorageResolver`（`resolver/storage.js`）只处理存储目标（S3/Local FS 等）的配置与同步，**不做任何文件安全扫描**。
+
+`editor-modal-media.vue`（页面媒体上传对话框）中即使有上传逻辑，也没有病毒扫描相关代码——Asset 系统本身也没有病毒扫描。
+
+### 2.14.5 评论内容中的图片
+
+虽然评论不能上传文件，但**Markdown 中可引用外部图片 URL**：
+
+Markdown 渲染（`default/comment.js:14-19`）配置：
+```js
+html: false,   // 禁止 <img> 标签（XSS 防护）
+// ...
+```
+
+由于 `html: false`，用户无法用 `<img src="...">` 嵌入图片。但 Markdown 的 `![alt](url)` 语法在 `markdown-it` 默认支持，**外部图片链接可以渲染**。
+
+DOMPurify 会对最终生成的 `<img>` 标签做白名单检查，但这是**对已渲染 HTML 的清洗**，不是对图片内容的病毒扫描。
+
+### 2.14.6 附件上传总结
+
+| 功能 | 数据库 | GraphQL Schema | 后端逻辑 | 前端 UI | 状态 |
+|------|--------|----------------|----------|---------|------|
+| 评论附件上传表 | ❌ 无 `commentAttachments` 表 | ❌ 无 mutation | ❌ 无处理逻辑 | ❌ 无上传控件 | ❌ 未实现 |
+| 评论文件类型校验 | — | — | ❌ 无 MIME/ext 校验 | — | ❌ 未实现 |
+| 评论病毒扫描 | — | — | ❌ 无 ClamAV/扫描器 | — | ❌ 未实现 |
+| 资产系统对接评论 | ❌ 无 comment-fk | ❌ 无关联字段 | ❌ 无关联逻辑 | ❌ 无评论媒体按钮 | ❌ 未实现 |
+| 页面 Asset 系统 | ✅ `assets` 表 | ✅ `asset.graphql` | ✅ 上传/文件夹逻辑 | ✅ `editor-modal-media.vue` | ✅ 独立存在（仅供页面编辑器） |
+
+**结论**：评论不能上传任何文件或图片附件。用户只能通过 Markdown 的 `![alt](url)` 引用**外部**图片 URL，但图片内容不会经过病毒扫描。
 
 ---
 
@@ -717,7 +1067,7 @@ page(
 | `server/graph/schemas/comment.graphql` | GraphQL 类型与权限定义 |
 | `server/graph/resolvers/comment.js` | GraphQL 解析器，串联权限与 Model |
 | `server/graph/directives/auth.js` | @auth 指令，全局权限拦截 |
-| `server/graph/directives/rate-limit.js` | @rateLimit 指令，频率限制 |
+| `server/graph/directives/rate-limit.js` | @rateLimit 指令，IP 级频率限制（`IP:父类型.字段名` 为 key） |
 | `server/models/comments.js` | Comment Model，核心业务逻辑 + 页面级权限校验 |
 | `server/models/users.js` | Guest 用户定义（id=2）、getGuestUser() |
 | `server/models/commentProviders.js` | Provider 注册、初始化、磁盘扫描 |
@@ -726,6 +1076,7 @@ page(
 | `server/db/migrations/2.0.0.js` | comments 表初始建表（id, content, createdAt, updatedAt） |
 | `server/db/migrations/2.4.36.js` | comments 表新增 render, name, email, ip 字段 |
 | `server/db/migrations/2.4.61.js` | comments 表新增 replyTo 字段 |
+| `server/graph/schemas/asset.graphql` | 资产上传 Schema（独立于评论系统） |
 | `server/core/kernel.js` | 事件系统初始化（inbound/outbound EventEmitter） |
 | `server/core/db.js` | High-Availability 事件总线（仅用于缓存失效） |
 | `server/core/auth.js` | `checkAccess()` 页面级权限引擎、`getEffectivePermissions()` |
@@ -768,7 +1119,7 @@ page(
 - **无状态机**：没有 `status` 字段，评论只有"存在/不存在"两种状态
 - **无作者权限**：作者本人不能编辑/删除自己的评论，需要 `manage:comments` 权限
 
-### 7.3 渲染与安全管道关键参数
+### 7.3 反垃圾与限流关键参数
 
 | 组件 | 参数 | 值 | 目的 |
 |------|------|----|------|
@@ -777,8 +1128,12 @@ page(
 | markdown-it | `linkify: true` | 自动识别链接 | 用户体验 |
 | DOMPurify | 默认配置 | 白名单过滤 | 防止 XSS 第二层 |
 | Akismet | `role=guest/user/admin` | 差异化评分 | 反垃圾 |
+| Akismet | ⚠️ `useragent: user.agentagent` | **拼写错误 Bug** | user-agent 永远为空 |
 | @rateLimit | `1/15s per IP` | IP 级限流 | 防刷屏 |
-| minDelay | 默认 30s | 用户级限流 | 防刷屏 |
+| minDelay | 默认 30s | 用户级限流（Guest 全局共享 id=2） | 防刷屏 |
+| users.isActive | true/false | 全局账号封禁 | 防恶意用户 |
+
+### 7.4 渲染与安全管道关键参数（已并入上一表，此节保留为空用于未来扩展）
 
 ---
 
@@ -812,16 +1167,20 @@ page(
   │    ├─ 2. XSS 防护：DOMPurify.sanitize()
   │    ├─ 3. Akismet 反垃圾（配置了 API Key 时）
   │    │    ├─ Guest → role=guest（更严格评分）
-  │    │    └─ 已登录 → role=user
+  │    │    ├─ 已登录 → role=user
+  │    │    └─ ⚠️ BUG: useragent: user.agentagent（拼写错误，UA 永远为空）
   │    ├─ 4. minDelay 频率控制
   │    │    ├─ Guest → 全站点共享 id=2 的计数器
   │    │    └─ 已登录 → 独立计数器
   │    └─ 5. 写入 DB：content(原始) + render(HTML)
-  │
+  │    │
   │    ⚠️  以下功能均未实现：
   │    ├─ ❌ 评论通知 / Activity log（无 event emit）
   │    ├─ ❌ 点赞 / 收藏（无数据表、无 mutation）
-  │    └─ ❌ @mention 解析与通知（仅页面编辑器 TODO 注释）
+  │    ├─ ❌ @mention 解析与通知（仅页面编辑器 TODO 注释）
+  │    ├─ ❌ 审核状态机（Akismet 要么拒绝要么直接入库，无待审）
+  │    ├─ ❌ IP 黑名单（仅有 users.isActive 账号级封禁）
+  │    └─ ❌ 附件上传与病毒扫描（仅可引用外部图片 URL）
   │
   └─ 前端 UI 门控
        effectivePermissions.comments.{read,write,manage}
@@ -837,4 +1196,8 @@ page(
   - 无 WYSIWYG：仅纯 Markdown 文本输入，使用独立的轻量级渲染管道
   - 无通知系统：评论事件无 event emit，Webhooks 管理页是半成品
   - 无社交互动：点赞、收藏、@mention 均未实现
+  - 无审核流程：Akismet 要么直接拒绝，要么直接入库（无待审状态）
+  - 无 IP 黑名单：仅账号级 `users.isActive` 全局封禁
+  - 反垃圾 Bug：Akismet 参数名拼写错误（`user.agentagent`），user-agent 永远为空
+  - 无附件上传：仅能引用外部图片 URL，无病毒扫描
 ```
